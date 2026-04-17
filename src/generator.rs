@@ -374,9 +374,7 @@ fn format_jwt_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
 /// in the last segment). Replaces other characters with deterministic hex.
 fn format_filepath_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
     // Find the last path separator position to identify the filename segment.
-    let last_sep = original
-        .rfind(['/', '\\'])
-        .map_or(0, |p| p + 1);
+    let last_sep = original.rfind(['/', '\\']).map_or(0, |p| p + 1);
     let filename = &original[last_sep..];
     // Find extension in the filename (last `.` that isn't at position 0).
     let ext_start = filename.rfind('.').filter(|&p| p > 0).map(|p| last_sep + p);

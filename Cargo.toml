@@ -39,7 +39,7 @@ flate2 = "1"
 clap = { version = "4.5.60", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-ctrlc = { version = "3", features = ["termination"] }
+ctrlc = { version = ">=3, <3.5", features = ["termination"] }
 rpassword = "7"
 
 [target.'cfg(unix)'.dependencies]
