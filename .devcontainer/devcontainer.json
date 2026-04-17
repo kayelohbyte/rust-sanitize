@@ -1,0 +1,16 @@
+{
+  "name": "rust-sanitize",
+  "image": "rust:1.75",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer"
+      ]
+    }
+  },
+
+"postCreateCommand": "rustup component add clippy rustfmt && cargo build"
+}

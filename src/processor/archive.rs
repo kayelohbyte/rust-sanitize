@@ -1,0 +1,1201 @@
+//! Archive processor for sanitizing files inside `.zip`, `.tar`, and `.tar.gz` archives.
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌───────────────────────┐
+//! │  Archive (zip/tar/gz) │
+//! └────────┬──────────────┘
+//!          │  for each entry
+//!          ▼
+//! ┌─────────────────────────────────────────────┐
+//! │  1. Match entry filename → FileTypeProfile  │
+//! │  2. Try ProcessorRegistry (structured)      │
+//! │  3. Fallback: StreamScanner (streaming)     │
+//! └────────┬────────────────────────────────────┘
+//!          │  sanitized bytes
+//!          ▼
+//! ┌───────────────────────┐
+//! │  Rebuilt archive       │
+//! │  (same format, meta   │
+//! │   preserved)          │
+//! └───────────────────────┘
+//! ```
+//!
+//! # Memory Efficiency
+//!
+//! Archives are processed **entry-by-entry**. Each entry is piped
+//! through either a structured processor (which must buffer the full
+//! entry) or the [`StreamScanner`]
+//! (which processes in configurable chunks). This means the maximum
+//! memory footprint is proportional to the largest *single entry*
+//! that uses a structured processor. Files without a profile match
+//! are streamed through the scanner without buffering the whole entry.
+//!
+//! For very large individual files inside archives, the streaming
+//! scanner path keeps only `chunk_size + overlap_size` bytes in memory.
+//!
+//! # Thread Safety
+//!
+//! [`ArchiveProcessor`] is `Send + Sync`. The underlying
+//! [`MappingStore`] provides lock-free
+//! reads for dedup consistency.
+//!
+//! # Metadata Preservation
+//!
+//! - **Tar**: modification time, permissions (mode), uid/gid, and
+//!   username/groupname are copied from the source entry.
+//! - **Zip**: modification time, compression method, and unix
+//!   permissions are preserved.
+//! - Symlinks, directories, and other non-regular entries are passed
+//!   through unchanged.
+
+use crate::error::{Result, SanitizeError};
+use crate::processor::profile::FileTypeProfile;
+use crate::processor::registry::ProcessorRegistry;
+use crate::scanner::{ScanStats, StreamScanner};
+use crate::store::MappingStore;
+
+use std::collections::HashMap;
+use std::io::{self, Read, Seek, Write};
+use std::sync::Arc;
+
+/// Maximum size (in bytes) for a single archive entry to be loaded into
+/// memory for structured processing. Entries larger than this are
+/// streamed through the scanner instead (M-3 fix).
+const MAX_STRUCTURED_ENTRY_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Default maximum nesting depth for recursive archive processing.
+///
+/// Depth 0 is the top-level archive. Nested archives at depths 1
+/// through `DEFAULT_MAX_ARCHIVE_DEPTH` are recursively extracted and
+/// sanitized. Exceeding this limit returns
+/// [`SanitizeError::RecursionDepthExceeded`].
+///
+/// Each nesting level buffers the inner archive in memory (up to
+/// `MAX_STRUCTURED_ENTRY_SIZE` per level), so the hard maximum is
+/// capped at 10 to bound peak memory.
+pub const DEFAULT_MAX_ARCHIVE_DEPTH: u32 = 3;
+
+/// Absolute maximum allowed value for archive nesting depth.
+/// Guards against excessive memory usage (each level can buffer up to
+/// 256 MiB).
+const MAX_ALLOWED_ARCHIVE_DEPTH: u32 = 10;
+
+// ---------------------------------------------------------------------------
+// Archive format enum
+// ---------------------------------------------------------------------------
+
+/// Supported archive formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    /// `.zip` archive.
+    Zip,
+    /// Uncompressed `.tar` archive.
+    Tar,
+    /// Gzip-compressed `.tar.gz` / `.tgz` archive.
+    TarGz,
+}
+
+impl ArchiveFormat {
+    /// Detect archive format from a file path / extension.
+    ///
+    /// Returns `None` for unrecognised extensions.
+    pub fn from_path(path: &str) -> Option<Self> {
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".tar.gz")
+            || std::path::Path::new(&lower)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tgz"))
+        {
+            Some(Self::TarGz)
+        } else if std::path::Path::new(&lower)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tar"))
+        {
+            Some(Self::Tar)
+        } else if std::path::Path::new(&lower)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        {
+            Some(Self::Zip)
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Archive statistics
+// ---------------------------------------------------------------------------
+
+/// Statistics collected while processing an archive.
+#[derive(Debug, Clone, Default)]
+pub struct ArchiveStats {
+    /// Number of file entries processed (excludes dirs/symlinks).
+    pub files_processed: u64,
+    /// Number of entries passed through unchanged (dirs, symlinks, etc.).
+    pub entries_skipped: u64,
+    /// Number of files handled by a structured processor.
+    pub structured_hits: u64,
+    /// Number of files handled by the streaming scanner fallback.
+    pub scanner_fallback: u64,
+    /// Number of entries that were themselves archives and processed
+    /// recursively.
+    pub nested_archives: u64,
+    /// Total input bytes across all file entries.
+    pub total_input_bytes: u64,
+    /// Total output bytes across all file entries.
+    pub total_output_bytes: u64,
+    /// Per-file processing method: filename → `"structured:<proc>"`, `"scanner"`,
+    /// or `"nested:<format>"`.
+    pub file_methods: HashMap<String, String>,
+    /// Per-file scan statistics (matches, replacements, bytes, pattern counts).
+    pub file_scan_stats: HashMap<String, ScanStats>,
+}
+
+impl ArchiveStats {
+    /// Merge statistics from a nested archive into this parent.
+    fn merge(&mut self, child: &ArchiveStats) {
+        self.files_processed += child.files_processed;
+        self.entries_skipped += child.entries_skipped;
+        self.structured_hits += child.structured_hits;
+        self.scanner_fallback += child.scanner_fallback;
+        self.nested_archives += child.nested_archives;
+        self.total_input_bytes += child.total_input_bytes;
+        self.total_output_bytes += child.total_output_bytes;
+        for (k, v) in &child.file_methods {
+            self.file_methods.insert(k.clone(), v.clone());
+        }
+        for (k, v) in &child.file_scan_stats {
+            self.file_scan_stats.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ArchiveProcessor
+// ---------------------------------------------------------------------------
+
+/// Processes archives by sanitizing each contained file and rebuilding
+/// the archive with the same format and preserved metadata.
+///
+/// # Usage
+///
+/// ```rust,no_run
+/// use sanitize_engine::processor::archive::{ArchiveProcessor, ArchiveFormat};
+/// use sanitize_engine::processor::registry::ProcessorRegistry;
+/// use sanitize_engine::scanner::{StreamScanner, ScanPattern, ScanConfig};
+/// use sanitize_engine::generator::HmacGenerator;
+/// use sanitize_engine::store::MappingStore;
+/// use sanitize_engine::category::Category;
+/// use std::sync::Arc;
+///
+/// let gen = Arc::new(HmacGenerator::new([42u8; 32]));
+/// let store = Arc::new(MappingStore::new(gen, None));
+/// let patterns = vec![
+///     ScanPattern::from_regex(r"secret\w+", Category::Custom("secret".into()), "secrets").unwrap(),
+/// ];
+/// let scanner = Arc::new(
+///     StreamScanner::new(patterns, Arc::clone(&store), ScanConfig::default()).unwrap(),
+/// );
+/// let registry = Arc::new(ProcessorRegistry::with_builtins());
+///
+/// let archive_proc = ArchiveProcessor::new(registry, scanner, store, vec![]);
+/// ```
+pub struct ArchiveProcessor {
+    /// Registry of structured processors.
+    registry: Arc<ProcessorRegistry>,
+    /// Streaming scanner for fallback processing.
+    scanner: Arc<StreamScanner>,
+    /// Shared mapping store (one-way replacements).
+    store: Arc<MappingStore>,
+    /// File-type profiles for structured processor matching.
+    profiles: Vec<FileTypeProfile>,
+    /// Maximum nesting depth for recursive archive processing.
+    max_depth: u32,
+}
+
+impl ArchiveProcessor {
+    /// Create a new archive processor.
+    ///
+    /// # Arguments
+    ///
+    /// - `registry` — structured processor registry.
+    /// - `scanner` — streaming scanner for fallback.
+    /// - `store` — shared mapping store for one-way dedup replacements.
+    /// - `profiles` — file-type profiles for structured matching.
+    pub fn new(
+        registry: Arc<ProcessorRegistry>,
+        scanner: Arc<StreamScanner>,
+        store: Arc<MappingStore>,
+        profiles: Vec<FileTypeProfile>,
+    ) -> Self {
+        Self {
+            registry,
+            scanner,
+            store,
+            profiles,
+            max_depth: DEFAULT_MAX_ARCHIVE_DEPTH,
+        }
+    }
+
+    /// Override the maximum nesting depth for recursive archive
+    /// processing.
+    ///
+    /// The default is [`DEFAULT_MAX_ARCHIVE_DEPTH`] (3). Values above
+    /// 10 are clamped.
+    #[must_use]
+    pub fn with_max_depth(mut self, depth: u32) -> Self {
+        self.max_depth = depth.min(MAX_ALLOWED_ARCHIVE_DEPTH);
+        self
+    }
+
+    /// Find the first profile matching a filename.
+    fn find_profile(&self, filename: &str) -> Option<&FileTypeProfile> {
+        self.profiles.iter().find(|p| p.matches_filename(filename))
+    }
+
+    /// Sanitize the content of a single file entry.
+    ///
+    /// If the entry is itself an archive (detected via extension), it is
+    /// recursively processed up to `self.max_depth`. Otherwise, tries a
+    /// structured processor first; falls back to the streaming scanner
+    /// if no processor matches.
+    ///
+    /// For the streaming scanner path, the content is piped through
+    /// `scan_reader` directly to the writer for memory-efficient
+    /// chunk-based processing (F-02 fix: no full output buffering).
+    #[allow(clippy::missing_errors_doc)] // private method
+    fn sanitize_entry(
+        &self,
+        filename: &str,
+        reader: &mut dyn Read,
+        writer: &mut dyn Write,
+        stats: &mut ArchiveStats,
+        entry_size_hint: Option<u64>,
+        depth: u32,
+    ) -> Result<()> {
+        // --- Nested archive detection ---
+        if let Some(nested_fmt) = ArchiveFormat::from_path(filename) {
+            return self.sanitize_nested_archive(
+                filename,
+                reader,
+                writer,
+                stats,
+                entry_size_hint,
+                nested_fmt,
+                depth,
+            );
+        }
+
+        // --- Structured / scanner processing (unchanged) ---
+
+        // Try structured processing first, but only if the entry is
+        // within the size cap.  Oversized entries fall through to the
+        // streaming scanner (M-3 fix).
+        let within_size_cap = entry_size_hint.map_or(true, |sz| sz <= MAX_STRUCTURED_ENTRY_SIZE); // unknown size → allow (conservative)
+
+        if within_size_cap {
+            if let Some(profile) = self.find_profile(filename) {
+                // Structured processors need the full content in memory.
+                let mut content = Vec::new();
+                reader.read_to_end(&mut content).map_err(|e| {
+                    SanitizeError::ArchiveError(format!("read entry '{filename}': {e}"))
+                })?;
+
+                stats.total_input_bytes += content.len() as u64;
+
+                if let Some(output) = self.registry.process(&content, profile, &self.store)? {
+                    stats.structured_hits += 1;
+                    stats.total_output_bytes += output.len() as u64;
+                    stats.file_methods.insert(
+                        filename.to_string(),
+                        format!("structured:{}", profile.processor),
+                    );
+                    writer.write_all(&output).map_err(|e| {
+                        SanitizeError::ArchiveError(format!("write entry '{filename}': {e}"))
+                    })?;
+                    return Ok(());
+                }
+
+                // Processor didn't match content heuristic — fall back to
+                // scanner with the already-buffered content.
+                let (output, scan_stats) = self.scanner.scan_bytes(&content)?;
+                stats.scanner_fallback += 1;
+                stats.total_output_bytes += output.len() as u64;
+                stats
+                    .file_methods
+                    .insert(filename.to_string(), "scanner".to_string());
+                stats
+                    .file_scan_stats
+                    .insert(filename.to_string(), scan_stats);
+                writer.write_all(&output).map_err(|e| {
+                    SanitizeError::ArchiveError(format!("write entry '{filename}': {e}"))
+                })?;
+                return Ok(());
+            }
+        }
+
+        // No profile (or entry too large) → streaming scanner.
+        // F-02 fix: stream directly from reader → scanner → writer
+        // without buffering the full output. We use a CountingWriter
+        // to track output bytes alongside the CountingReader for input.
+        let mut counting_r = CountingReader::new(reader);
+        let mut counting_w = CountingWriter::new(writer);
+        let scan_stats = self.scanner.scan_reader(&mut counting_r, &mut counting_w)?;
+
+        stats.scanner_fallback += 1;
+        stats.total_input_bytes += counting_r.bytes_read();
+        stats.total_output_bytes += counting_w.bytes_written();
+        stats
+            .file_methods
+            .insert(filename.to_string(), "scanner".to_string());
+        stats
+            .file_scan_stats
+            .insert(filename.to_string(), scan_stats);
+
+        Ok(())
+    }
+
+    /// Handle a nested archive entry: validate depth/size, buffer, recurse,
+    /// and write the sanitized output.
+    #[allow(clippy::too_many_arguments)]
+    fn sanitize_nested_archive(
+        &self,
+        filename: &str,
+        reader: &mut dyn Read,
+        writer: &mut dyn Write,
+        stats: &mut ArchiveStats,
+        entry_size_hint: Option<u64>,
+        nested_fmt: ArchiveFormat,
+        depth: u32,
+    ) -> Result<()> {
+        if depth >= self.max_depth {
+            return Err(SanitizeError::RecursionDepthExceeded(format!(
+                "nested archive '{}' at depth {} exceeds maximum nesting depth of {}",
+                filename, depth, self.max_depth,
+            )));
+        }
+
+        // Buffer the nested archive (bounded by MAX_STRUCTURED_ENTRY_SIZE).
+        if let Some(sz) = entry_size_hint {
+            if sz > MAX_STRUCTURED_ENTRY_SIZE {
+                return Err(SanitizeError::ArchiveError(format!(
+                    "nested archive '{}' is too large ({} bytes, limit {} bytes)",
+                    filename, sz, MAX_STRUCTURED_ENTRY_SIZE,
+                )));
+            }
+        }
+
+        let mut content = Vec::new();
+        reader.read_to_end(&mut content).map_err(|e| {
+            SanitizeError::ArchiveError(format!("read nested archive '{filename}': {e}"))
+        })?;
+        stats.total_input_bytes += content.len() as u64;
+
+        // Recurse into the nested archive.
+        let mut output_buf: Vec<u8> = Vec::new();
+        let child_stats = match nested_fmt {
+            ArchiveFormat::Tar => {
+                self.process_tar_at_depth(&content[..], &mut output_buf, depth + 1)?
+            }
+            ArchiveFormat::TarGz => {
+                self.process_tar_gz_at_depth(&content[..], &mut output_buf, depth + 1)?
+            }
+            ArchiveFormat::Zip => {
+                let reader = io::Cursor::new(&content);
+                let mut writer = io::Cursor::new(Vec::new());
+                let s = self.process_zip_at_depth(reader, &mut writer, depth + 1)?;
+                output_buf = writer.into_inner();
+                s
+            }
+        };
+
+        stats.nested_archives += 1;
+        stats.merge(&child_stats);
+        stats.total_output_bytes += output_buf.len() as u64;
+        let fmt_name = match nested_fmt {
+            ArchiveFormat::Tar => "tar",
+            ArchiveFormat::TarGz => "tar.gz",
+            ArchiveFormat::Zip => "zip",
+        };
+        stats
+            .file_methods
+            .insert(filename.to_string(), format!("nested:{fmt_name}"));
+        writer.write_all(&output_buf).map_err(|e| {
+            SanitizeError::ArchiveError(format!("write nested archive '{filename}': {e}"))
+        })?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Tar processing
+    // -----------------------------------------------------------------------
+
+    /// Process a `.tar` archive, sanitizing each file entry and
+    /// rebuilding the archive with preserved metadata.
+    ///
+    /// Entries that are not regular files (directories, symlinks, etc.)
+    /// are copied through unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SanitizeError::ArchiveError`] on I/O failures or
+    /// [`SanitizeError::RecursionDepthExceeded`] for nested archives.
+    pub fn process_tar<R: Read, W: Write>(&self, reader: R, writer: W) -> Result<ArchiveStats> {
+        self.process_tar_at_depth(reader, writer, 0)
+    }
+
+    /// Internal: process a tar archive at a given nesting depth.
+    fn process_tar_at_depth<R: Read, W: Write>(
+        &self,
+        reader: R,
+        writer: W,
+        depth: u32,
+    ) -> Result<ArchiveStats> {
+        let mut stats = ArchiveStats::default();
+        let mut archive = tar::Archive::new(reader);
+        let mut builder = tar::Builder::new(writer);
+
+        let entries = archive
+            .entries()
+            .map_err(|e| SanitizeError::ArchiveError(format!("read tar entries: {}", e)))?;
+
+        for entry_result in entries {
+            let mut entry = entry_result
+                .map_err(|e| SanitizeError::ArchiveError(format!("read tar entry: {}", e)))?;
+
+            let header = entry.header().clone();
+            let path = entry
+                .path()
+                .map_err(|e| SanitizeError::ArchiveError(format!("entry path: {}", e)))?
+                .to_string_lossy()
+                .to_string();
+
+            let entry_type = header.entry_type();
+
+            // Only process regular files.
+            if !entry_type.is_file() {
+                // Pass through directories, symlinks, etc. unchanged.
+                // We need to read the entry data (even if empty) to
+                // advance the archive cursor.
+                let mut data = Vec::new();
+                entry.read_to_end(&mut data).map_err(|e| {
+                    SanitizeError::ArchiveError(format!("read non-file entry '{}': {}", path, e))
+                })?;
+                builder.append(&header, &*data).map_err(|e| {
+                    SanitizeError::ArchiveError(format!("append entry '{}': {}", path, e))
+                })?;
+                stats.entries_skipped += 1;
+                continue;
+            }
+
+            // Sanitize the file content.
+            let mut sanitized_buf: Vec<u8> = Vec::new();
+            let entry_size = header.size().ok();
+            self.sanitize_entry(
+                &path,
+                &mut entry,
+                &mut sanitized_buf,
+                &mut stats,
+                entry_size,
+                depth,
+            )?;
+
+            // Build a new header with the sanitized content length but
+            // preserved metadata.
+            let mut new_header = header.clone();
+            new_header.set_size(sanitized_buf.len() as u64);
+            new_header.set_cksum();
+
+            builder.append(&new_header, &*sanitized_buf).map_err(|e| {
+                SanitizeError::ArchiveError(format!("append entry '{}': {}", path, e))
+            })?;
+
+            stats.files_processed += 1;
+        }
+
+        builder
+            .finish()
+            .map_err(|e| SanitizeError::ArchiveError(format!("finalize tar: {}", e)))?;
+
+        Ok(stats)
+    }
+
+    /// Process a `.tar.gz` archive (gzip-compressed tar).
+    ///
+    /// Decompresses on the fly, processes each entry, and recompresses
+    /// the output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SanitizeError::ArchiveError`] on I/O failures or
+    /// [`SanitizeError::RecursionDepthExceeded`] for nested archives.
+    pub fn process_tar_gz<R: Read, W: Write>(&self, reader: R, writer: W) -> Result<ArchiveStats> {
+        self.process_tar_gz_at_depth(reader, writer, 0)
+    }
+
+    /// Internal: process a tar.gz archive at a given nesting depth.
+    fn process_tar_gz_at_depth<R: Read, W: Write>(
+        &self,
+        reader: R,
+        writer: W,
+        depth: u32,
+    ) -> Result<ArchiveStats> {
+        let gz_reader = flate2::read::GzDecoder::new(reader);
+        let gz_writer = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
+
+        let stats = self.process_tar_at_depth(gz_reader, gz_writer, depth)?;
+        // GzEncoder is flushed when the tar builder finishes and the
+        // encoder is dropped. The `finish()` call in `process_tar`
+        // flushes the tar builder, which flushes writes to the
+        // GzEncoder. When the GzEncoder is dropped it finalises the
+        // gzip stream.
+        Ok(stats)
+    }
+
+    // -----------------------------------------------------------------------
+    // Zip processing
+    // -----------------------------------------------------------------------
+
+    /// Process a `.zip` archive, sanitizing each file entry and
+    /// rebuilding the archive with preserved metadata.
+    ///
+    /// # Type Bounds
+    ///
+    /// Zip requires seekable I/O for both reading and writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SanitizeError::ArchiveError`] on I/O failures or
+    /// [`SanitizeError::RecursionDepthExceeded`] for nested archives.
+    pub fn process_zip<R: Read + Seek, W: Write + Seek>(
+        &self,
+        reader: R,
+        writer: W,
+    ) -> Result<ArchiveStats> {
+        self.process_zip_at_depth(reader, writer, 0)
+    }
+
+    /// Internal: process a zip archive at a given nesting depth.
+    fn process_zip_at_depth<R: Read + Seek, W: Write + Seek>(
+        &self,
+        reader: R,
+        writer: W,
+        depth: u32,
+    ) -> Result<ArchiveStats> {
+        let mut stats = ArchiveStats::default();
+        let mut zip_in = zip::ZipArchive::new(reader)
+            .map_err(|e| SanitizeError::ArchiveError(format!("open zip: {}", e)))?;
+        let mut zip_out = zip::ZipWriter::new(writer);
+
+        for i in 0..zip_in.len() {
+            let mut entry = zip_in
+                .by_index(i)
+                .map_err(|e| SanitizeError::ArchiveError(format!("zip entry {}: {}", i, e)))?;
+
+            let name = entry.name().to_string();
+
+            // Security note: entry names are preserved verbatim (including any
+            // "../" or absolute-path components) because this tool writes a
+            // sanitised *archive*, not a filesystem tree.  Path traversal is
+            // therefore not exploitable here.  Consumers that later *extract*
+            // the output archive must apply their own path validation.
+
+            // Directories and non-files: pass through.
+            if entry.is_dir() {
+                let options = zip::write::FileOptions::default()
+                    .last_modified_time(entry.last_modified())
+                    .compression_method(entry.compression());
+
+                #[cfg(unix)]
+                let options = if let Some(mode) = entry.unix_mode() {
+                    options.unix_permissions(mode)
+                } else {
+                    options
+                };
+
+                zip_out.add_directory(&name, options).map_err(|e| {
+                    SanitizeError::ArchiveError(format!("add dir '{}': {}", name, e))
+                })?;
+                stats.entries_skipped += 1;
+                continue;
+            }
+
+            // Build write options preserving metadata.
+            let options = zip::write::FileOptions::default()
+                .compression_method(entry.compression())
+                .last_modified_time(entry.last_modified());
+
+            #[cfg(unix)]
+            let options = if let Some(mode) = entry.unix_mode() {
+                options.unix_permissions(mode)
+            } else {
+                options
+            };
+
+            // Sanitize the file.
+            let mut sanitized_buf: Vec<u8> = Vec::new();
+            let entry_size = Some(entry.size());
+            self.sanitize_entry(
+                &name,
+                &mut entry,
+                &mut sanitized_buf,
+                &mut stats,
+                entry_size,
+                depth,
+            )?;
+
+            zip_out.start_file(&name, options).map_err(|e| {
+                SanitizeError::ArchiveError(format!("start file '{}': {}", name, e))
+            })?;
+            zip_out.write_all(&sanitized_buf).map_err(|e| {
+                SanitizeError::ArchiveError(format!("write file '{}': {}", name, e))
+            })?;
+
+            stats.files_processed += 1;
+        }
+
+        zip_out
+            .finish()
+            .map_err(|e| SanitizeError::ArchiveError(format!("finalize zip: {}", e)))?;
+
+        Ok(stats)
+    }
+
+    // -----------------------------------------------------------------------
+    // Format-aware dispatch
+    // -----------------------------------------------------------------------
+
+    /// Auto-detect the archive format and process accordingly.
+    ///
+    /// For zip archives the reader must additionally implement `Seek`.
+    /// This method accepts `Read + Seek` to cover all formats uniformly.
+    /// Tar and tar.gz do not require seeking, but the bound is imposed
+    /// for a single entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SanitizeError::ArchiveError`] on I/O failures or
+    /// [`SanitizeError::RecursionDepthExceeded`] for nested archives.
+    pub fn process<R: Read + Seek, W: Write + Seek>(
+        &self,
+        reader: R,
+        writer: W,
+        format: ArchiveFormat,
+    ) -> Result<ArchiveStats> {
+        match format {
+            ArchiveFormat::Zip => self.process_zip(reader, writer),
+            ArchiveFormat::Tar => self.process_tar(reader, writer),
+            ArchiveFormat::TarGz => self.process_tar_gz(reader, writer),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Counting reader wrapper (for input byte tracking)
+// ---------------------------------------------------------------------------
+
+/// A thin wrapper around a reader that counts bytes read.
+struct CountingReader<'a> {
+    inner: &'a mut dyn Read,
+    count: u64,
+}
+
+impl<'a> CountingReader<'a> {
+    fn new(inner: &'a mut dyn Read) -> Self {
+        Self { inner, count: 0 }
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.count
+    }
+}
+
+impl Read for CountingReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+}
+
+/// A thin wrapper around a writer that counts bytes written (F-02 fix).
+struct CountingWriter<'a> {
+    inner: &'a mut dyn Write,
+    count: u64,
+}
+
+impl<'a> CountingWriter<'a> {
+    fn new(inner: &'a mut dyn Write) -> Self {
+        Self { inner, count: 0 }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.count
+    }
+}
+
+impl Write for CountingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::category::Category;
+    use crate::generator::HmacGenerator;
+    use crate::processor::profile::{FieldRule, FileTypeProfile};
+    use crate::processor::registry::ProcessorRegistry;
+    use crate::scanner::{ScanConfig, ScanPattern};
+    use std::io::Cursor;
+
+    /// Build a test archive processor with an email pattern and a JSON profile.
+    fn make_archive_processor() -> ArchiveProcessor {
+        let gen = Arc::new(HmacGenerator::new([42u8; 32]));
+        let store = Arc::new(MappingStore::new(gen, None));
+
+        let patterns = vec![
+            ScanPattern::from_regex(
+                r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+                Category::Email,
+                "email",
+            )
+            .unwrap(),
+            ScanPattern::from_literal("SUPERSECRET", Category::Custom("api_key".into()), "api_key")
+                .unwrap(),
+        ];
+
+        let scanner = Arc::new(
+            StreamScanner::new(patterns, Arc::clone(&store), ScanConfig::default()).unwrap(),
+        );
+
+        let registry = Arc::new(ProcessorRegistry::with_builtins());
+
+        let profiles = vec![FileTypeProfile::new(
+            "json",
+            vec![FieldRule::new("*").with_category(Category::Custom("field".into()))],
+        )
+        .with_extension(".json")];
+
+        ArchiveProcessor::new(registry, scanner, store, profiles)
+    }
+
+    // -- Tar tests ----------------------------------------------------------
+
+    fn build_test_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            for (name, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_mtime(1_700_000_000);
+                header.set_cksum();
+                builder.append_data(&mut header, *name, *data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn tar_sanitizes_plaintext_with_scanner() {
+        let proc = make_archive_processor();
+        let input = build_test_tar(&[("readme.txt", b"Contact alice@corp.com for help.")]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&input[..], &mut output).unwrap();
+
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.scanner_fallback, 1);
+        assert_eq!(stats.structured_hits, 0);
+
+        // Verify the output is a valid tar and the secret is gone.
+        let mut archive = tar::Archive::new(&output[..]);
+        for entry in archive.entries().unwrap() {
+            let mut e = entry.unwrap();
+            let mut content = String::new();
+            e.read_to_string(&mut content).unwrap();
+            assert!(
+                !content.contains("alice@corp.com"),
+                "email should be sanitized: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn tar_sanitizes_json_with_structured_processor() {
+        let proc = make_archive_processor();
+        let json_content = br#"{"email": "bob@example.org", "name": "Bob"}"#;
+        let input = build_test_tar(&[("config.json", json_content)]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&input[..], &mut output).unwrap();
+
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.structured_hits, 1);
+        assert_eq!(stats.scanner_fallback, 0);
+        assert_eq!(
+            stats.file_methods.get("config.json").unwrap(),
+            "structured:json"
+        );
+
+        // Verify sanitized output.
+        let mut archive = tar::Archive::new(&output[..]);
+        for entry in archive.entries().unwrap() {
+            let mut e = entry.unwrap();
+            let mut content = String::new();
+            e.read_to_string(&mut content).unwrap();
+            assert!(
+                !content.contains("bob@example.org"),
+                "email should be sanitized"
+            );
+            assert!(!content.contains("Bob"), "name should be sanitized");
+        }
+    }
+
+    #[test]
+    fn tar_preserves_metadata() {
+        let proc = make_archive_processor();
+        let input = build_test_tar(&[("data.txt", b"SUPERSECRET token here")]);
+
+        let mut output = Vec::new();
+        proc.process_tar(&input[..], &mut output).unwrap();
+
+        let mut archive = tar::Archive::new(&output[..]);
+        for entry in archive.entries().unwrap() {
+            let e = entry.unwrap();
+            let hdr = e.header();
+            assert_eq!(hdr.mode().unwrap(), 0o644);
+            assert_eq!(hdr.mtime().unwrap(), 1_700_000_000);
+        }
+    }
+
+    #[test]
+    fn tar_handles_multiple_files() {
+        let proc = make_archive_processor();
+        let input = build_test_tar(&[
+            ("a.txt", b"alice@corp.com"),
+            ("b.json", br#"{"key":"value"}"#),
+            ("c.log", b"no secrets here"),
+        ]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&input[..], &mut output).unwrap();
+
+        assert_eq!(stats.files_processed, 3);
+        // b.json matched the JSON profile
+        assert_eq!(stats.structured_hits, 1);
+        // a.txt and c.log fall back to scanner
+        assert_eq!(stats.scanner_fallback, 2);
+    }
+
+    #[test]
+    fn tar_passes_through_directories() {
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+
+            // Add a directory entry.
+            let mut dir_header = tar::Header::new_gnu();
+            dir_header.set_entry_type(tar::EntryType::Directory);
+            dir_header.set_size(0);
+            dir_header.set_mode(0o755);
+            dir_header.set_cksum();
+            builder
+                .append_data(&mut dir_header, "mydir/", &b""[..])
+                .unwrap();
+
+            // Add a file.
+            let mut file_header = tar::Header::new_gnu();
+            file_header.set_size(5);
+            file_header.set_mode(0o644);
+            file_header.set_cksum();
+            builder
+                .append_data(&mut file_header, "mydir/hello.txt", &b"hello"[..])
+                .unwrap();
+
+            builder.finish().unwrap();
+        }
+
+        let proc = make_archive_processor();
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&buf[..], &mut output).unwrap();
+
+        assert_eq!(stats.entries_skipped, 1);
+        assert_eq!(stats.files_processed, 1);
+    }
+
+    // -- Tar.gz tests -------------------------------------------------------
+
+    #[test]
+    fn tar_gz_round_trip() {
+        let proc = make_archive_processor();
+
+        // Build a tar and gzip it.
+        let tar_data = build_test_tar(&[("secret.txt", b"Key is SUPERSECRET okay")]);
+        let mut gz_input = Vec::new();
+        {
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut gz_input, flate2::Compression::fast());
+            encoder.write_all(&tar_data).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let mut gz_output = Vec::new();
+        let stats = proc.process_tar_gz(&gz_input[..], &mut gz_output).unwrap();
+
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.scanner_fallback, 1);
+
+        // Decompress and verify.
+        let decoder = flate2::read::GzDecoder::new(&gz_output[..]);
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive.entries().unwrap() {
+            let mut e = entry.unwrap();
+            let mut content = String::new();
+            e.read_to_string(&mut content).unwrap();
+            assert!(
+                !content.contains("SUPERSECRET"),
+                "secret should be sanitized: {content}"
+            );
+        }
+    }
+
+    // -- Zip tests ----------------------------------------------------------
+
+    fn build_test_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            for (name, data) in entries {
+                let options = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated);
+                zip.start_file(*name, options).unwrap();
+                zip.write_all(data).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    fn zip_sanitizes_plaintext_with_scanner() {
+        let proc = make_archive_processor();
+        let zip_data = build_test_zip(&[("notes.txt", b"Reach alice@corp.com for info.")]);
+
+        let reader = Cursor::new(&zip_data);
+        let mut writer = Cursor::new(Vec::new());
+        let stats = proc.process_zip(reader, &mut writer).unwrap();
+
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.scanner_fallback, 1);
+
+        // Verify the output zip.
+        let out_data = writer.into_inner();
+        let mut zip_out = zip::ZipArchive::new(Cursor::new(out_data)).unwrap();
+        let mut entry = zip_out.by_index(0).unwrap();
+        let mut content = String::new();
+        entry.read_to_string(&mut content).unwrap();
+        assert!(
+            !content.contains("alice@corp.com"),
+            "email should be sanitized: {content}"
+        );
+    }
+
+    #[test]
+    fn zip_sanitizes_json_with_structured_processor() {
+        let proc = make_archive_processor();
+        let json_content = br#"{"password": "hunter2", "host": "db.internal"}"#;
+        let zip_data = build_test_zip(&[("settings.json", json_content)]);
+
+        let reader = Cursor::new(&zip_data);
+        let mut writer = Cursor::new(Vec::new());
+        let stats = proc.process_zip(reader, &mut writer).unwrap();
+
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.structured_hits, 1);
+
+        let out_data = writer.into_inner();
+        let mut zip_out = zip::ZipArchive::new(Cursor::new(out_data)).unwrap();
+        let mut entry = zip_out.by_index(0).unwrap();
+        let mut content = String::new();
+        entry.read_to_string(&mut content).unwrap();
+        assert!(!content.contains("hunter2"), "password should be sanitized");
+        assert!(!content.contains("db.internal"), "host should be sanitized");
+    }
+
+    #[test]
+    fn zip_preserves_directory_entries() {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+
+            let dir_options = zip::write::FileOptions::default();
+            zip.add_directory("subdir/", dir_options).unwrap();
+
+            let file_options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("subdir/data.txt", file_options).unwrap();
+            zip.write_all(b"SUPERSECRET value").unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let zip_data = buf.into_inner();
+        let proc = make_archive_processor();
+        let reader = Cursor::new(&zip_data);
+        let mut writer = Cursor::new(Vec::new());
+        let stats = proc.process_zip(reader, &mut writer).unwrap();
+
+        assert_eq!(stats.entries_skipped, 1); // directory
+        assert_eq!(stats.files_processed, 1);
+    }
+
+    #[test]
+    fn zip_handles_multiple_files() {
+        let proc = make_archive_processor();
+        let zip_data = build_test_zip(&[
+            ("file1.txt", b"alice@corp.com"),
+            ("file2.json", br#"{"secret":"SUPERSECRET"}"#),
+            ("file3.log", b"nothing to see"),
+        ]);
+
+        let reader = Cursor::new(&zip_data);
+        let mut writer = Cursor::new(Vec::new());
+        let stats = proc.process_zip(reader, &mut writer).unwrap();
+
+        assert_eq!(stats.files_processed, 3);
+        assert_eq!(stats.structured_hits, 1); // JSON
+        assert_eq!(stats.scanner_fallback, 2); // .txt + .log
+    }
+
+    // -- Format detection tests ---------------------------------------------
+
+    #[test]
+    fn format_detection_from_path() {
+        assert_eq!(
+            ArchiveFormat::from_path("data.tar"),
+            Some(ArchiveFormat::Tar)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path("data.tar.gz"),
+            Some(ArchiveFormat::TarGz)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path("data.tgz"),
+            Some(ArchiveFormat::TarGz)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path("data.zip"),
+            Some(ArchiveFormat::Zip)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path("DATA.ZIP"),
+            Some(ArchiveFormat::Zip)
+        );
+        assert_eq!(ArchiveFormat::from_path("photo.png"), None);
+    }
+
+    // -- Determinism / dedup tests ------------------------------------------
+
+    #[test]
+    fn same_secret_gets_same_replacement_across_entries() {
+        let proc = make_archive_processor();
+        let input = build_test_tar(&[
+            ("a.txt", b"contact alice@corp.com"),
+            ("b.txt", b"reach alice@corp.com"),
+        ]);
+
+        let mut output = Vec::new();
+        proc.process_tar(&input[..], &mut output).unwrap();
+
+        let mut archive = tar::Archive::new(&output[..]);
+        let mut contents: Vec<String> = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let mut e = entry.unwrap();
+            let mut s = String::new();
+            e.read_to_string(&mut s).unwrap();
+            contents.push(s);
+        }
+
+        // Both files should have the *same* replacement for alice@corp.com.
+        // Extract the replacement by removing the prefix.
+        let replacement_a = contents[0].strip_prefix("contact ").unwrap();
+        let replacement_b = contents[1].strip_prefix("reach ").unwrap();
+        assert_eq!(
+            replacement_a, replacement_b,
+            "dedup should produce identical replacements"
+        );
+        assert!(!replacement_a.contains("alice@corp.com"));
+    }
+
+    // -- Auto-dispatch test -------------------------------------------------
+
+    #[test]
+    fn process_auto_dispatch_tar() {
+        let proc = make_archive_processor();
+        let tar_data = build_test_tar(&[("f.txt", b"SUPERSECRET")]);
+
+        let reader = Cursor::new(tar_data);
+        let writer = Cursor::new(Vec::new());
+        let stats = proc.process(reader, writer, ArchiveFormat::Tar).unwrap();
+
+        assert_eq!(stats.files_processed, 1);
+    }
+
+    #[test]
+    fn process_auto_dispatch_zip() {
+        let proc = make_archive_processor();
+        let zip_data = build_test_zip(&[("f.txt", b"SUPERSECRET")]);
+
+        let reader = Cursor::new(zip_data);
+        let mut writer = Cursor::new(Vec::new());
+        let stats = proc
+            .process(reader, &mut writer, ArchiveFormat::Zip)
+            .unwrap();
+
+        assert_eq!(stats.files_processed, 1);
+    }
+
+    // -- Empty archive tests ------------------------------------------------
+
+    #[test]
+    fn tar_empty_archive() {
+        let proc = make_archive_processor();
+        let tar_data = build_test_tar(&[]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&tar_data[..], &mut output).unwrap();
+
+        assert_eq!(stats.files_processed, 0);
+        assert_eq!(stats.entries_skipped, 0);
+    }
+
+    #[test]
+    fn zip_empty_archive() {
+        let proc = make_archive_processor();
+        let zip_data = build_test_zip(&[]);
+
+        let reader = Cursor::new(zip_data);
+        let mut writer = Cursor::new(Vec::new());
+        let stats = proc.process_zip(reader, &mut writer).unwrap();
+
+        assert_eq!(stats.files_processed, 0);
+    }
+}

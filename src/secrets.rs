@@ -1,0 +1,991 @@
+//! Encrypted secrets management.
+//!
+//! This module provides **in-memory-only** decryption of user-supplied
+//! secrets files. Secrets are never written to disk in plaintext form;
+//! they are loaded from an AES-256-GCM encrypted `.enc` file, decrypted
+//! into memory, parsed, and converted directly into [`ScanPattern`]s
+//! for the streaming scanner.
+//!
+//! # Encryption Format
+//!
+//! ```text
+//! ┌────────────────────────────────┬──────────────┬─────────────────────────────┐
+//! │  Salt (32 B)                   │  Nonce (12 B)│  AES-256-GCM Ciphertext     │
+//! └────────────────────────────────┴──────────────┴─────────────────────────────┘
+//! ```
+//!
+//! - **Salt** (32 bytes): random, used for PBKDF2-derived key.
+//! - **Nonce** (12 bytes): random, for AES-256-GCM.
+//! - **Ciphertext**: authenticated encryption of the plaintext secrets
+//!   file (JSON / YAML / TOML).
+//!
+//! The 256-bit AES key is derived from the user password using
+//! PBKDF2-HMAC-SHA256 with 600 000 iterations, which meets current
+//! OWASP recommendations.
+//!
+//! # Key Derivation
+//!
+//! ```text
+//! key = PBKDF2-HMAC-SHA256(password, salt, iterations=600_000, dkLen=32)
+//! ```
+//!
+//! # Secrets File Schema
+//!
+//! The plaintext secrets file (before encryption) must deserialize to
+//! `Vec<SecretEntry>`:
+//!
+//! ```json
+//! [
+//!   {
+//!     "pattern": "alice@corp\\.com",
+//!     "kind": "regex",
+//!     "category": "email",
+//!     "label": "alice_email"
+//!   },
+//!   {
+//!     "pattern": "sk-proj-abc123secret",
+//!     "kind": "literal",
+//!     "category": "custom:api_key",
+//!     "label": "openai_key"
+//!   }
+//! ]
+//! ```
+//!
+//! # Thread Safety
+//!
+//! All public types are `Send + Sync`. Decrypted secrets use
+//! [`zeroize::Zeroizing`] to scrub plaintext from memory on drop.
+//!
+//! # Security Considerations
+//!
+//! - AES-256-GCM provides both confidentiality and integrity (AEAD).
+//! - PBKDF2 with 600 000 iterations resists offline brute-force attacks.
+//! - Decrypted plaintext is held in [`Zeroizing<Vec<u8>>`] and zeroed
+//!   on drop.
+//! - The plaintext secrets file is never written to disk by this crate.
+//! - Nonce and salt are generated with OS CSPRNG (`rand`).
+
+use crate::category::Category;
+use crate::error::{Result, SanitizeError};
+use crate::scanner::ScanPattern;
+
+/// Result of compiling secret entries into patterns.
+/// Contains successfully compiled patterns and a list of (index, error) for failures.
+pub type PatternCompileResult = (Vec<ScanPattern>, Vec<(usize, SanitizeError)>);
+
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+use hmac::Hmac;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use zeroize::{Zeroize, Zeroizing};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Salt length for PBKDF2 key derivation (bytes).
+const SALT_LEN: usize = 32;
+
+/// AES-GCM nonce length (bytes). Must be 12 for AES-256-GCM.
+const NONCE_LEN: usize = 12;
+
+/// PBKDF2 iteration count — OWASP 2023+ recommendation.
+const PBKDF2_ITERATIONS: u32 = 600_000;
+
+/// Minimum ciphertext size: salt + nonce + at least 16-byte AES-GCM tag.
+const MIN_ENCRYPTED_LEN: usize = SALT_LEN + NONCE_LEN + 16;
+
+// ---------------------------------------------------------------------------
+// Secrets file schema
+// ---------------------------------------------------------------------------
+
+/// A single secret entry as stored in the (plaintext) secrets file.
+///
+/// After decryption the entries are parsed from JSON, YAML, or TOML and
+/// converted into [`ScanPattern`]s.
+///
+/// Implements [`Drop`] via [`Zeroize`] to scrub sensitive pattern data
+/// from memory when no longer needed (S-1 fix).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretEntry {
+    /// The pattern string (regex or literal text).
+    pub pattern: String,
+
+    /// `"regex"` or `"literal"`.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+
+    /// Category string. Supported values:
+    /// `email`, `name`, `phone`, `ipv4`, `ipv6`, `credit_card`, `ssn`,
+    /// `hostname`, `mac_address`, `container_id`, `uuid`, `jwt`,
+    /// `auth_token`, `file_path`, `windows_sid`, `url`, `aws_arn`,
+    /// `azure_resource_id`, or `custom:<tag>`.
+    #[serde(default = "default_category")]
+    pub category: String,
+
+    /// Human-readable label for stats reporting. Defaults to a truncated
+    /// version of `pattern` if omitted.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+impl Drop for SecretEntry {
+    fn drop(&mut self) {
+        self.pattern.zeroize();
+        self.kind.zeroize();
+        self.category.zeroize();
+        if let Some(ref mut l) = self.label {
+            l.zeroize();
+        }
+    }
+}
+
+fn default_kind() -> String {
+    "literal".into()
+}
+
+fn default_category() -> String {
+    "custom:secret".into()
+}
+
+/// Supported plaintext file formats for secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretsFormat {
+    Json,
+    Yaml,
+    Toml,
+}
+
+impl SecretsFormat {
+    /// Detect format from file extension.
+    pub fn from_extension(path: &str) -> Option<Self> {
+        // Strip .enc suffix first if present.
+        let base = path.strip_suffix(".enc").unwrap_or(path);
+        let ext = std::path::Path::new(base).extension();
+        if ext.is_some_and(|e| e.eq_ignore_ascii_case("json")) {
+            Some(Self::Json)
+        } else if ext.is_some_and(|e| {
+            e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml")
+        }) {
+            Some(Self::Yaml)
+        } else if ext.is_some_and(|e| e.eq_ignore_ascii_case("toml")) {
+            Some(Self::Toml)
+        } else {
+            None
+        }
+    }
+
+    /// Try to auto-detect format from content.
+    pub fn detect(content: &[u8]) -> Self {
+        let s = String::from_utf8_lossy(content);
+        let trimmed = s.trim_start();
+        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+            // Could be JSON array/object or TOML table header — try JSON
+            // first since TOML arrays look different.
+            Self::Json
+        } else if trimmed.starts_with('-') || trimmed.starts_with("---") {
+            Self::Yaml
+        } else {
+            // Fallback: assume TOML
+            Self::Toml
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TOML wrapper — serde_toml expects a top-level table
+// ---------------------------------------------------------------------------
+
+/// Wrapper for TOML deserialization: `secrets = [...]`
+#[derive(Deserialize)]
+struct TomlSecrets {
+    secrets: Vec<SecretEntry>,
+}
+
+/// Wrapper for TOML serialization.
+#[derive(Serialize)]
+struct TomlSecretsRef<'a> {
+    secrets: &'a [SecretEntry],
+}
+
+// ---------------------------------------------------------------------------
+// Key derivation
+// ---------------------------------------------------------------------------
+
+/// Derive a 256-bit AES key from a password and salt using PBKDF2.
+fn derive_key(password: &[u8], salt: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    pbkdf2::pbkdf2::<Hmac<Sha256>>(password, salt, PBKDF2_ITERATIONS, key.as_mut())
+        .expect("PBKDF2 output length is valid");
+    key
+}
+
+// ---------------------------------------------------------------------------
+// Encryption
+// ---------------------------------------------------------------------------
+
+/// Encrypt a plaintext secrets file.
+///
+/// Returns the encrypted blob: `salt (32) || nonce (12) || ciphertext`.
+///
+/// # Arguments
+///
+/// - `plaintext` — raw bytes of the secrets file (JSON / YAML / TOML).
+/// - `password` — user-supplied password.
+///
+/// # Errors
+///
+/// Returns [`SanitizeError::SecretsError`] if the password is empty or
+/// encryption fails.
+///
+/// # Security
+///
+/// - Salt and nonce are generated with CSPRNG.
+/// - Key is derived with PBKDF2 (600 000 iterations).
+/// - AES-256-GCM provides authenticated encryption.
+pub fn encrypt_secrets(plaintext: &[u8], password: &str) -> Result<Vec<u8>> {
+    if password.is_empty() {
+        return Err(SanitizeError::SecretsError(
+            "password must not be empty".into(),
+        ));
+    }
+
+    let mut rng = rand::thread_rng();
+
+    // Generate random salt and nonce.
+    let mut salt = [0u8; SALT_LEN];
+    rng.fill_bytes(&mut salt);
+
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    // Derive key.
+    let key = derive_key(password.as_bytes(), &salt);
+    let cipher = Aes256Gcm::new_from_slice(key.as_ref())
+        .map_err(|e| SanitizeError::SecretsError(format!("cipher init: {}", e)))?;
+
+    // Encrypt.
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| SanitizeError::SecretsError(format!("encryption failed: {}", e)))?;
+
+    // Assemble: salt || nonce || ciphertext
+    let mut output = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
+    output.extend_from_slice(&salt);
+    output.extend_from_slice(&nonce_bytes);
+    output.extend_from_slice(&ciphertext);
+
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// Decryption
+// ---------------------------------------------------------------------------
+
+/// Decrypt an encrypted secrets blob in memory.
+///
+/// Returns the plaintext wrapped in [`Zeroizing`] so it is scrubbed on drop.
+///
+/// # Arguments
+///
+/// - `encrypted` — `salt (32) || nonce (12) || ciphertext`.
+/// - `password` — user-supplied password.
+///
+/// # Errors
+///
+/// - [`SanitizeError::SecretsError`] if the blob is too short, the
+///   password is wrong, or the ciphertext has been tampered with.
+pub fn decrypt_secrets(encrypted: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>> {
+    if encrypted.len() < MIN_ENCRYPTED_LEN {
+        return Err(SanitizeError::SecretsError(
+            "encrypted file too short (corrupt or truncated)".into(),
+        ));
+    }
+
+    let salt = &encrypted[..SALT_LEN];
+    let nonce_bytes = &encrypted[SALT_LEN..SALT_LEN + NONCE_LEN];
+    let ciphertext = &encrypted[SALT_LEN + NONCE_LEN..];
+
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    let key = derive_key(password.as_bytes(), salt);
+    let cipher = Aes256Gcm::new_from_slice(key.as_ref())
+        .map_err(|e| SanitizeError::SecretsError(format!("cipher init: {}", e)))?;
+
+    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        SanitizeError::SecretsError("decryption failed: wrong password or corrupted file".into())
+    })?;
+
+    Ok(Zeroizing::new(plaintext))
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a decrypted plaintext into secret entries.
+///
+/// Supports JSON, YAML, and TOML. Format is auto-detected if `format`
+/// is `None`.
+///
+/// # Errors
+///
+/// Returns [`SanitizeError::SecretsError`] if the plaintext is not
+/// valid UTF-8 or cannot be parsed in the specified format.
+pub fn parse_secrets(plaintext: &[u8], format: Option<SecretsFormat>) -> Result<Vec<SecretEntry>> {
+    let fmt = format.unwrap_or_else(|| SecretsFormat::detect(plaintext));
+    let text = std::str::from_utf8(plaintext)
+        .map_err(|e| SanitizeError::SecretsError(format!("invalid UTF-8: {}", e)))?;
+
+    match fmt {
+        SecretsFormat::Json => serde_json::from_str(text)
+            .map_err(|e| SanitizeError::SecretsError(format!("JSON parse: {}", e))),
+        SecretsFormat::Yaml => serde_yaml_ng::from_str(text)
+            .map_err(|e| SanitizeError::SecretsError(format!("YAML parse: {}", e))),
+        SecretsFormat::Toml => {
+            let wrapper: TomlSecrets = toml::from_str(text)
+                .map_err(|e| SanitizeError::SecretsError(format!("TOML parse: {}", e)))?;
+            Ok(wrapper.secrets)
+        }
+    }
+}
+
+/// Serialize secret entries back into a plaintext format.
+///
+/// Used by the encryption helper CLI.
+///
+/// # Errors
+///
+/// Returns [`SanitizeError::SecretsError`] if serialization fails.
+pub fn serialize_secrets(entries: &[SecretEntry], format: SecretsFormat) -> Result<Vec<u8>> {
+    match format {
+        SecretsFormat::Json => serde_json::to_vec_pretty(entries)
+            .map_err(|e| SanitizeError::SecretsError(format!("JSON serialize: {}", e))),
+        SecretsFormat::Yaml => serde_yaml_ng::to_string(entries)
+            .map(|s| s.into_bytes())
+            .map_err(|e| SanitizeError::SecretsError(format!("YAML serialize: {}", e))),
+        SecretsFormat::Toml => {
+            let wrapper = TomlSecretsRef { secrets: entries };
+            toml::to_string_pretty(&wrapper)
+                .map(|s| s.into_bytes())
+                .map_err(|e| SanitizeError::SecretsError(format!("TOML serialize: {}", e)))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Category parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a category string into a [`Category`].
+///
+/// Accepted values: `email`, `name`, `phone`, `ipv4`, `ipv6`,
+/// `credit_card`, `ssn`, `hostname`, `mac_address`, `container_id`,
+/// `uuid`, `jwt`, `auth_token`, `file_path`, `windows_sid`, `url`,
+/// `aws_arn`, `azure_resource_id`, or `custom:<tag>`.
+pub fn parse_category(s: &str) -> Category {
+    match s {
+        "email" => Category::Email,
+        "name" => Category::Name,
+        "phone" => Category::Phone,
+        "ipv4" => Category::IpV4,
+        "ipv6" => Category::IpV6,
+        "credit_card" => Category::CreditCard,
+        "ssn" => Category::Ssn,
+        "hostname" => Category::Hostname,
+        "mac_address" => Category::MacAddress,
+        "container_id" => Category::ContainerId,
+        "uuid" => Category::Uuid,
+        "jwt" => Category::Jwt,
+        "auth_token" => Category::AuthToken,
+        "file_path" => Category::FilePath,
+        "windows_sid" => Category::WindowsSid,
+        "url" => Category::Url,
+        "aws_arn" => Category::AwsArn,
+        "azure_resource_id" => Category::AzureResourceId,
+        other => {
+            let tag = other.strip_prefix("custom:").unwrap_or(other);
+            Category::Custom(tag.into())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conversion to ScanPatterns
+// ---------------------------------------------------------------------------
+
+/// Convert parsed [`SecretEntry`]s into compiled [`ScanPattern`]s.
+///
+/// Invalid entries (e.g. bad regex) are collected as errors and
+/// returned alongside the successfully compiled patterns.
+pub fn entries_to_patterns(entries: &[SecretEntry]) -> PatternCompileResult {
+    let mut patterns = Vec::with_capacity(entries.len());
+    let mut errors = Vec::new();
+
+    for (i, entry) in entries.iter().enumerate() {
+        let category = parse_category(&entry.category);
+        let label = entry
+            .label
+            .clone()
+            .unwrap_or_else(|| truncate_label(&entry.pattern));
+
+        let result = match entry.kind.as_str() {
+            "regex" => ScanPattern::from_regex(&entry.pattern, category, label),
+            _ => ScanPattern::from_literal(&entry.pattern, category, label),
+        };
+
+        match result {
+            Ok(pat) => patterns.push(pat),
+            Err(e) => errors.push((i, e)),
+        }
+    }
+
+    (patterns, errors)
+}
+
+/// Truncate to a maximum label length.
+fn truncate_label(s: &str) -> String {
+    if s.len() <= 32 {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..31])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// High-level: load encrypted secrets → ScanPatterns
+// ---------------------------------------------------------------------------
+
+/// Load, decrypt, parse, and compile an encrypted secrets file into
+/// [`ScanPattern`]s ready for the streaming scanner.
+///
+/// This is the primary entry point for CLI integration.
+///
+/// # Arguments
+///
+/// - `encrypted_bytes` — raw bytes of the `.enc` file.
+/// - `password` — user-supplied password.
+/// - `format` — optional explicit format override.
+///
+/// # Returns
+///
+/// `(patterns, warnings)` where `warnings` contains indices and errors
+/// for entries that failed to compile.
+///
+/// # Security
+///
+/// The decrypted plaintext is held in zeroizing memory and dropped
+/// immediately after parsing.
+///
+/// # Errors
+///
+/// Returns [`SanitizeError::SecretsError`] if decryption or parsing fails.
+pub fn load_encrypted_secrets(
+    encrypted_bytes: &[u8],
+    password: &str,
+    format: Option<SecretsFormat>,
+) -> Result<PatternCompileResult> {
+    let plaintext = decrypt_secrets(encrypted_bytes, password)?;
+    let mut entries = parse_secrets(&plaintext, format)?;
+    let result = entries_to_patterns(&entries);
+    // Explicitly zeroize entries (S-2 fix — belt-and-suspenders with Drop).
+    for entry in &mut entries {
+        entry.pattern.zeroize();
+        entry.kind.zeroize();
+        entry.category.zeroize();
+        if let Some(ref mut l) = entry.label {
+            l.zeroize();
+        }
+    }
+    drop(entries);
+    Ok(result)
+}
+
+/// Load and parse a plaintext secrets file into [`ScanPattern`]s.
+///
+/// This function mirrors [`load_encrypted_secrets`] but skips
+/// AES decryption and password prompts entirely. It preserves
+/// memory hygiene by zeroizing parsed entries after compilation.
+///
+/// # Arguments
+///
+/// - `plaintext` — raw bytes of the secrets file (JSON / YAML / TOML).
+/// - `format` — optional explicit format override.
+///
+/// # Security
+///
+/// Even for unencrypted secrets, entries are zeroized after pattern
+/// compilation to minimise the window during which sensitive values
+/// reside in memory.
+///
+/// # Errors
+///
+/// Returns [`SanitizeError::SecretsError`] if parsing or pattern
+/// compilation fails.
+pub fn load_plaintext_secrets(
+    plaintext: &[u8],
+    format: Option<SecretsFormat>,
+) -> Result<PatternCompileResult> {
+    let mut entries = parse_secrets(plaintext, format)?;
+    let result = entries_to_patterns(&entries);
+    // Zeroize entries — same belt-and-suspenders approach as
+    // load_encrypted_secrets (S-2 fix).
+    for entry in &mut entries {
+        entry.pattern.zeroize();
+        entry.kind.zeroize();
+        entry.category.zeroize();
+        if let Some(ref mut l) = entry.label {
+            l.zeroize();
+        }
+    }
+    drop(entries);
+    Ok(result)
+}
+
+/// Detect whether raw file bytes look like an AES-256-GCM encrypted
+/// secrets blob (binary with salt+nonce header) or a plaintext secrets
+/// file (UTF-8 JSON / YAML / TOML).
+///
+/// Returns `true` if the content appears to be encrypted.
+///
+/// Heuristic:
+/// 1. Files shorter than the minimum encrypted length cannot be valid
+///    ciphertext.
+/// 2. If the content is valid UTF-8, starts with a JSON/YAML/TOML
+///    marker, and successfully parses as `Vec<SecretEntry>`, it is
+///    considered plaintext.
+/// 3. Otherwise it is assumed to be encrypted.
+pub fn looks_encrypted(data: &[u8]) -> bool {
+    if data.len() < MIN_ENCRYPTED_LEN {
+        // Too short for a valid encrypted blob — might be a tiny
+        // plaintext file, but definitely not encrypted.
+        return false;
+    }
+    // If the file is valid UTF-8 and starts with a recognisable
+    // plaintext marker, treat it as plaintext.
+    if let Ok(text) = std::str::from_utf8(data) {
+        let trimmed = text.trim_start();
+        let has_marker = trimmed.starts_with('[')
+            || trimmed.starts_with('{')
+            || trimmed.starts_with('-')
+            || trimmed.starts_with("---")
+            || trimmed.starts_with("[[")
+            || trimmed.starts_with('#');
+        if has_marker {
+            return false;
+        }
+    }
+    // Binary / non-UTF-8 → assume encrypted.
+    true
+}
+
+/// Unified loader: auto-detect encrypted vs plaintext and load
+/// secret patterns accordingly.
+///
+/// When `force_plaintext` is `true`, decryption is skipped regardless
+/// of file content. When `false`, the function uses [`looks_encrypted`]
+/// to choose the path automatically.
+///
+/// # Arguments
+///
+/// - `data` — raw bytes read from the secrets file.
+/// - `password` — password for decryption (ignored when plaintext).
+/// - `format` — optional format override.
+/// - `force_plaintext` — if `true`, always treat as plaintext.
+///
+/// # Returns
+///
+/// `(patterns, warnings, was_encrypted)` — the compiled patterns,
+/// any compile warnings, and a flag indicating which path was taken.
+///
+/// # Errors
+///
+/// Returns [`SanitizeError::SecretsError`] if decryption or parsing
+/// fails, or if a password is required but not provided.
+pub fn load_secrets_auto(
+    data: &[u8],
+    password: Option<&str>,
+    format: Option<SecretsFormat>,
+    force_plaintext: bool,
+) -> Result<(PatternCompileResult, bool)> {
+    if force_plaintext || !looks_encrypted(data) {
+        let result = load_plaintext_secrets(data, format)?;
+        Ok((result, false))
+    } else {
+        let pw = password.ok_or_else(|| {
+            SanitizeError::SecretsError(
+                "secrets file appears encrypted but no password was provided; \
+                 use --unencrypted-secrets if the file is plaintext"
+                    .into(),
+            )
+        })?;
+        let result = load_encrypted_secrets(data, pw, format)?;
+        Ok((result, true))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_json() -> &'static str {
+        r#"[
+            {
+                "pattern": "alice@corp\\.com",
+                "kind": "regex",
+                "category": "email",
+                "label": "alice_email"
+            },
+            {
+                "pattern": "sk-proj-abc123secret",
+                "kind": "literal",
+                "category": "custom:api_key",
+                "label": "openai_key"
+            }
+        ]"#
+    }
+
+    fn sample_yaml() -> &'static str {
+        r#"- pattern: "alice@corp\\.com"
+  kind: regex
+  category: email
+  label: alice_email
+- pattern: sk-proj-abc123secret
+  kind: literal
+  category: "custom:api_key"
+  label: openai_key
+"#
+    }
+
+    fn sample_toml() -> &'static str {
+        r#"[[secrets]]
+pattern = "alice@corp\\.com"
+kind = "regex"
+category = "email"
+label = "alice_email"
+
+[[secrets]]
+pattern = "sk-proj-abc123secret"
+kind = "literal"
+category = "custom:api_key"
+label = "openai_key"
+"#
+    }
+
+    // ---- Parsing ----
+
+    #[test]
+    fn parse_json_entries() {
+        let entries = parse_secrets(sample_json().as_bytes(), Some(SecretsFormat::Json)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, "regex");
+        assert_eq!(entries[0].category, "email");
+        assert_eq!(entries[1].kind, "literal");
+    }
+
+    #[test]
+    fn parse_yaml_entries() {
+        let entries = parse_secrets(sample_yaml().as_bytes(), Some(SecretsFormat::Yaml)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].label, Some("alice_email".into()));
+    }
+
+    #[test]
+    fn parse_toml_entries() {
+        let entries = parse_secrets(sample_toml().as_bytes(), Some(SecretsFormat::Toml)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].pattern, "sk-proj-abc123secret");
+    }
+
+    #[test]
+    fn parse_auto_detect_json() {
+        let entries = parse_secrets(sample_json().as_bytes(), None).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn parse_auto_detect_yaml() {
+        let entries = parse_secrets(sample_yaml().as_bytes(), None).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    // ---- Category parsing ----
+
+    #[test]
+    fn parse_builtin_categories() {
+        assert_eq!(parse_category("email"), Category::Email);
+        assert_eq!(parse_category("ipv4"), Category::IpV4);
+        assert_eq!(parse_category("ssn"), Category::Ssn);
+    }
+
+    #[test]
+    fn parse_custom_category() {
+        match parse_category("custom:api_key") {
+            Category::Custom(tag) => assert_eq!(tag.as_str(), "api_key"),
+            other => panic!("expected Custom, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_category_becomes_custom() {
+        match parse_category("foobar") {
+            Category::Custom(tag) => assert_eq!(tag.as_str(), "foobar"),
+            other => panic!("expected Custom, got {:?}", other),
+        }
+    }
+
+    // ---- Entries to patterns ----
+
+    #[test]
+    fn entries_to_patterns_success() {
+        let entries = parse_secrets(sample_json().as_bytes(), Some(SecretsFormat::Json)).unwrap();
+        let (patterns, errors) = entries_to_patterns(&entries);
+        assert_eq!(patterns.len(), 2);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn entries_to_patterns_bad_regex() {
+        let json = r#"[{"pattern": "[invalid(", "kind": "regex", "category": "email"}]"#;
+        let entries = parse_secrets(json.as_bytes(), Some(SecretsFormat::Json)).unwrap();
+        let (patterns, errors) = entries_to_patterns(&entries);
+        assert!(patterns.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, 0);
+    }
+
+    // ---- Encrypt / Decrypt round-trip ----
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let plaintext = sample_json().as_bytes();
+        let password = "test-password-42";
+
+        let encrypted = encrypt_secrets(plaintext, password).unwrap();
+
+        // Encrypted blob must be larger than plaintext (salt + nonce + tag).
+        assert!(encrypted.len() > plaintext.len());
+
+        let decrypted = decrypt_secrets(&encrypted, password).unwrap();
+        assert_eq!(decrypted.as_slice(), plaintext);
+    }
+
+    #[test]
+    fn decrypt_wrong_password_fails() {
+        let plaintext = b"hello";
+        let encrypted = encrypt_secrets(plaintext, "correct").unwrap();
+        let result = decrypt_secrets(&encrypted, "wrong");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decrypt_truncated_blob_fails() {
+        let result = decrypt_secrets(&[0u8; 10], "any");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decrypt_tampered_blob_fails() {
+        let plaintext = b"hello world";
+        let mut encrypted = encrypt_secrets(plaintext, "pw").unwrap();
+        // Flip a byte in the ciphertext portion.
+        let last = encrypted.len() - 1;
+        encrypted[last] ^= 0xFF;
+        let result = decrypt_secrets(&encrypted, "pw");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn encrypt_empty_password_rejected() {
+        let result = encrypt_secrets(b"hello", "");
+        assert!(result.is_err());
+    }
+
+    // ---- Full pipeline: encrypt → decrypt → parse → patterns ----
+
+    #[test]
+    fn full_pipeline_json() {
+        let plaintext = sample_json().as_bytes();
+        let password = "pipeline-test";
+
+        let encrypted = encrypt_secrets(plaintext, password).unwrap();
+        let (patterns, errors) =
+            load_encrypted_secrets(&encrypted, password, Some(SecretsFormat::Json)).unwrap();
+
+        assert_eq!(patterns.len(), 2);
+        assert!(errors.is_empty());
+        assert_eq!(patterns[0].label(), "alice_email");
+        assert_eq!(patterns[1].label(), "openai_key");
+    }
+
+    #[test]
+    fn full_pipeline_yaml() {
+        let plaintext = sample_yaml().as_bytes();
+        let password = "yaml-test";
+
+        let encrypted = encrypt_secrets(plaintext, password).unwrap();
+        let (patterns, errors) =
+            load_encrypted_secrets(&encrypted, password, Some(SecretsFormat::Yaml)).unwrap();
+
+        assert_eq!(patterns.len(), 2);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn full_pipeline_toml() {
+        let plaintext = sample_toml().as_bytes();
+        let password = "toml-test";
+
+        let encrypted = encrypt_secrets(plaintext, password).unwrap();
+        let (patterns, errors) =
+            load_encrypted_secrets(&encrypted, password, Some(SecretsFormat::Toml)).unwrap();
+
+        assert_eq!(patterns.len(), 2);
+        assert!(errors.is_empty());
+    }
+
+    // ---- Plaintext loader ----
+
+    #[test]
+    fn load_plaintext_secrets_works() {
+        let (patterns, errors) =
+            load_plaintext_secrets(sample_json().as_bytes(), Some(SecretsFormat::Json)).unwrap();
+        assert_eq!(patterns.len(), 2);
+        assert!(errors.is_empty());
+    }
+
+    // ---- Serialization round-trip ----
+
+    #[test]
+    fn serialize_roundtrip_json() {
+        let entries = parse_secrets(sample_json().as_bytes(), Some(SecretsFormat::Json)).unwrap();
+        let serialized = serialize_secrets(&entries, SecretsFormat::Json).unwrap();
+        let reparsed = parse_secrets(&serialized, Some(SecretsFormat::Json)).unwrap();
+        assert_eq!(entries.len(), reparsed.len());
+        assert_eq!(entries[0].pattern, reparsed[0].pattern);
+    }
+
+    // ---- Format detection ----
+
+    #[test]
+    fn format_from_extension() {
+        assert_eq!(
+            SecretsFormat::from_extension("secrets.json"),
+            Some(SecretsFormat::Json)
+        );
+        assert_eq!(
+            SecretsFormat::from_extension("secrets.json.enc"),
+            Some(SecretsFormat::Json)
+        );
+        assert_eq!(
+            SecretsFormat::from_extension("secrets.yaml"),
+            Some(SecretsFormat::Yaml)
+        );
+        assert_eq!(
+            SecretsFormat::from_extension("secrets.yml.enc"),
+            Some(SecretsFormat::Yaml)
+        );
+        assert_eq!(
+            SecretsFormat::from_extension("secrets.toml"),
+            Some(SecretsFormat::Toml)
+        );
+        assert_eq!(SecretsFormat::from_extension("secrets.txt"), None);
+    }
+
+    // ---- Defaults ----
+
+    #[test]
+    fn default_kind_is_literal() {
+        let json = r#"[{"pattern": "foo"}]"#;
+        let entries = parse_secrets(json.as_bytes(), Some(SecretsFormat::Json)).unwrap();
+        assert_eq!(entries[0].kind, "literal");
+    }
+
+    #[test]
+    fn default_category_is_custom_secret() {
+        let json = r#"[{"pattern": "foo"}]"#;
+        let entries = parse_secrets(json.as_bytes(), Some(SecretsFormat::Json)).unwrap();
+        assert_eq!(entries[0].category, "custom:secret");
+    }
+
+    #[test]
+    fn default_label_from_pattern() {
+        let json = r#"[{"pattern": "short"}]"#;
+        let entries = parse_secrets(json.as_bytes(), Some(SecretsFormat::Json)).unwrap();
+        let (patterns, _) = entries_to_patterns(&entries);
+        assert_eq!(patterns[0].label(), "short");
+    }
+
+    // ---- looks_encrypted ----
+
+    #[test]
+    fn looks_encrypted_json_plaintext() {
+        assert!(!looks_encrypted(sample_json().as_bytes()));
+    }
+
+    #[test]
+    fn looks_encrypted_yaml_plaintext() {
+        assert!(!looks_encrypted(sample_yaml().as_bytes()));
+    }
+
+    #[test]
+    fn looks_encrypted_toml_plaintext() {
+        assert!(!looks_encrypted(sample_toml().as_bytes()));
+    }
+
+    #[test]
+    fn looks_encrypted_actual_encrypted() {
+        let encrypted = encrypt_secrets(sample_json().as_bytes(), "pw").unwrap();
+        assert!(looks_encrypted(&encrypted));
+    }
+
+    #[test]
+    fn looks_encrypted_too_short() {
+        assert!(!looks_encrypted(&[0u8; 10]));
+    }
+
+    // ---- load_secrets_auto ----
+
+    #[test]
+    fn auto_load_plaintext_json() {
+        let data = sample_json().as_bytes();
+        let ((pats, errs), was_enc) =
+            load_secrets_auto(data, None, Some(SecretsFormat::Json), false).unwrap();
+        assert!(!was_enc);
+        assert_eq!(pats.len(), 2);
+        assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn auto_load_encrypted_json() {
+        let encrypted = encrypt_secrets(sample_json().as_bytes(), "pw").unwrap();
+        let ((pats, errs), was_enc) =
+            load_secrets_auto(&encrypted, Some("pw"), Some(SecretsFormat::Json), false).unwrap();
+        assert!(was_enc);
+        assert_eq!(pats.len(), 2);
+        assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn auto_load_force_plaintext() {
+        let data = sample_json().as_bytes();
+        let ((pats, _), was_enc) =
+            load_secrets_auto(data, None, Some(SecretsFormat::Json), true).unwrap();
+        assert!(!was_enc);
+        assert_eq!(pats.len(), 2);
+    }
+
+    #[test]
+    fn auto_load_encrypted_no_password_fails() {
+        let encrypted = encrypt_secrets(sample_json().as_bytes(), "pw").unwrap();
+        let result = load_secrets_auto(&encrypted, None, None, false);
+        assert!(result.is_err());
+    }
+}
