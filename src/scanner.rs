@@ -488,11 +488,7 @@ impl StreamScanner {
     ///
     /// Returns [`SanitizeError`] on I/O failures or if a replacement
     /// cannot be generated (e.g. store capacity exceeded).
-    pub fn scan_reader<R: Read, W: Write>(
-        &self,
-        reader: R,
-        writer: W,
-    ) -> Result<ScanStats> {
+    pub fn scan_reader<R: Read, W: Write>(&self, reader: R, writer: W) -> Result<ScanStats> {
         self.scan_reader_with_progress(reader, writer, None, |_| {})
     }
 
@@ -500,6 +496,11 @@ impl StreamScanner {
     ///
     /// `total_bytes` should be provided when the caller knows the full input
     /// size. When omitted, progress consumers should avoid percentages/ETA.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SanitizeError`] on I/O failures or if a replacement
+    /// cannot be generated (e.g. store capacity exceeded).
     pub fn scan_reader_with_progress<R: Read, W: Write, F>(
         &self,
         mut reader: R,
@@ -610,6 +611,11 @@ impl StreamScanner {
     }
 
     /// Scan a byte slice in memory and emit progress snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SanitizeError`] if a replacement cannot be generated
+    /// (e.g. store capacity exceeded).
     pub fn scan_bytes_with_progress<F>(
         &self,
         input: &[u8],
@@ -619,7 +625,12 @@ impl StreamScanner {
         F: FnMut(&ScanProgress),
     {
         let mut output = Vec::with_capacity(input.len());
-        let stats = self.scan_reader_with_progress(input, &mut output, Some(input.len() as u64), on_progress)?;
+        let stats = self.scan_reader_with_progress(
+            input,
+            &mut output,
+            Some(input.len() as u64),
+            on_progress,
+        )?;
         Ok((output, stats))
     }
 
@@ -1097,7 +1108,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(progress_output, baseline_output);
-        assert_eq!(progress_stats.bytes_processed, baseline_stats.bytes_processed);
+        assert_eq!(
+            progress_stats.bytes_processed,
+            baseline_stats.bytes_processed
+        );
         assert_eq!(progress_stats.bytes_output, baseline_stats.bytes_output);
         assert_eq!(progress_stats.matches_found, baseline_stats.matches_found);
         assert_eq!(
@@ -1106,7 +1120,10 @@ mod tests {
         );
         assert!(!updates.is_empty());
         assert_eq!(updates.last().unwrap().bytes_processed, input.len() as u64);
-        assert_eq!(updates.last().unwrap().total_bytes, Some(input.len() as u64));
+        assert_eq!(
+            updates.last().unwrap().total_bytes,
+            Some(input.len() as u64)
+        );
         assert_eq!(updates.last().unwrap().matches_found, 2);
     }
 
@@ -1122,15 +1139,26 @@ mod tests {
         let mut output = Vec::new();
         let mut updates = Vec::new();
         let stats = scanner
-            .scan_reader_with_progress(&input[..], &mut output, Some(input.len() as u64), |progress| {
-                updates.push(progress.clone());
-            })
+            .scan_reader_with_progress(
+                &input[..],
+                &mut output,
+                Some(input.len() as u64),
+                |progress| {
+                    updates.push(progress.clone());
+                },
+            )
             .unwrap();
 
         assert!(updates.len() >= 2);
-        assert_eq!(updates.last().unwrap().bytes_processed, stats.bytes_processed);
+        assert_eq!(
+            updates.last().unwrap().bytes_processed,
+            stats.bytes_processed
+        );
         assert_eq!(updates.last().unwrap().bytes_output, stats.bytes_output);
-        assert_eq!(updates.last().unwrap().total_bytes, Some(input.len() as u64));
+        assert_eq!(
+            updates.last().unwrap().total_bytes,
+            Some(input.len() as u64)
+        );
     }
 
     // ---- Scan via Read/Write interface ----
