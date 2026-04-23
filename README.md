@@ -41,40 +41,47 @@ Deterministic, one-way data sanitization engine and CLI tool.
 ## Quick Start
 
 ```bash
-# 1. Create a plaintext secrets file:
-cat > secrets.json <<'EOF'
-[
-  {
-    "pattern": "alice@corp\\.com",
-    "kind": "regex",
-    "category": "email",
-    "label": "alice_email"
-  },
-  {
-    "pattern": "sk-proj-abc123secret",
-    "kind": "literal",
-    "category": "custom:api_key",
-    "label": "openai_key"
-  }
-]
+# 1. Create a plaintext secrets file (YAML is the canonical authoring format):
+cat > secrets.yaml <<'EOF'
+- pattern: "alice@corp\\.com"
+  kind: regex
+  category: email
+  label: alice_email
+
+- pattern: "sk-proj-abc123secret"
+  kind: literal
+  category: "custom:api_key"
+  label: openai_key
 EOF
 
 # 2. Encrypt it (recommended for production):
-sanitize encrypt secrets.json secrets.json.enc --password "my-password"
+sanitize encrypt secrets.yaml secrets.yaml.enc --password "my-password"
 
 # 3. Remove the plaintext:
-rm secrets.json
+rm secrets.yaml
 
 # 4. Sanitize a file (prefer env var over --password for passwords):
 export SANITIZE_PASSWORD="my-password"
-sanitize data.log -s secrets.json.enc -o output.log
+sanitize data.log -s secrets.yaml.enc -o output.log
 
 # 5. Or write to stdout (default) and redirect:
-sanitize data.log -s secrets.json.enc > output.log
+sanitize data.log -s secrets.yaml.enc > output.log
 
 # 6. CI gate — fail the build if secrets are detected:
-sanitize config.yaml -s secrets.json.enc --fail-on-match
+sanitize config.yaml -s secrets.yaml.enc --fail-on-match
 ```
+
+### Quick Start - Guided Setup
+
+For a logs-focused starter template, run the interactive wizard:
+
+```bash
+sanitize guided
+```
+
+The wizard can generate a baseline secrets file, optionally encrypt it, and optionally run sanitization immediately.
+
+For a full step-by-step breakdown of prompts and the exact categories/patterns generated, see the `sanitize guided` section in [docs/cli-reference.md](docs/cli-reference.md).
 
 ### Quick Start — Stdin Pipes
 
@@ -82,7 +89,7 @@ You can pipe data directly into `sanitize`:
 
 ```bash
 # Pipe from grep:
-grep "error" app.log | sanitize -s secrets.json -p hunter2
+grep "error" app.log | sanitize -s secrets.yaml -p hunter2
 
 # Read from stdin, write sanitized output to a file:
 cat data.csv | sanitize -s secrets.enc -p pw -f csv -o clean.csv
@@ -96,17 +103,19 @@ mysqldump mydb | sanitize -s secrets.enc -p pw | gzip > dump.sql.gz
 Encryption is recommended but not required. You can use a plaintext secrets file directly:
 
 ```bash
-# Use a plaintext JSON/YAML/TOML secrets file (auto-detected):
-sanitize data.log -s secrets.json
+# Use a plaintext YAML secrets file (canonical; auto-detected):
+sanitize data.log -s secrets.yaml
 
 # Or explicitly skip encryption with --unencrypted-secrets:
-sanitize data.log -s secrets.json --unencrypted-secrets
+sanitize data.log -s secrets.yaml --unencrypted-secrets
 
 # Deterministic mode works the same way:
-sanitize data.csv -s secrets.json -d
+sanitize data.csv -s secrets.yaml -d
 ```
 
 No password or `SANITIZE_PASSWORD` env var is needed when using plaintext secrets. Memory hygiene (zeroization of parsed entries) is preserved.
+
+JSON and TOML secrets files remain fully supported for compatibility and automation, but YAML is the recommended default for human authoring.
 
 ---
 
