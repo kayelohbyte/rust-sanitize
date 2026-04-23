@@ -59,20 +59,22 @@
 //! is no restore mode. Re-running with the `--deterministic` flag and the
 //! same secrets will produce identical replacements.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use sanitize_engine::secrets::{decrypt_secrets, encrypt_secrets, parse_secrets, SecretsFormat};
 use sanitize_engine::{
-    atomic_write, ArchiveFormat, ArchiveProcessor, AtomicFileWriter, FileReport, HmacGenerator,
-    MappingStore, ProcessorRegistry, RandomGenerator, ReplacementGenerator, ReportBuilder,
-    ReportMetadata, ScanConfig, ScanStats, StreamScanner, DEFAULT_MAX_ARCHIVE_DEPTH,
+    atomic_write, ArchiveFormat, ArchiveProcessor, ArchiveProgress, AtomicFileWriter,
+    FileReport, HmacGenerator, MappingStore, ProcessorRegistry, RandomGenerator,
+    ReplacementGenerator, ReportBuilder, ReportMetadata, ScanConfig, ScanProgress, ScanStats,
+    StreamScanner, DEFAULT_MAX_ARCHIVE_DEPTH,
 };
 use std::fs;
+use std::env;
 use std::io::{self, BufReader, BufWriter, Cursor, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{info, warn};
 use zeroize::Zeroize;
 
@@ -85,9 +87,297 @@ const DEFAULT_MAX_STRUCTURED_FILE_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
 /// Global flag set by the SIGINT/SIGTERM handler.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+/// Default UI refresh interval for live progress rendering.
+const DEFAULT_PROGRESS_INTERVAL_MS: u64 = 200;
+
 /// Check whether a graceful shutdown has been requested.
 fn is_interrupted() -> bool {
     INTERRUPTED.load(Ordering::Relaxed)
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ProgressMode {
+    Auto,
+    On,
+    Off,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ProgressPolicy {
+    live_updates: bool,
+    milestone_updates: bool,
+}
+
+type SharedProgressReporter = Arc<Mutex<ProgressReporter>>;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ProgressContext {
+    stderr_is_terminal: bool,
+    is_ci: bool,
+    term_is_dumb: bool,
+    json_logs: bool,
+}
+
+impl ProgressContext {
+    fn detect(log_format: &str) -> Self {
+        let term = env::var("TERM").unwrap_or_default();
+        let ci = env::var_os("CI").is_some();
+
+        Self {
+            stderr_is_terminal: io::stderr().is_terminal(),
+            is_ci: ci,
+            term_is_dumb: term.eq_ignore_ascii_case("dumb"),
+            json_logs: log_format == "json",
+        }
+    }
+}
+
+impl ProgressPolicy {
+    fn from_mode(mode: ProgressMode, context: ProgressContext) -> Self {
+        match mode {
+            ProgressMode::Off => Self {
+                live_updates: false,
+                milestone_updates: false,
+            },
+            ProgressMode::On => Self {
+                live_updates: context.stderr_is_terminal && !context.json_logs,
+                milestone_updates: true,
+            },
+            ProgressMode::Auto => {
+                let allow_live = context.stderr_is_terminal
+                    && !context.is_ci
+                    && !context.term_is_dumb
+                    && !context.json_logs;
+                Self {
+                    live_updates: allow_live,
+                    milestone_updates: allow_live,
+                }
+            }
+        }
+    }
+}
+
+struct ProgressReporter {
+    policy: ProgressPolicy,
+    json_logs: bool,
+    interval: Duration,
+    spinner_index: usize,
+    last_emit: Option<Instant>,
+    last_units: u64,
+    rendered_line_len: usize,
+}
+
+impl ProgressReporter {
+    fn new(policy: ProgressPolicy, json_logs: bool, progress_interval_ms: u64) -> Self {
+        Self {
+            policy,
+            json_logs,
+            interval: Duration::from_millis(progress_interval_ms),
+            spinner_index: 0,
+            last_emit: None,
+            last_units: 0,
+            rendered_line_len: 0,
+        }
+    }
+
+    fn start_task(&mut self, label: &str) {
+        self.spinner_index = 0;
+        self.last_emit = None;
+        self.last_units = 0;
+        if self.policy.live_updates {
+            let frame = self.spinner_frame();
+            self.render_live_line(format!("{} {}", frame, label));
+        } else if self.policy.milestone_updates {
+            self.emit_milestone(label, None);
+        }
+    }
+
+    fn update_scan(&mut self, label: &str, progress: &ScanProgress) {
+        let min_delta = 8 * 1024 * 1024;
+        if !self.should_emit(progress.bytes_processed, min_delta) {
+            return;
+        }
+
+        if self.policy.live_updates {
+            let frame = self.spinner_frame();
+            self.render_live_line(format!(
+                "{} {}: {}",
+                frame,
+                label,
+                format_scan_progress(progress)
+            ));
+        } else if self.policy.milestone_updates {
+            self.emit_milestone(
+                label,
+                Some(format!("processed {}", format_scan_progress(progress))),
+            );
+        }
+    }
+
+    fn update_archive(&mut self, label: &str, progress: &ArchiveProgress) {
+        if !self.should_emit(progress.entries_seen, 1) {
+            return;
+        }
+
+        let detail = match progress.total_entries {
+            Some(total) => format!(
+                "entry {}/{} ({})",
+                progress.entries_seen, total, progress.current_entry
+            ),
+            None => format!("entry {} ({})", progress.entries_seen, progress.current_entry),
+        };
+
+        if self.policy.live_updates {
+            let frame = self.spinner_frame();
+            self.render_live_line(format!("{} {}: {}", frame, label, detail));
+        } else if self.policy.milestone_updates {
+            self.emit_milestone(label, Some(detail));
+        }
+    }
+
+    fn finish_task(&mut self, label: &str) {
+        if self.policy.live_updates {
+            self.render_final_line(format!("done: {}", label));
+        } else if self.policy.milestone_updates {
+            self.emit_milestone(label, Some("done".into()));
+        }
+    }
+
+    fn fail_task(&mut self, label: &str) {
+        if self.policy.live_updates {
+            self.render_final_line(format!("stopped: {}", label));
+        } else if self.policy.milestone_updates {
+            self.emit_milestone(label, Some("stopped".into()));
+        }
+    }
+
+    fn should_emit(&mut self, units: u64, min_delta: u64) -> bool {
+        let now = Instant::now();
+        let elapsed_ready = self
+            .last_emit
+            .map_or(true, |last_emit| now.duration_since(last_emit) >= self.interval);
+        let delta_ready = units >= self.last_units.saturating_add(min_delta);
+
+        if elapsed_ready || delta_ready {
+            self.last_emit = Some(now);
+            self.last_units = units;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn emit_milestone(&mut self, label: &str, detail: Option<String>) {
+        if self.json_logs {
+            if let Some(detail) = detail {
+                info!(task = label, detail = %detail, "progress update");
+            } else {
+                info!(task = label, "progress update");
+            }
+            return;
+        }
+
+        self.clear_live_line();
+        match detail {
+            Some(detail) => eprintln!("{}: {}", label, detail),
+            None => eprintln!("{}", label),
+        }
+    }
+
+    fn spinner_frame(&mut self) -> char {
+        const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+        let frame = FRAMES[self.spinner_index % FRAMES.len()];
+        self.spinner_index = (self.spinner_index + 1) % FRAMES.len();
+        frame
+    }
+
+    fn render_live_line(&mut self, line: String) {
+        let padded_line = if line.len() < self.rendered_line_len {
+            format!("{}{}", line, " ".repeat(self.rendered_line_len - line.len()))
+        } else {
+            line
+        };
+        self.rendered_line_len = padded_line.len();
+        let mut stderr = io::stderr().lock();
+        let _ = write!(stderr, "\r{}", padded_line);
+        let _ = stderr.flush();
+    }
+
+    fn render_final_line(&mut self, line: String) {
+        self.render_live_line(line);
+        let mut stderr = io::stderr().lock();
+        let _ = writeln!(stderr);
+        let _ = stderr.flush();
+        self.rendered_line_len = 0;
+    }
+
+    fn clear_live_line(&mut self) {
+        if self.rendered_line_len == 0 {
+            return;
+        }
+
+        let mut stderr = io::stderr().lock();
+        let _ = write!(stderr, "\r{}\r", " ".repeat(self.rendered_line_len));
+        let _ = stderr.flush();
+        self.rendered_line_len = 0;
+    }
+}
+
+fn format_scan_progress(progress: &ScanProgress) -> String {
+    match progress.total_bytes {
+        Some(total_bytes) if total_bytes > 0 => format!(
+            "{} / {} ({:.0}%)",
+            format_bytes(progress.bytes_processed),
+            format_bytes(total_bytes),
+            (progress.bytes_processed as f64 / total_bytes as f64) * 100.0
+        ),
+        _ => format_bytes(progress.bytes_processed),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    let mut value = bytes as f64;
+    let mut unit_index = 0;
+    while value >= 1024.0 && unit_index < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+
+    if unit_index == 0 {
+        format!("{} {}", bytes, UNITS[unit_index])
+    } else {
+        format!("{value:.1} {}", UNITS[unit_index])
+    }
+}
+
+fn with_progress_scope<T, F>(
+    progress: Option<&SharedProgressReporter>,
+    label: &str,
+    action: F,
+) -> Result<T, String>
+where
+    F: FnOnce(Option<SharedProgressReporter>) -> Result<T, String>,
+{
+    let progress = progress.cloned();
+
+    if let Some(reporter) = &progress {
+        reporter.lock().unwrap().start_task(label);
+    }
+
+    let result = action(progress.clone());
+
+    if let Some(reporter) = &progress {
+        let mut reporter = reporter.lock().unwrap();
+        if result.is_ok() {
+            reporter.finish_task(label);
+        } else {
+            reporter.fail_task(label);
+        }
+    }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +533,30 @@ struct Cli {
     /// Log output format: "human" (default) or "json" (for SIEM ingestion).
     #[arg(long, value_name = "FMT", default_value = "human")]
     log_format: String,
+
+    /// Progress display mode: auto (default), on, or off.
+    #[arg(long, value_enum, value_name = "MODE")]
+    progress: Option<ProgressMode>,
+
+    /// Disable live progress output.
+    #[arg(long)]
+    no_progress: bool,
+
+    /// Minimum interval between live progress refreshes.
+    #[arg(long, value_name = "MS", default_value_t = DEFAULT_PROGRESS_INTERVAL_MS)]
+    progress_interval_ms: u64,
+}
+
+impl Cli {
+    fn effective_progress_mode(&self) -> ProgressMode {
+        if let Some(mode) = self.progress {
+            mode
+        } else if self.no_progress {
+            ProgressMode::Off
+        } else {
+            ProgressMode::Auto
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -699,6 +1013,10 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
         ));
     }
 
+    if cli.progress_interval_ms == 0 {
+        return Err("--progress-interval-ms must be greater than 0".into());
+    }
+
     Ok(())
 }
 
@@ -724,6 +1042,7 @@ fn process_stdin(
     registry: &Arc<ProcessorRegistry>,
     store: &Arc<MappingStore>,
     report_builder: Option<&ReportBuilder>,
+    progress: Option<&SharedProgressReporter>,
 ) -> Result<bool, String> {
     // Determine whether structured processing should be attempted.
     let structured_ext = cli.format.as_deref().and_then(format_to_ext);
@@ -748,69 +1067,71 @@ fn process_stdin(
             let cursor = Cursor::new(input_bytes);
             let chained = cursor.chain(io::stdin().lock());
             let reader = BufReader::new(chained);
-            return process_stdin_streaming(reader, cli, scanner, report_builder);
+            return process_stdin_streaming(reader, cli, scanner, report_builder, progress);
         }
 
         let store_len_before = store.len();
-        let structured_result =
-            try_structured_processing(&input_bytes, &format!("stdin.{ext}"), registry, store);
+        let label = format!("Processing structured stdin ({ext})");
+        return with_progress_scope(progress, &label, |_| {
+            let structured_result =
+                try_structured_processing(&input_bytes, &format!("stdin.{ext}"), registry, store);
 
-        match structured_result {
-            Some(Ok(output_bytes)) => {
-                let method = format!("structured:{ext}");
-                let replacements = store.len().saturating_sub(store_len_before) as u64;
-                if replacements > 0 {
-                    had_matches = true;
+            match structured_result {
+                Some(Ok(output_bytes)) => {
+                    let method = format!("structured:{ext}");
+                    let replacements = store.len().saturating_sub(store_len_before) as u64;
+                    if replacements > 0 {
+                        had_matches = true;
+                    }
+                    if let Some(rb) = report_builder {
+                        let stats = ScanStats {
+                            matches_found: replacements,
+                            replacements_applied: replacements,
+                            bytes_processed: input_bytes.len() as u64,
+                            bytes_output: output_bytes.len() as u64,
+                            ..Default::default()
+                        };
+                        rb.record_file(FileReport::from_scan_stats(
+                            "<stdin>".to_string(),
+                            &stats,
+                            method,
+                        ));
+                    }
+                    if !cli.dry_run {
+                        write_output(cli, &output_bytes)?;
+                    }
+                    return Ok(had_matches);
                 }
-                if let Some(rb) = report_builder {
-                    let stats = ScanStats {
-                        matches_found: replacements,
-                        replacements_applied: replacements,
-                        bytes_processed: input_bytes.len() as u64,
-                        bytes_output: output_bytes.len() as u64,
-                        ..Default::default()
-                    };
-                    rb.record_file(FileReport::from_scan_stats(
-                        "<stdin>".to_string(),
-                        &stats,
-                        method,
-                    ));
+                Some(Err(e)) => {
+                    if cli.strict {
+                        return Err(format!("structured processing failed: {e}"));
+                    }
+                    warn!(error = %e, "structured processing failed, falling back to scanner");
                 }
-                if !cli.dry_run {
-                    write_output(cli, &output_bytes)?;
-                }
-                return Ok(had_matches);
+                None => {}
             }
-            Some(Err(e)) => {
-                if cli.strict {
-                    return Err(format!("structured processing failed: {e}"));
-                }
-                warn!(error = %e, "structured processing failed, falling back to scanner");
-            }
-            None => {}
-        }
 
-        // Structured processing not applicable or failed — scan the buffered bytes.
-        let (output_bytes, stats) = scanner_fallback(scanner, &input_bytes)?;
-        if stats.matches_found > 0 {
-            had_matches = true;
-        }
-        if let Some(rb) = report_builder {
-            rb.record_file(FileReport::from_scan_stats(
-                "<stdin>".to_string(),
-                &stats,
-                "scanner",
-            ));
-        }
-        if !cli.dry_run {
-            write_output(cli, &output_bytes)?;
-        }
-        return Ok(had_matches);
+            let (output_bytes, stats) = scanner_fallback(scanner, &input_bytes)?;
+            if stats.matches_found > 0 {
+                had_matches = true;
+            }
+            if let Some(rb) = report_builder {
+                rb.record_file(FileReport::from_scan_stats(
+                    "<stdin>".to_string(),
+                    &stats,
+                    "scanner",
+                ));
+            }
+            if !cli.dry_run {
+                write_output(cli, &output_bytes)?;
+            }
+            Ok(had_matches)
+        });
     }
 
     // Plain text streaming from stdin.
     let reader = BufReader::new(io::stdin().lock());
-    process_stdin_streaming(reader, cli, scanner, report_builder)
+    process_stdin_streaming(reader, cli, scanner, report_builder, progress)
 }
 
 /// Stream stdin through the scanner, writing to output (stdout or file).
@@ -819,77 +1140,100 @@ fn process_stdin_streaming<R: io::Read>(
     cli: &Cli,
     scanner: &Arc<StreamScanner>,
     report_builder: Option<&ReportBuilder>,
+    progress: Option<&SharedProgressReporter>,
 ) -> Result<bool, String> {
-    let mut had_matches = false;
-
-    if cli.dry_run {
-        let stats = scanner
-            .scan_reader(reader, io::sink())
-            .map_err(|e| format!("scanner error: {e}"))?;
-        if stats.matches_found > 0 {
-            had_matches = true;
-        }
-        if let Some(rb) = report_builder {
-            rb.record_file(FileReport::from_scan_stats(
-                "<stdin>".to_string(),
-                &stats,
-                "scanner",
-            ));
-        }
-        info!(
-            matches = stats.matches_found,
-            replacements = stats.replacements_applied,
-            "dry-run complete"
-        );
-        return Ok(had_matches);
-    }
-
-    if let Some(ref out_path) = cli.output {
-        let mut atomic_writer =
-            AtomicFileWriter::new(out_path).map_err(|e| format!("failed to create output: {e}"))?;
-
-        let stats = scanner
-            .scan_reader(reader, &mut atomic_writer)
-            .map_err(|e| format!("scanner error: {e}"))?;
-
-        if is_interrupted() {
-            return Err("interrupted — partial output discarded".into());
-        }
-
-        atomic_writer
-            .finish()
-            .map_err(|e| format!("failed to finalize output: {e}"))?;
-
-        if stats.matches_found > 0 {
-            had_matches = true;
-        }
-        if let Some(rb) = report_builder {
-            rb.record_file(FileReport::from_scan_stats(
-                "<stdin>".to_string(),
-                &stats,
-                "scanner",
-            ));
-        }
+    let label = if cli.dry_run {
+        "Scanning stdin (dry-run)"
     } else {
-        // stdout
-        let stdout = io::stdout();
-        let writer = BufWriter::new(stdout.lock());
-        let stats = scanner
-            .scan_reader(reader, writer)
-            .map_err(|e| format!("scanner error: {e}"))?;
-        if stats.matches_found > 0 {
-            had_matches = true;
-        }
-        if let Some(rb) = report_builder {
-            rb.record_file(FileReport::from_scan_stats(
-                "<stdin>".to_string(),
-                &stats,
-                "scanner",
-            ));
-        }
-    }
+        "Scanning stdin"
+    };
 
-    Ok(had_matches)
+    with_progress_scope(progress, label, |progress| {
+        let mut had_matches = false;
+
+        if cli.dry_run {
+            let progress_for_scan = progress.clone();
+            let stats = scanner
+                .scan_reader_with_progress(reader, io::sink(), None, move |scan_progress| {
+                    if let Some(reporter) = &progress_for_scan {
+                        reporter.lock().unwrap().update_scan(label, scan_progress);
+                    }
+                })
+                .map_err(|e| format!("scanner error: {e}"))?;
+            if stats.matches_found > 0 {
+                had_matches = true;
+            }
+            if let Some(rb) = report_builder {
+                rb.record_file(FileReport::from_scan_stats(
+                    "<stdin>".to_string(),
+                    &stats,
+                    "scanner",
+                ));
+            }
+            info!(
+                matches = stats.matches_found,
+                replacements = stats.replacements_applied,
+                "dry-run complete"
+            );
+            return Ok(had_matches);
+        }
+
+        if let Some(ref out_path) = cli.output {
+            let mut atomic_writer = AtomicFileWriter::new(out_path)
+                .map_err(|e| format!("failed to create output: {e}"))?;
+
+            let progress_for_scan = progress.clone();
+            let stats = scanner
+                .scan_reader_with_progress(reader, &mut atomic_writer, None, move |scan_progress| {
+                    if let Some(reporter) = &progress_for_scan {
+                        reporter.lock().unwrap().update_scan(label, scan_progress);
+                    }
+                })
+                .map_err(|e| format!("scanner error: {e}"))?;
+
+            if is_interrupted() {
+                return Err("interrupted — partial output discarded".into());
+            }
+
+            atomic_writer
+                .finish()
+                .map_err(|e| format!("failed to finalize output: {e}"))?;
+
+            if stats.matches_found > 0 {
+                had_matches = true;
+            }
+            if let Some(rb) = report_builder {
+                rb.record_file(FileReport::from_scan_stats(
+                    "<stdin>".to_string(),
+                    &stats,
+                    "scanner",
+                ));
+            }
+        } else {
+            let stdout = io::stdout();
+            let writer = BufWriter::new(stdout.lock());
+            let progress_for_scan = progress.clone();
+            let stats = scanner
+                .scan_reader_with_progress(reader, writer, None, move |scan_progress| {
+                    if let Some(reporter) = &progress_for_scan {
+                        reporter.lock().unwrap().update_scan(label, scan_progress);
+                    }
+                })
+                .map_err(|e| format!("scanner error: {e}"))?;
+            if stats.matches_found > 0 {
+                had_matches = true;
+            }
+            if let Some(rb) = report_builder {
+                rb.record_file(FileReport::from_scan_stats(
+                    "<stdin>".to_string(),
+                    &stats,
+                    "scanner",
+                ));
+            }
+        }
+
+        Ok(had_matches)
+    })
 }
 
 /// Process a plain (non-archive) file. Returns `true` if matches were found.
@@ -900,6 +1244,7 @@ fn process_plain_file(
     registry: &Arc<ProcessorRegistry>,
     store: &Arc<MappingStore>,
     report_builder: Option<&ReportBuilder>,
+    progress: Option<&SharedProgressReporter>,
 ) -> Result<bool, String> {
     // --- binary detection ---
     let mut sample = [0u8; 512];
@@ -966,68 +1311,68 @@ fn process_plain_file(
             // without a redundant re-scan of the input.
             let store_len_before = store.len();
 
-            let structured_result =
-                try_structured_processing(&input_bytes, &filename, registry, store);
+            let label = format!("Processing structured {}", input.display());
+            return with_progress_scope(progress, &label, |_| {
+                let structured_result =
+                    try_structured_processing(&input_bytes, &filename, registry, store);
 
-            let (output_bytes, method, was_structured, fallback_stats) = match structured_result {
-                Some(Ok(bytes)) => {
-                    let ext = filename.rsplit('.').next().unwrap_or("unknown");
-                    (bytes, format!("structured:{ext}"), true, None)
-                }
-                Some(Err(e)) => {
-                    if cli.strict {
-                        return Err(format!("structured processing failed: {e}"));
+                let (output_bytes, method, was_structured, fallback_stats) = match structured_result {
+                    Some(Ok(bytes)) => {
+                        let ext = filename.rsplit('.').next().unwrap_or("unknown");
+                        (bytes, format!("structured:{ext}"), true, None)
                     }
-                    warn!(error = %e, "structured processing failed, falling back to scanner");
-                    let (out, stats) = scanner_fallback(scanner, &input_bytes)?;
-                    (out, "scanner".into(), false, Some(stats))
-                }
-                None => {
-                    let (out, stats) = scanner_fallback(scanner, &input_bytes)?;
-                    (out, "scanner".into(), false, Some(stats))
-                }
-            };
-
-            if cli.dry_run || report_builder.is_some() || cli.fail_on_match {
-                // For structured processing, derive stats from the store
-                // delta to avoid a redundant full re-scan.
-                let replacements = if was_structured {
-                    store.len().saturating_sub(store_len_before) as u64
-                } else {
-                    // Reuse stats from the scanner fallback pass.
-                    fallback_stats
-                        .as_ref()
-                        .map_or(0, |s| s.replacements_applied)
+                    Some(Err(e)) => {
+                        if cli.strict {
+                            return Err(format!("structured processing failed: {e}"));
+                        }
+                        warn!(error = %e, "structured processing failed, falling back to scanner");
+                        let (out, stats) = scanner_fallback(scanner, &input_bytes)?;
+                        (out, "scanner".into(), false, Some(stats))
+                    }
+                    None => {
+                        let (out, stats) = scanner_fallback(scanner, &input_bytes)?;
+                        (out, "scanner".into(), false, Some(stats))
+                    }
                 };
 
-                if replacements > 0 {
-                    had_matches = true;
-                }
-                if let Some(rb) = report_builder {
-                    let stats = ScanStats {
-                        matches_found: replacements,
-                        replacements_applied: replacements,
-                        bytes_processed: input_bytes.len() as u64,
-                        bytes_output: output_bytes.len() as u64,
-                        ..Default::default()
+                if cli.dry_run || report_builder.is_some() || cli.fail_on_match {
+                    let replacements = if was_structured {
+                        store.len().saturating_sub(store_len_before) as u64
+                    } else {
+                        fallback_stats
+                            .as_ref()
+                            .map_or(0, |s| s.replacements_applied)
                     };
-                    rb.record_file(FileReport::from_scan_stats(
-                        input.display().to_string(),
-                        &stats,
-                        method,
-                    ));
+
+                    if replacements > 0 {
+                        had_matches = true;
+                    }
+                    if let Some(rb) = report_builder {
+                        let stats = ScanStats {
+                            matches_found: replacements,
+                            replacements_applied: replacements,
+                            bytes_processed: input_bytes.len() as u64,
+                            bytes_output: output_bytes.len() as u64,
+                            ..Default::default()
+                        };
+                        rb.record_file(FileReport::from_scan_stats(
+                            input.display().to_string(),
+                            &stats,
+                            method,
+                        ));
+                    }
+                    if cli.dry_run {
+                        info!(
+                            matches = replacements,
+                            replacements = replacements,
+                            "dry-run complete"
+                        );
+                        return Ok(had_matches);
+                    }
                 }
-                if cli.dry_run {
-                    info!(
-                        matches = replacements,
-                        replacements = replacements,
-                        "dry-run complete"
-                    );
-                    return Ok(had_matches);
-                }
-            }
-            write_output(cli, &output_bytes)?;
-            return Ok(had_matches);
+                write_output(cli, &output_bytes)?;
+                Ok(had_matches)
+            });
         }
     }
 
@@ -1035,88 +1380,112 @@ fn process_plain_file(
     let method = "scanner";
 
     if cli.dry_run {
-        let reader = BufReader::new(
-            fs::File::open(input)
-                .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-        );
-        let stats = scanner
-            .scan_reader(reader, io::sink())
-            .map_err(|e| format!("scan error: {e}"))?;
-        if stats.matches_found > 0 {
-            had_matches = true;
-        }
-        if let Some(rb) = report_builder {
-            rb.record_file(FileReport::from_scan_stats(
-                input.display().to_string(),
-                &stats,
-                method,
-            ));
-        }
-        info!(
-            matches = stats.matches_found,
-            replacements = stats.replacements_applied,
-            "dry-run complete"
-        );
-        return Ok(had_matches);
+        let label = format!("Scanning {} (dry-run)", input.display());
+        let progress_label = label.clone();
+        return with_progress_scope(progress, &label, move |progress| {
+            let reader = BufReader::new(
+                fs::File::open(input)
+                    .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+            );
+            let progress_for_scan = progress.clone();
+            let stats = scanner
+                .scan_reader_with_progress(reader, io::sink(), Some(file_size(input)?), move |scan_progress| {
+                    if let Some(reporter) = &progress_for_scan {
+                        reporter.lock().unwrap().update_scan(&progress_label, scan_progress);
+                    }
+                })
+                .map_err(|e| format!("scan error: {e}"))?;
+            if stats.matches_found > 0 {
+                had_matches = true;
+            }
+            if let Some(rb) = report_builder {
+                rb.record_file(FileReport::from_scan_stats(
+                    input.display().to_string(),
+                    &stats,
+                    method,
+                ));
+            }
+            info!(
+                matches = stats.matches_found,
+                replacements = stats.replacements_applied,
+                "dry-run complete"
+            );
+            Ok(had_matches)
+        });
     }
 
     // Real streaming output.
     if let Some(ref out_path) = cli.output {
-        let reader = BufReader::new(
-            fs::File::open(input)
-                .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-        );
-        // Atomic output: write to temp, then rename.
-        let mut atomic_writer =
-            AtomicFileWriter::new(out_path).map_err(|e| format!("failed to create output: {e}"))?;
+        let label = format!("Scanning {}", input.display());
+        let progress_label = label.clone();
+        return with_progress_scope(progress, &label, move |progress| {
+            let reader = BufReader::new(
+                fs::File::open(input)
+                    .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+            );
+            let mut atomic_writer = AtomicFileWriter::new(out_path)
+                .map_err(|e| format!("failed to create output: {e}"))?;
 
-        let stats = scanner
-            .scan_reader(reader, &mut atomic_writer)
-            .map_err(|e| format!("scanner error: {e}"))?;
+            let progress_for_scan = progress.clone();
+            let stats = scanner
+                .scan_reader_with_progress(reader, &mut atomic_writer, Some(file_size(input)?), move |scan_progress| {
+                    if let Some(reporter) = &progress_for_scan {
+                        reporter.lock().unwrap().update_scan(&progress_label, scan_progress);
+                    }
+                })
+                .map_err(|e| format!("scanner error: {e}"))?;
 
-        if is_interrupted() {
-            // Drop will clean up temp file.
-            return Err("interrupted — partial output discarded".into());
-        }
+            if is_interrupted() {
+                return Err("interrupted — partial output discarded".into());
+            }
 
-        atomic_writer
-            .finish()
-            .map_err(|e| format!("failed to finalize output: {e}"))?;
+            atomic_writer
+                .finish()
+                .map_err(|e| format!("failed to finalize output: {e}"))?;
 
-        if stats.matches_found > 0 {
-            had_matches = true;
-        }
-        if let Some(rb) = report_builder {
-            rb.record_file(FileReport::from_scan_stats(
-                input.display().to_string(),
-                &stats,
-                method,
-            ));
-        }
+            if stats.matches_found > 0 {
+                had_matches = true;
+            }
+            if let Some(rb) = report_builder {
+                rb.record_file(FileReport::from_scan_stats(
+                    input.display().to_string(),
+                    &stats,
+                    method,
+                ));
+            }
+            Ok(had_matches)
+        });
     } else {
-        // stdout
-        let reader = BufReader::new(
-            fs::File::open(input)
-                .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-        );
-        let stdout = io::stdout();
-        let writer = BufWriter::new(stdout.lock());
-        let stats = scanner
-            .scan_reader(reader, writer)
-            .map_err(|e| format!("scanner error: {e}"))?;
-        if stats.matches_found > 0 {
-            had_matches = true;
-        }
-        if let Some(rb) = report_builder {
-            rb.record_file(FileReport::from_scan_stats(
-                input.display().to_string(),
-                &stats,
-                method,
-            ));
-        }
+        let label = format!("Scanning {}", input.display());
+        let progress_label = label.clone();
+        return with_progress_scope(progress, &label, move |progress| {
+            let reader = BufReader::new(
+                fs::File::open(input)
+                    .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+            );
+            let stdout = io::stdout();
+            let writer = BufWriter::new(stdout.lock());
+            let progress_for_scan = progress.clone();
+            let stats = scanner
+                .scan_reader_with_progress(reader, writer, Some(file_size(input)?), move |scan_progress| {
+                    if let Some(reporter) = &progress_for_scan {
+                        reporter.lock().unwrap().update_scan(&progress_label, scan_progress);
+                    }
+                })
+                .map_err(|e| format!("scanner error: {e}"))?;
+            if stats.matches_found > 0 {
+                had_matches = true;
+            }
+            if let Some(rb) = report_builder {
+                rb.record_file(FileReport::from_scan_stats(
+                    input.display().to_string(),
+                    &stats,
+                    method,
+                ));
+            }
+            Ok(had_matches)
+        });
     }
-
-    Ok(had_matches)
 }
 
 /// Attempt structured processing for a file based on its extension.
@@ -1169,155 +1538,148 @@ fn process_archive(
     store: &Arc<MappingStore>,
     format: ArchiveFormat,
     report_builder: Option<&ReportBuilder>,
+    progress: Option<&SharedProgressReporter>,
 ) -> Result<bool, String> {
     let output_path = cli
         .output
         .clone()
         .unwrap_or_else(|| default_archive_output(input, format));
+    let label = format!("Processing archive {}", input.display());
 
-    let mut had_matches = false;
+    with_progress_scope(progress, &label, |progress| {
+        let archive_proc = if let Some(progress) = &progress {
+            let label = label.clone();
+            let progress = Arc::clone(progress);
+            ArchiveProcessor::new(
+                Arc::clone(registry),
+                Arc::clone(scanner),
+                Arc::clone(store),
+                vec![],
+            )
+            .with_max_depth(cli.max_archive_depth)
+            .with_progress_callback(Arc::new(move |archive_progress: &ArchiveProgress| {
+                progress.lock().unwrap().update_archive(&label, archive_progress);
+            }))
+        } else {
+            ArchiveProcessor::new(
+                Arc::clone(registry),
+                Arc::clone(scanner),
+                Arc::clone(store),
+                vec![],
+            )
+            .with_max_depth(cli.max_archive_depth)
+        };
 
-    if cli.dry_run {
-        let archive_proc = ArchiveProcessor::new(
-            Arc::clone(registry),
-            Arc::clone(scanner),
-            Arc::clone(store),
-            vec![],
-        )
-        .with_max_depth(cli.max_archive_depth);
+        if cli.dry_run {
+            let stats = match format {
+                ArchiveFormat::Tar => {
+                    let reader = BufReader::new(
+                        fs::File::open(input).map_err(|e| format!("failed to open archive: {e}"))?,
+                    );
+                    let mut sink = Vec::new();
+                    archive_proc
+                        .process_tar(reader, &mut sink)
+                        .map_err(|e| format!("archive error: {e}"))?
+                }
+                ArchiveFormat::TarGz => {
+                    let reader = BufReader::new(
+                        fs::File::open(input).map_err(|e| format!("failed to open archive: {e}"))?,
+                    );
+                    let mut sink = Vec::new();
+                    archive_proc
+                        .process_tar_gz(reader, &mut sink)
+                        .map_err(|e| format!("archive error: {e}"))?
+                }
+                ArchiveFormat::Zip => {
+                    let mut reader = BufReader::new(
+                        fs::File::open(input).map_err(|e| format!("failed to open archive: {e}"))?,
+                    );
+                    let mut cursor_out = Cursor::new(Vec::new());
+                    archive_proc
+                        .process_zip(&mut reader, &mut cursor_out)
+                        .map_err(|e| format!("archive error: {e}"))?
+                }
+            };
+
+            if let Some(rb) = report_builder {
+                record_archive_stats(rb, &stats);
+            }
+
+            info!(
+                files = stats.files_processed,
+                structured = stats.structured_hits,
+                scanner = stats.scanner_fallback,
+                "dry-run archive processing complete"
+            );
+
+            return Ok(stats.files_processed > 0);
+        }
 
         let stats = match format {
             ArchiveFormat::Tar => {
                 let reader = BufReader::new(
-                    fs::File::open(input).map_err(|e| format!("failed to open archive: {e}"))?,
+                    fs::File::open(input).map_err(|e| format!("failed to open input: {e}"))?,
                 );
-                let mut sink = Vec::new();
-                archive_proc
-                    .process_tar(reader, &mut sink)
-                    .map_err(|e| format!("archive error: {e}"))?
+                let mut atomic_writer = AtomicFileWriter::new(&output_path)
+                    .map_err(|e| format!("failed to create output: {e}"))?;
+                let stats = archive_proc
+                    .process_tar(reader, &mut atomic_writer)
+                    .map_err(|e| format!("archive processing error: {e}"))?;
+                if is_interrupted() {
+                    return Err("interrupted — partial output discarded".into());
+                }
+                atomic_writer
+                    .finish()
+                    .map_err(|e| format!("failed to finalize output: {e}"))?;
+                stats
             }
             ArchiveFormat::TarGz => {
                 let reader = BufReader::new(
-                    fs::File::open(input).map_err(|e| format!("failed to open archive: {e}"))?,
+                    fs::File::open(input).map_err(|e| format!("failed to open input: {e}"))?,
                 );
-                let mut sink = Vec::new();
-                archive_proc
-                    .process_tar_gz(reader, &mut sink)
-                    .map_err(|e| format!("archive error: {e}"))?
+                let mut atomic_writer = AtomicFileWriter::new(&output_path)
+                    .map_err(|e| format!("failed to create output: {e}"))?;
+                let stats = archive_proc
+                    .process_tar_gz(reader, &mut atomic_writer)
+                    .map_err(|e| format!("archive processing error: {e}"))?;
+                if is_interrupted() {
+                    return Err("interrupted — partial output discarded".into());
+                }
+                atomic_writer
+                    .finish()
+                    .map_err(|e| format!("failed to finalize output: {e}"))?;
+                stats
             }
             ArchiveFormat::Zip => {
                 let mut reader = BufReader::new(
                     fs::File::open(input).map_err(|e| format!("failed to open archive: {e}"))?,
                 );
                 let mut cursor_out = Cursor::new(Vec::new());
-                archive_proc
+                let stats = archive_proc
                     .process_zip(&mut reader, &mut cursor_out)
-                    .map_err(|e| format!("archive error: {e}"))?
+                    .map_err(|e| format!("archive processing error: {e}"))?;
+                if is_interrupted() {
+                    return Err("interrupted — partial output discarded".into());
+                }
+                atomic_write(&output_path, &cursor_out.into_inner())
+                    .map_err(|e| format!("failed to write output: {e}"))?;
+                stats
             }
         };
-
-        if stats.files_processed > 0 {
-            had_matches = true;
-        }
-
-        info!(
-            files = stats.files_processed,
-            structured = stats.structured_hits,
-            scanner = stats.scanner_fallback,
-            "dry-run archive processing complete"
-        );
 
         if let Some(rb) = report_builder {
             record_archive_stats(rb, &stats);
         }
-        return Ok(had_matches);
-    }
+        print_archive_stats(&output_path, &stats);
 
-    // Real processing.
-    let archive_proc = ArchiveProcessor::new(
-        Arc::clone(registry),
-        Arc::clone(scanner),
-        Arc::clone(store),
-        vec![],
-    )
-    .with_max_depth(cli.max_archive_depth);
+        Ok(stats.files_processed > 0)
+    })
+}
 
-    match format {
-        ArchiveFormat::Tar => {
-            let reader = BufReader::new(
-                fs::File::open(input).map_err(|e| format!("failed to open input: {e}"))?,
-            );
-            let mut atomic_writer = AtomicFileWriter::new(&output_path)
-                .map_err(|e| format!("failed to create output: {e}"))?;
-            let stats = archive_proc
-                .process_tar(reader, &mut atomic_writer)
-                .map_err(|e| format!("archive processing error: {e}"))?;
-            if is_interrupted() {
-                return Err("interrupted — partial output discarded".into());
-            }
-            atomic_writer
-                .finish()
-                .map_err(|e| format!("failed to finalize output: {e}"))?;
-            if let Some(rb) = report_builder {
-                record_archive_stats(rb, &stats);
-            }
-            if stats.files_processed > 0 {
-                had_matches = true;
-            }
-            print_archive_stats(&output_path, &stats);
-        }
-        ArchiveFormat::TarGz => {
-            let reader = BufReader::new(
-                fs::File::open(input).map_err(|e| format!("failed to open input: {e}"))?,
-            );
-            let mut atomic_writer = AtomicFileWriter::new(&output_path)
-                .map_err(|e| format!("failed to create output: {e}"))?;
-            let stats = archive_proc
-                .process_tar_gz(reader, &mut atomic_writer)
-                .map_err(|e| format!("archive processing error: {e}"))?;
-            if is_interrupted() {
-                return Err("interrupted — partial output discarded".into());
-            }
-            atomic_writer
-                .finish()
-                .map_err(|e| format!("failed to finalize output: {e}"))?;
-            if let Some(rb) = report_builder {
-                record_archive_stats(rb, &stats);
-            }
-            if stats.files_processed > 0 {
-                had_matches = true;
-            }
-            print_archive_stats(&output_path, &stats);
-        }
-        ArchiveFormat::Zip => {
-            let mut reader = BufReader::new(
-                fs::File::open(input).map_err(|e| format!("failed to open archive: {e}"))?,
-            );
-            let mut cursor_out = Cursor::new(Vec::new());
-
-            let stats = archive_proc
-                .process_zip(&mut reader, &mut cursor_out)
-                .map_err(|e| format!("archive processing error: {e}"))?;
-
-            if is_interrupted() {
-                return Err("interrupted — partial output discarded".into());
-            }
-
-            // Atomic write the zip output.
-            atomic_write(&output_path, &cursor_out.into_inner())
-                .map_err(|e| format!("failed to write output: {e}"))?;
-
-            if let Some(rb) = report_builder {
-                record_archive_stats(rb, &stats);
-            }
-            if stats.files_processed > 0 {
-                had_matches = true;
-            }
-            print_archive_stats(&output_path, &stats);
-        }
-    }
-
-    Ok(had_matches)
+fn file_size(path: &Path) -> Result<u64, String> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|e| format!("failed to stat {}: {e}", path.display()))
 }
 
 /// Convert archive stats into per-entry [`FileReport`]s and record them.
@@ -1341,6 +1703,7 @@ fn record_archive_stats(rb: &ReportBuilder, stats: &sanitize_engine::ArchiveStat
             });
         }
     }
+
     if stats.file_methods.is_empty() {
         rb.record_file(FileReport {
             path: "(archive)".into(),
@@ -1528,11 +1891,28 @@ fn run() -> Result<(), (String, i32)> {
     // --- validate -----------------------------------------------------------
     validate_args(&cli).map_err(|e| (e, 1))?;
 
+    let progress_mode = cli.effective_progress_mode();
+    let progress_context = ProgressContext::detect(&cli.log_format);
+    let progress_policy = ProgressPolicy::from_mode(progress_mode, progress_context);
+    let progress_reporter = if progress_policy.live_updates || progress_policy.milestone_updates {
+        Some(Arc::new(Mutex::new(ProgressReporter::new(
+            progress_policy,
+            progress_context.json_logs,
+            cli.progress_interval_ms,
+        ))))
+    } else {
+        None
+    };
+
     let thread_count = resolve_thread_count(cli.threads);
     info!(
         threads = thread_count,
         deterministic = cli.deterministic,
         chunk_size = cli.chunk_size,
+        progress_mode = ?progress_mode,
+        live_progress = progress_policy.live_updates,
+        milestone_progress = progress_policy.milestone_updates,
+        progress_interval_ms = cli.progress_interval_ms,
         "starting sanitization"
     );
 
@@ -1638,7 +2018,14 @@ fn run() -> Result<(), (String, i32)> {
 
     // --- detect stdin vs archive vs plain file --------------------------------
     let had_matches = if is_stdin_input(&cli) {
-        process_stdin(&cli, &scanner, &registry, &store, report_builder.as_ref())
+        process_stdin(
+            &cli,
+            &scanner,
+            &registry,
+            &store,
+            report_builder.as_ref(),
+            progress_reporter.as_ref(),
+        )
             .map_err(|e| (e, 1))?
     } else {
         let input = cli.input.as_ref().unwrap();
@@ -1652,6 +2039,7 @@ fn run() -> Result<(), (String, i32)> {
                 &store,
                 fmt,
                 report_builder.as_ref(),
+                progress_reporter.as_ref(),
             )
             .map_err(|e| (e, 1))?
         } else {
@@ -1662,6 +2050,7 @@ fn run() -> Result<(), (String, i32)> {
                 &registry,
                 &store,
                 report_builder.as_ref(),
+                progress_reporter.as_ref(),
             )
             .map_err(|e| (e, 1))?
         }
@@ -1727,6 +2116,20 @@ fn main() {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    fn make_progress_context(
+        stderr_is_terminal: bool,
+        is_ci: bool,
+        term_is_dumb: bool,
+        json_logs: bool,
+    ) -> ProgressContext {
+        ProgressContext {
+            stderr_is_terminal,
+            is_ci,
+            term_is_dumb,
+            json_logs,
+        }
+    }
 
     /// Verify clap derive builds without panicking on debug assertions.
     #[test]
@@ -1795,6 +2198,87 @@ mod tests {
     fn cli_parses_dry_run() {
         let cli = Cli::try_parse_from(["sanitize", "input.txt", "--dry-run"]).unwrap();
         assert!(cli.dry_run);
+    }
+
+    #[test]
+    fn cli_parses_progress_mode() {
+        let cli = Cli::try_parse_from(["sanitize", "input.txt", "--progress", "on"]).unwrap();
+        assert_eq!(cli.progress, Some(ProgressMode::On));
+        assert_eq!(cli.effective_progress_mode(), ProgressMode::On);
+    }
+
+    #[test]
+    fn cli_no_progress_maps_to_off() {
+        let cli = Cli::try_parse_from(["sanitize", "input.txt", "--no-progress"]).unwrap();
+        assert!(cli.no_progress);
+        assert_eq!(cli.effective_progress_mode(), ProgressMode::Off);
+    }
+
+    #[test]
+    fn cli_explicit_progress_takes_precedence_over_no_progress() {
+        let cli =
+            Cli::try_parse_from(["sanitize", "input.txt", "--no-progress", "--progress", "on"])
+                .unwrap();
+        assert!(cli.no_progress);
+        assert_eq!(cli.progress, Some(ProgressMode::On));
+        assert_eq!(cli.effective_progress_mode(), ProgressMode::On);
+    }
+
+    #[test]
+    fn cli_parses_progress_interval() {
+        let cli =
+            Cli::try_parse_from(["sanitize", "input.txt", "--progress-interval-ms", "500"])
+                .unwrap();
+        assert_eq!(cli.progress_interval_ms, 500);
+    }
+
+    #[test]
+    fn validate_args_rejects_zero_progress_interval() {
+        let mut cli = Cli::try_parse_from(["sanitize", "input.txt"]).unwrap();
+        cli.input = Some(std::env::current_dir().unwrap().join("Cargo.toml"));
+        cli.progress_interval_ms = 0;
+        let err = validate_args(&cli).unwrap_err();
+        assert!(err.contains("--progress-interval-ms must be greater than 0"));
+    }
+
+    #[test]
+    fn progress_policy_auto_disables_live_updates_for_json_logs() {
+        let policy = ProgressPolicy::from_mode(
+            ProgressMode::Auto,
+            make_progress_context(true, false, false, true),
+        );
+        assert!(!policy.live_updates);
+        assert!(!policy.milestone_updates);
+    }
+
+    #[test]
+    fn progress_policy_auto_disables_live_updates_in_ci() {
+        let policy = ProgressPolicy::from_mode(
+            ProgressMode::Auto,
+            make_progress_context(true, true, false, false),
+        );
+        assert!(!policy.live_updates);
+        assert!(!policy.milestone_updates);
+    }
+
+    #[test]
+    fn progress_policy_on_keeps_milestones_when_live_updates_are_unavailable() {
+        let policy = ProgressPolicy::from_mode(
+            ProgressMode::On,
+            make_progress_context(false, false, false, false),
+        );
+        assert!(!policy.live_updates);
+        assert!(policy.milestone_updates);
+    }
+
+    #[test]
+    fn progress_policy_auto_enables_live_updates_in_interactive_human_mode() {
+        let policy = ProgressPolicy::from_mode(
+            ProgressMode::Auto,
+            make_progress_context(true, false, false, false),
+        );
+        assert!(policy.live_updates);
+        assert!(policy.milestone_updates);
     }
 
     #[test]

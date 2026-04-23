@@ -118,11 +118,11 @@ pub use category::Category;
 pub use error::{Result, SanitizeError};
 pub use generator::{HmacGenerator, RandomGenerator, ReplacementGenerator};
 pub use processor::archive::{
-    ArchiveFormat, ArchiveProcessor, ArchiveStats, DEFAULT_MAX_ARCHIVE_DEPTH,
+    ArchiveFormat, ArchiveProcessor, ArchiveProgress, ArchiveStats, DEFAULT_MAX_ARCHIVE_DEPTH,
 };
 pub use processor::{FieldRule, FileTypeProfile, Processor, ProcessorRegistry};
 pub use report::{FileReport, ReportBuilder, ReportMetadata, SanitizeReport};
-pub use scanner::{ScanConfig, ScanPattern, ScanStats, StreamScanner};
+pub use scanner::{ScanConfig, ScanPattern, ScanProgress, ScanStats, StreamScanner};
 pub use secrets::{
     decrypt_secrets, encrypt_secrets, load_secrets_auto, looks_encrypted, SecretEntry,
     SecretsFormat,

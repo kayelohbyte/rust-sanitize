@@ -7,3 +7,8 @@
 *.bak
 .idea/
 .vscode/
+
+# Test files
+test.json
+test.zip
+test.sanitized.zip

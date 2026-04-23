@@ -323,6 +323,21 @@ pub struct ScanStats {
     pub pattern_counts: HashMap<String, u64>,
 }
 
+/// Progress snapshot emitted during streaming scans.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct ScanProgress {
+    /// Total bytes read from the input so far.
+    pub bytes_processed: u64,
+    /// Total bytes written to the output so far.
+    pub bytes_output: u64,
+    /// Total input size when known.
+    pub total_bytes: Option<u64>,
+    /// Total number of matches found so far.
+    pub matches_found: u64,
+    /// Total replacements applied so far.
+    pub replacements_applied: u64,
+}
+
 // ---------------------------------------------------------------------------
 // StreamScanner
 // ---------------------------------------------------------------------------
@@ -475,9 +490,26 @@ impl StreamScanner {
     /// cannot be generated (e.g. store capacity exceeded).
     pub fn scan_reader<R: Read, W: Write>(
         &self,
+        reader: R,
+        writer: W,
+    ) -> Result<ScanStats> {
+        self.scan_reader_with_progress(reader, writer, None, |_| {})
+    }
+
+    /// Scan a reader and emit progress snapshots after each committed chunk.
+    ///
+    /// `total_bytes` should be provided when the caller knows the full input
+    /// size. When omitted, progress consumers should avoid percentages/ETA.
+    pub fn scan_reader_with_progress<R: Read, W: Write, F>(
+        &self,
         mut reader: R,
         mut writer: W,
-    ) -> Result<ScanStats> {
+        total_bytes: Option<u64>,
+        mut on_progress: F,
+    ) -> Result<ScanStats>
+    where
+        F: FnMut(&ScanProgress),
+    {
         let mut stats = ScanStats::default();
 
         // Carry buffer: the tail of the previous window that needs
@@ -543,6 +575,14 @@ impl StreamScanner {
                 .map_err(|e| SanitizeError::IoError(e.to_string()))?;
             stats.bytes_output += output.len() as u64;
 
+            on_progress(&ScanProgress {
+                bytes_processed: stats.bytes_processed,
+                bytes_output: stats.bytes_output,
+                total_bytes,
+                matches_found: stats.matches_found,
+                replacements_applied: stats.replacements_applied,
+            });
+
             // Update carry for next iteration. Reuse the carry buffer
             // by copying remaining bytes down.
             if is_eof {
@@ -566,8 +606,20 @@ impl StreamScanner {
     /// Returns [`SanitizeError`] if a replacement cannot be generated
     /// (e.g. store capacity exceeded).
     pub fn scan_bytes(&self, input: &[u8]) -> Result<(Vec<u8>, ScanStats)> {
+        self.scan_bytes_with_progress(input, |_| {})
+    }
+
+    /// Scan a byte slice in memory and emit progress snapshots.
+    pub fn scan_bytes_with_progress<F>(
+        &self,
+        input: &[u8],
+        on_progress: F,
+    ) -> Result<(Vec<u8>, ScanStats)>
+    where
+        F: FnMut(&ScanProgress),
+    {
         let mut output = Vec::with_capacity(input.len());
-        let stats = self.scan_reader(input, &mut output)?;
+        let stats = self.scan_reader_with_progress(input, &mut output, Some(input.len() as u64), on_progress)?;
         Ok((output, stats))
     }
 
@@ -1030,6 +1082,55 @@ mod tests {
             let email = format!("user{}@example.com", i);
             assert!(!out_str.contains(&email));
         }
+    }
+
+    #[test]
+    fn scan_bytes_with_progress_preserves_output_and_stats() {
+        let scanner = test_scanner(vec![email_pattern()]);
+        let input = b"Contact alice@corp.com and bob@corp.com for help.";
+
+        let (baseline_output, baseline_stats) = scanner.scan_bytes(input).unwrap();
+
+        let mut updates = Vec::new();
+        let (progress_output, progress_stats) = scanner
+            .scan_bytes_with_progress(input, |progress| updates.push(progress.clone()))
+            .unwrap();
+
+        assert_eq!(progress_output, baseline_output);
+        assert_eq!(progress_stats.bytes_processed, baseline_stats.bytes_processed);
+        assert_eq!(progress_stats.bytes_output, baseline_stats.bytes_output);
+        assert_eq!(progress_stats.matches_found, baseline_stats.matches_found);
+        assert_eq!(
+            progress_stats.replacements_applied,
+            baseline_stats.replacements_applied
+        );
+        assert!(!updates.is_empty());
+        assert_eq!(updates.last().unwrap().bytes_processed, input.len() as u64);
+        assert_eq!(updates.last().unwrap().total_bytes, Some(input.len() as u64));
+        assert_eq!(updates.last().unwrap().matches_found, 2);
+    }
+
+    #[test]
+    fn scan_reader_with_progress_reports_multiple_updates_for_multi_chunk_input() {
+        let scanner = test_scanner(vec![email_pattern()]);
+        let mut input = Vec::new();
+        for i in 0..8 {
+            input.extend_from_slice(b"padding padding padding ");
+            input.extend_from_slice(format!("user{i}@example.com ").as_bytes());
+        }
+
+        let mut output = Vec::new();
+        let mut updates = Vec::new();
+        let stats = scanner
+            .scan_reader_with_progress(&input[..], &mut output, Some(input.len() as u64), |progress| {
+                updates.push(progress.clone());
+            })
+            .unwrap();
+
+        assert!(updates.len() >= 2);
+        assert_eq!(updates.last().unwrap().bytes_processed, stats.bytes_processed);
+        assert_eq!(updates.last().unwrap().bytes_output, stats.bytes_output);
+        assert_eq!(updates.last().unwrap().total_bytes, Some(input.len() as u64));
     }
 
     // ---- Scan via Read/Write interface ----

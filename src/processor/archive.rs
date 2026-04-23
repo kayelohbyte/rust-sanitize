@@ -154,6 +154,21 @@ pub struct ArchiveStats {
     pub file_scan_stats: HashMap<String, ScanStats>,
 }
 
+/// Progress snapshot emitted while processing archive entries.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ArchiveProgress {
+    /// Entries seen so far, including skipped entries.
+    pub entries_seen: u64,
+    /// Regular file entries processed so far.
+    pub files_processed: u64,
+    /// Non-file entries skipped so far.
+    pub entries_skipped: u64,
+    /// Total entries when cheaply known.
+    pub total_entries: Option<u64>,
+    /// Path of the current entry.
+    pub current_entry: String,
+}
+
 impl ArchiveStats {
     /// Merge statistics from a nested archive into this parent.
     fn merge(&mut self, child: &ArchiveStats) {
@@ -214,6 +229,8 @@ pub struct ArchiveProcessor {
     profiles: Vec<FileTypeProfile>,
     /// Maximum nesting depth for recursive archive processing.
     max_depth: u32,
+    /// Optional callback for per-entry progress updates.
+    progress_callback: Option<Arc<dyn Fn(&ArchiveProgress) + Send + Sync>>,
 }
 
 impl ArchiveProcessor {
@@ -237,6 +254,7 @@ impl ArchiveProcessor {
             store,
             profiles,
             max_depth: DEFAULT_MAX_ARCHIVE_DEPTH,
+            progress_callback: None,
         }
     }
 
@@ -251,9 +269,31 @@ impl ArchiveProcessor {
         self
     }
 
+    /// Register a per-entry archive progress callback.
+    #[must_use]
+    pub fn with_progress_callback(
+        mut self,
+        callback: Arc<dyn Fn(&ArchiveProgress) + Send + Sync>,
+    ) -> Self {
+        self.progress_callback = Some(callback);
+        self
+    }
+
     /// Find the first profile matching a filename.
     fn find_profile(&self, filename: &str) -> Option<&FileTypeProfile> {
         self.profiles.iter().find(|p| p.matches_filename(filename))
+    }
+
+    fn emit_progress(&self, stats: &ArchiveStats, total_entries: Option<u64>, current_entry: &str) {
+        if let Some(callback) = &self.progress_callback {
+            callback(&ArchiveProgress {
+                entries_seen: stats.files_processed + stats.entries_skipped,
+                files_processed: stats.files_processed,
+                entries_skipped: stats.entries_skipped,
+                total_entries,
+                current_entry: current_entry.to_string(),
+            });
+        }
     }
 
     /// Sanitize the content of a single file entry.
@@ -488,6 +528,7 @@ impl ArchiveProcessor {
                     SanitizeError::ArchiveError(format!("append entry '{}': {}", path, e))
                 })?;
                 stats.entries_skipped += 1;
+                self.emit_progress(&stats, None, &path);
                 continue;
             }
 
@@ -514,6 +555,7 @@ impl ArchiveProcessor {
             })?;
 
             stats.files_processed += 1;
+            self.emit_progress(&stats, None, &path);
         }
 
         builder
@@ -589,6 +631,7 @@ impl ArchiveProcessor {
         let mut zip_in = zip::ZipArchive::new(reader)
             .map_err(|e| SanitizeError::ArchiveError(format!("open zip: {}", e)))?;
         let mut zip_out = zip::ZipWriter::new(writer);
+        let total_entries = Some(zip_in.len() as u64);
 
         for i in 0..zip_in.len() {
             let mut entry = zip_in
@@ -620,6 +663,7 @@ impl ArchiveProcessor {
                     SanitizeError::ArchiveError(format!("add dir '{}': {}", name, e))
                 })?;
                 stats.entries_skipped += 1;
+                self.emit_progress(&stats, total_entries, &name);
                 continue;
             }
 
@@ -655,6 +699,7 @@ impl ArchiveProcessor {
             })?;
 
             stats.files_processed += 1;
+            self.emit_progress(&stats, total_entries, &name);
         }
 
         zip_out
@@ -762,6 +807,7 @@ mod tests {
     use crate::processor::registry::ProcessorRegistry;
     use crate::scanner::{ScanConfig, ScanPattern};
     use std::io::Cursor;
+    use std::sync::Mutex;
 
     /// Build a test archive processor with an email pattern and a JSON profile.
     fn make_archive_processor() -> ArchiveProcessor {
@@ -1083,6 +1129,55 @@ mod tests {
         assert_eq!(stats.files_processed, 3);
         assert_eq!(stats.structured_hits, 1); // JSON
         assert_eq!(stats.scanner_fallback, 2); // .txt + .log
+    }
+
+    #[test]
+    fn tar_progress_callback_receives_updates() {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let proc = make_archive_processor().with_progress_callback({
+            let updates = Arc::clone(&updates);
+            Arc::new(move |progress| {
+                updates.lock().unwrap().push(progress.clone());
+            })
+        });
+        let input = build_test_tar(&[
+            ("a.txt", b"alice@corp.com"),
+            ("b.txt", b"SUPERSECRET"),
+        ]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&input[..], &mut output).unwrap();
+        let updates = updates.lock().unwrap();
+
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates.last().unwrap().entries_seen, 2);
+        assert_eq!(updates.last().unwrap().files_processed, stats.files_processed);
+        assert_eq!(updates.last().unwrap().total_entries, None);
+    }
+
+    #[test]
+    fn zip_progress_callback_reports_total_entries() {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let proc = make_archive_processor().with_progress_callback({
+            let updates = Arc::clone(&updates);
+            Arc::new(move |progress| {
+                updates.lock().unwrap().push(progress.clone());
+            })
+        });
+        let zip_data = build_test_zip(&[
+            ("file1.txt", b"alice@corp.com"),
+            ("file2.log", b"nothing to see"),
+        ]);
+
+        let reader = Cursor::new(&zip_data);
+        let mut writer = Cursor::new(Vec::new());
+        let stats = proc.process_zip(reader, &mut writer).unwrap();
+        let updates = updates.lock().unwrap();
+
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates.last().unwrap().files_processed, stats.files_processed);
+        assert_eq!(updates.last().unwrap().total_entries, Some(2));
+        assert_eq!(updates.last().unwrap().current_entry, "file2.log");
     }
 
     // -- Format detection tests ---------------------------------------------
