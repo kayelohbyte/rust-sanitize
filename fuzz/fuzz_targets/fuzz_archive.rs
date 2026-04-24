@@ -40,23 +40,16 @@ fuzz_target!(|data: &[u8]| {
         Err(_) => return,
     };
 
-    let profiles = vec![
-        FileTypeProfile::new(
-            "json",
-            vec![FieldRule::new("*.password").with_category(Category::Custom("password".into()))],
-        )
-        .with_extension("json"),
-    ];
+    let profiles = vec![FileTypeProfile::new(
+        "json",
+        vec![FieldRule::new("*.password").with_category(Category::Custom("password".into()))],
+    )
+    .with_extension("json")];
 
     let registry = Arc::new(ProcessorRegistry::with_builtins());
     let scanner = Arc::new(scanner);
 
-    let archive_processor = ArchiveProcessor::new(
-        registry,
-        scanner,
-        store,
-        profiles,
-    );
+    let archive_processor = ArchiveProcessor::new(registry, scanner, store, profiles);
 
     // Try tar format — should not panic on arbitrary bytes.
     let mut output = Vec::new();
