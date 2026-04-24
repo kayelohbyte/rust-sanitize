@@ -70,12 +70,12 @@ use sanitize_engine::{
     ReportBuilder, ReportMetadata, ScanConfig, ScanProgress, ScanStats, StreamScanner,
     DEFAULT_MAX_ARCHIVE_DEPTH,
 };
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Cursor, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -603,11 +603,11 @@ EXAMPLES:\n  \
   sanitize decrypt secrets.enc out.yaml --password-file /run/secrets/pw")]
     Decrypt(DecryptArgs),
 
-        /// Interactive guided setup for logs-focused secrets templates.
-        #[command(after_help = "\
+    /// Interactive guided setup for logs-focused secrets templates.
+    #[command(after_help = "\
 EXAMPLES:\n  \
     sanitize guided")]
-        Guided,
+    Guided,
 }
 
 #[derive(Parser, Debug)]
@@ -820,7 +820,11 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
             "hostname",
         ),
         make_regex_entry(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "ipv4", "ipv4"),
-        make_regex_entry(r"\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b", "ipv6", "ipv6"),
+        make_regex_entry(
+            r"\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b",
+            "ipv6",
+            "ipv6",
+        ),
         make_regex_entry(
             r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b",
             "mac_address",
@@ -837,11 +841,7 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
             "jwt",
             "jwt",
         ),
-        make_regex_entry(
-            r#"https?://[^\s"'<>]+"#,
-            "url",
-            "url",
-        ),
+        make_regex_entry(r#"https?://[^\s"'<>]+"#, "url", "url"),
     ];
 
     if matches!(opts.preset, GuidedPreset::Aggressive) {
@@ -1023,8 +1023,8 @@ fn run_guided() -> Result<(), (String, i32)> {
         output_path.display()
     );
 
-    let encrypt = prompt_yes_no("Encrypt the generated secrets file now?", true)
-        .map_err(|e| (e, 1))?;
+    let encrypt =
+        prompt_yes_no("Encrypt the generated secrets file now?", true).map_err(|e| (e, 1))?;
     let mut secrets_for_run = output_path.clone();
     let mut run_password: Option<String> = None;
     let mut run_unencrypted = true;
@@ -1034,16 +1034,20 @@ fn run_guided() -> Result<(), (String, i32)> {
         let encrypted = encrypt_secrets(&plain, &pw)
             .map_err(|e| (format!("failed to encrypt guided secrets file: {e}"), 1))?;
         let encrypted_path = PathBuf::from(format!("{}.enc", output_path.display()));
-        atomic_write(&encrypted_path, &encrypted)
-            .map_err(|e| (format!("failed to write {}: {e}", encrypted_path.display()), 1))?;
+        atomic_write(&encrypted_path, &encrypted).map_err(|e| {
+            (
+                format!("failed to write {}: {e}", encrypted_path.display()),
+                1,
+            )
+        })?;
         eprintln!("Encrypted template written to {}", encrypted_path.display());
         secrets_for_run = encrypted_path;
         run_password = Some(pw);
         run_unencrypted = false;
     }
 
-    let run_now = prompt_yes_no("Run sanitize now with this secrets file?", true)
-        .map_err(|e| (e, 1))?;
+    let run_now =
+        prompt_yes_no("Run sanitize now with this secrets file?", true).map_err(|e| (e, 1))?;
     if !run_now {
         eprintln!("Next: sanitize <input> -s {}", secrets_for_run.display());
         return Ok(());
@@ -1056,8 +1060,8 @@ fn run_guided() -> Result<(), (String, i32)> {
         PathBuf::from(input_raw)
     };
 
-    let out_raw = prompt_line("Output path (optional; blank = stdout/default): ")
-        .map_err(|e| (e, 1))?;
+    let out_raw =
+        prompt_line("Output path (optional; blank = stdout/default): ").map_err(|e| (e, 1))?;
     let output = if out_raw.trim().is_empty() {
         None
     } else {
@@ -1065,8 +1069,8 @@ fn run_guided() -> Result<(), (String, i32)> {
     };
 
     let dry_run = prompt_yes_no("Dry-run first?", true).map_err(|e| (e, 1))?;
-    let deterministic = prompt_yes_no("Use deterministic replacements?", true)
-        .map_err(|e| (e, 1))?;
+    let deterministic =
+        prompt_yes_no("Use deterministic replacements?", true).map_err(|e| (e, 1))?;
 
     let mut deterministic_password = run_password.clone();
     if deterministic && deterministic_password.is_none() {
@@ -2360,7 +2364,6 @@ fn run() -> Result<(), (String, i32)> {
 }
 
 fn run_sanitize(cli: Cli) -> Result<(), (String, i32)> {
-
     // --- install signal handler (graceful shutdown) --------------------------
     if let Err(e) = ctrlc::set_handler(move || {
         INTERRUPTED.store(true, Ordering::SeqCst);
