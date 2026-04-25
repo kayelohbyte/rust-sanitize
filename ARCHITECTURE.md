@@ -89,14 +89,63 @@ input via `rpassword`).
 
 ---
 
-## 2. Module Map
+## 2. Replacement Strategies: Two Parallel Paths
+
+The crate provides **two distinct APIs** for generating sanitized replacements:
+
+### Path 1: Category-Aware Generators (Used by CLI)
+
+```rust
+HmacGenerator / RandomGenerator
+    → implements ReplacementGenerator trait
+    → calls format_replacement(category, hash, original)
+    → category-specific formatting (email, IP, JWT, etc.)
+```
+
+- **Used by:** CLI binary, streaming scanner
+- **Design:** Opinionated, category-aware formatters with length preservation
+- **Determinism:** HMAC-SHA256 for deterministic mode, OS CSPRNG for random mode
+- **Code:** `src/generator.rs` (lines 136-600+)
+
+### Path 2: Pluggable Strategy Trait (Public Library API)
+
+```rust
+StrategyGenerator (adapter)
+    → implements ReplacementGenerator trait
+    → delegates to dyn Strategy::replace(original, entropy)
+    → user-defined or built-in strategies (RandomString, FakeIp, etc.)
+```
+
+- **Used by:** Library consumers, third-party crates via public API
+- **Design:** Extensible, strategy pattern for custom replacement logic
+- **Determinism:** Entropy source (HMAC or CSPRNG) decoupled from strategy
+- **Code:** `src/strategy.rs`
+- **Example:** `examples/custom_strategy.rs`
+- **Docs:** `docs/strategies.md`
+
+### Why Two Paths?
+
+1. **CLI simplicity:** Direct category formatters avoid indirection overhead for
+   the built-in use case (email → email-shaped replacement, IP → IP-shaped, etc.).
+2. **Library extensibility:** The `Strategy` trait allows users to plug in
+   custom replacement logic without forking the crate.
+3. **Historical:** The Strategy trait was part of the initial design. The
+   category-aware formatters (`format_replacement`) were later optimized for
+   the CLI and became the primary path.
+
+Both paths are maintained and tested. They share the same `MappingStore` and
+`ReplacementGenerator` interface, but diverge in how replacements are computed.
+
+---
+
+## 3. Module Map
 
 | Module | Responsibility |
 |--------|---------------|
 | `scanner` | Streaming regex scanner with configurable chunk/overlap. Memory-bounded reads. |
 | `store` | `DashMap`-backed dedup cache. `get_or_insert` is the single entry-point. Capacity-limited. |
-| `generator` | `ReplacementGenerator` trait. Two impls: `HmacGenerator` (deterministic), `RandomGenerator` (CSPRNG). |
-| `strategy` | Category-specific formatting (email, IPv4, phone, etc.). Pure functions, no I/O. |
+| `generator` | `ReplacementGenerator` trait. Two impls: `HmacGenerator` (deterministic), `RandomGenerator` (CSPRNG). Contains category-aware formatters used by the CLI. |
+| `strategy` | **Extensibility layer:** `Strategy` trait + `StrategyGenerator` adapter + 5 built-in strategies (`RandomString`, `FakeIp`, etc.). Public API for library users to implement custom replacement logic. |
 | `category` | `Category` enum. Drives domain separation in HMAC and replacement format selection. |
 | `secrets` | AES-256-GCM encrypted secrets file format. PBKDF2 key derivation. Zeroizes plaintext on drop. |
 | `processor::*` | Format-aware processors: JSON, YAML, XML, CSV, KeyValue. Each implements `Processor` trait. |
@@ -109,7 +158,7 @@ input via `rpassword`).
 
 ---
 
-## 3. Streaming Model
+## 4. Streaming Model
 
 The scanner never holds the entire file in memory. It reads fixed-size
 **chunks** (default 1 MiB) with a configurable **overlap** (default
@@ -130,7 +179,7 @@ fall through to the streaming scanner.
 
 ---
 
-## 4. Concurrency Model
+## 5. Concurrency Model
 
 - **`MappingStore`** uses `DashMap` (striped read-write locks). Multiple
   threads can call `get_or_insert` concurrently; per-shard locking keeps
@@ -143,7 +192,7 @@ fall through to the streaming scanner.
 
 ---
 
-## 5. Replacement Pipeline
+## 6. Replacement Pipeline
 
 ```
 Input value  ──▶  MappingStore::get_or_insert
@@ -176,7 +225,7 @@ Input value  ──▶  MappingStore::get_or_insert
 
 ---
 
-## 6. Atomic Output Safety
+## 7. Atomic Output Safety
 
 All file outputs go through `AtomicFileWriter`:
 
@@ -190,7 +239,7 @@ crash or signal interrupt.
 
 ---
 
-## 7. Signal Handling
+## 8. Signal Handling
 
 The CLI installs a `SIGINT` / `SIGTERM` handler via the `ctrlc` crate.
 A global `AtomicBool` (`INTERRUPTED`) is set on signal. The pipeline
@@ -202,7 +251,7 @@ checks `is_interrupted()` before committing output:
 
 ---
 
-## 8. Observability
+## 9. Observability
 
 Logging uses the `tracing` / `tracing-subscriber` stack:
 
@@ -215,7 +264,7 @@ Logging uses the `tracing` / `tracing-subscriber` stack:
 
 ---
 
-## 9. Feature Flags
+## 10. Feature Flags
 
 | Feature | Effect |
 |---------|--------|
@@ -223,7 +272,7 @@ Logging uses the `tracing` / `tracing-subscriber` stack:
 
 ---
 
-## 10. Build & Test
+## 11. Build & Test
 
 ```bash
 # Run all tests
