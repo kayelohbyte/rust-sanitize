@@ -55,20 +55,20 @@ cat > secrets.yaml <<'EOF'
 EOF
 
 # 2. Encrypt it (recommended for production):
-sanitize encrypt secrets.yaml secrets.yaml.enc --password "my-password"
+sanitize encrypt secrets.yaml secrets.yaml.enc --password
 
 # 3. Remove the plaintext:
 rm secrets.yaml
 
-# 4. Sanitize a file (prefer env var over --password for passwords):
-export SANITIZE_PASSWORD="my-password"
-sanitize data.log -s secrets.yaml.enc -o output.log
+# 4. Sanitize a file using the encrypted secrets file:
+sanitize data.log -s secrets.yaml.enc --encrypted-secrets --password -o output.log
 
-# 5. Or write to stdout (default) and redirect:
-sanitize data.log -s secrets.yaml.enc > output.log
+# 5. Or write to stdout (use env var to avoid interactive prompt in scripts):
+export SANITIZE_PASSWORD="my-password"
+sanitize data.log -s secrets.yaml.enc --encrypted-secrets > output.log
 
 # 6. CI gate — fail the build if secrets are detected:
-sanitize config.yaml -s secrets.yaml.enc --fail-on-match
+SANITIZE_PASSWORD="my-password" sanitize config.yaml -s secrets.yaml.enc --encrypted-secrets --fail-on-match
 ```
 
 ### Quick Start - Guided Setup
@@ -88,34 +88,45 @@ For a full step-by-step breakdown of prompts and the exact categories/patterns g
 You can pipe data directly into `sanitize`:
 
 ```bash
-# Pipe from grep:
-grep "error" app.log | sanitize -s secrets.yaml -p hunter2
+# Pipe from grep with a plaintext secrets file:
+grep "error" app.log | sanitize -s secrets.yaml
 
-# Read from stdin, write sanitized output to a file:
-cat data.csv | sanitize -s secrets.enc -p pw -f csv -o clean.csv
+# Pipe from grep with an encrypted secrets file (use env var since stdin is a pipe):
+export SANITIZE_PASSWORD="my-password"
+grep "error" app.log | sanitize -s secrets.enc --encrypted-secrets
+
+# Read from stdin, write sanitized output to a file (plaintext secrets):
+cat data.csv | sanitize -s secrets.yaml -f csv -o clean.csv
 
 # Chain with other tools:
-mysqldump mydb | sanitize -s secrets.enc -p pw | gzip > dump.sql.gz
+mysqldump mydb | sanitize -s secrets.yaml | gzip > dump.sql.gz
 ```
 
-### Quick Start — Plaintext Secrets (no encryption)
+### Quick Start — Plaintext Secrets (default)
 
-Encryption is recommended but not required. You can use a plaintext secrets file directly:
+Plaintext secrets files are the default. No password or `SANITIZE_PASSWORD` env var is needed:
 
 ```bash
-# Use a plaintext YAML secrets file (canonical; auto-detected):
+# Use a plaintext YAML secrets file (canonical):
 sanitize data.log -s secrets.yaml
-
-# Or explicitly skip encryption with --unencrypted-secrets:
-sanitize data.log -s secrets.yaml --unencrypted-secrets
 
 # Deterministic mode works the same way:
 sanitize data.csv -s secrets.yaml -d
 ```
 
-No password or `SANITIZE_PASSWORD` env var is needed when using plaintext secrets. Memory hygiene (zeroization of parsed entries) is preserved.
+JSON and TOML secrets files remain fully supported. YAML is the recommended default for human authoring.
 
-JSON and TOML secrets files remain fully supported for compatibility and automation, but YAML is the recommended default for human authoring.
+### Quick Start — Encrypted Secrets (opt-in)
+
+Encryption is optional. Use `--encrypted-secrets` to decrypt an AES-256-GCM file:
+
+```bash
+# Prompt for password interactively:
+sanitize data.log -s secrets.enc --encrypted-secrets -p
+
+# Or provide via file (CI-friendly):
+sanitize data.log -s secrets.enc --encrypted-secrets -P /run/secrets/pw
+```
 
 ---
 
@@ -222,39 +233,40 @@ For the full security model, threat mitigations, and out-of-scope threats, see [
 
 ## Examples
 
-**Sanitize a single file:**
+**Sanitize a single file (interactive password prompt):**
 
 ```bash
-sanitize data.log -s secrets.enc -p hunter2
+sanitize data.log -s secrets.enc --password
 ```
 
 **Write output to a file:**
 
 ```bash
-sanitize data.log -s secrets.enc -p hunter2 -o output.log
+sanitize data.log -s secrets.enc --password -o output.log
 ```
 
-**Pipe from another command:**
+**Pipe from another command (non-interactive; use env var or password-file):**
 
 ```bash
-grep "error" app.log | sanitize -s secrets.enc -p hunter2
+export SANITIZE_PASSWORD="my-password"
+grep "error" app.log | sanitize -s secrets.enc
 ```
 
 **Deterministic mode (same seed → same replacements every run):**
 
 ```bash
-sanitize data.csv -s s.enc -p pw -d
+sanitize data.csv -s s.enc --password -d
 ```
 
 **Fail CI if secrets are detected:**
 
 ```bash
-sanitize config.yaml -s s.enc -p pw --fail-on-match
+sanitize config.yaml -s s.enc -P /run/secrets/pw --fail-on-match
 ```
 
 See [docs/cli-reference.md](docs/cli-reference.md) for the complete set of examples including archive processing, stdin pipes, dry-run, plaintext secrets, and custom chunk sizes.
 
-> **Security note:** Prefer `-P` / `--password-file` or the `SANITIZE_PASSWORD` environment variable over `-p` / `--password` to avoid exposing the password in process listings and shell history.
+> **Security note:** `-p` / `--password` now triggers a secure interactive prompt (masked input, no shell history). For non-interactive automation use `-P` / `--password-file` or the `SANITIZE_PASSWORD` environment variable.
 
 ---
 

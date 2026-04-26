@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Default secrets mode is now plaintext** — `sanitize` loads secrets files as
+  plaintext JSON / YAML / TOML by default. Encrypted (AES-256-GCM) files now
+  require the explicit `--encrypted-secrets` flag.
+- **`--unencrypted-secrets` removed** — replaced by the inverse `--encrypted-secrets`
+  flag. Scripts using `--unencrypted-secrets` must remove the flag (the default
+  behaviour is now plaintext).
+- **Password inputs require `--encrypted-secrets`** — supplying `--password`,
+  `--password-file`, or the `SANITIZE_PASSWORD` environment variable without
+  `--encrypted-secrets` is now a hard error with a clear message.
+- **`--password` / `-p` is now interactive** — The flag no longer accepts an
+  inline value. When provided, it triggers a secure interactive password prompt
+  (masked input via `rpassword`, no shell history or process listing exposure).
+  Passing `--password VALUE` is rejected by the parser. In non-interactive
+  contexts (no TTY) the flag returns a clear error and directs users to
+  `--password-file` or `SANITIZE_PASSWORD`.
+
 ## [0.2.0] — 2026-03-20
 
 ### Fixed
@@ -47,7 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   combinations. Prevents future clap derive regressions.
 - **Stdin support** — When `INPUT` is omitted or set to `-`, `sanitize` reads
   from stdin. Enables Unix pipeline usage:
-  `grep "error" log.txt | sanitize -s secrets.enc -p hunter2`.
+  `export SANITIZE_PASSWORD="secret"; grep "error" log.txt | sanitize -s secrets.enc`.
   TTY detection prevents hanging when run interactively without input.
 - **Short flags** — Common options now have short aliases: `-s` (secrets-file),
   `-p` (password), `-P` (password-file), `-o` (output), `-n` (dry-run),

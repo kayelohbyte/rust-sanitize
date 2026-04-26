@@ -35,7 +35,6 @@ fn forced_progress_uses_stderr_and_keeps_stdout_payload_clean() {
         .arg(&input_path)
         .arg("-s")
         .arg(&secrets_path)
-        .arg("--unencrypted-secrets")
         .arg("--progress")
         .arg("on")
         .env("SANITIZE_LOG", "error")
@@ -71,7 +70,6 @@ fn auto_progress_is_silent_in_non_tty_mode() {
         .arg(&input_path)
         .arg("-s")
         .arg(&secrets_path)
-        .arg("--unencrypted-secrets")
         .env("SANITIZE_LOG", "error")
         .output()
         .unwrap();
@@ -100,7 +98,6 @@ fn stdin_pipeline_forced_progress_keeps_stdout_clean() {
         .arg("-")
         .arg("-s")
         .arg(&secrets_path)
-        .arg("--unencrypted-secrets")
         .arg("--progress")
         .arg("on")
         .env("SANITIZE_LOG", "error")

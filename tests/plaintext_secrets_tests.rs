@@ -3,7 +3,6 @@
 //! Covers:
 //! - Plaintext secrets parsing (JSON, YAML, TOML)
 //! - Auto-detect: encrypted vs plaintext
-//! - CLI `--unencrypted-secrets` flag detection
 //! - Replacement correctness with plaintext secrets
 //! - Deterministic replacement mode with plaintext secrets
 //! - Fail-on-match behaviour with plaintext secrets
