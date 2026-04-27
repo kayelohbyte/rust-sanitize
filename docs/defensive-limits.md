@@ -6,7 +6,7 @@
 
 The streaming scanner never holds the entire file in memory. It reads fixed-size **chunks** (default 1 MiB) with an automatically derived **overlap** window (default 4 KiB). The overlap ensures that a sensitive value straddling a chunk boundary is still detected.
 
-The CLI derives overlap from the `--chunk-size` value: `overlap = min(chunk_size, 4096)`, clamped to a minimum of 256 bytes. The library API allows direct configuration via `ScanConfig::new(chunk_size, overlap_size)`.
+The CLI derives overlap from the `--chunk-size` value: `overlap = chunk_size / 4`, clamped to the range `[1, 4096]` bytes. The library API allows direct configuration via `ScanConfig::new(chunk_size, overlap_size)`.
 
 ```
 Chunk N:     [===========================|overlap|]
@@ -24,7 +24,7 @@ Archives (tar, tar.gz, zip) are processed **entry-by-entry**:
 3. Otherwise the entry is piped through the streaming scanner in chunks — no full-entry buffering.
 4. The archive is rebuilt with sanitized content and preserved metadata (timestamps, permissions, uid/gid).
 
-Archive entries are processed **sequentially** to preserve ordering determinism.
+Archive entries are **sanitized in parallel** via rayon when the entry count meets the threshold (default: 4 file entries) and the archive is a top-level input (not a nested archive). The rebuilt archive is always written in the original entry order, so output is fully deterministic regardless of thread count. When multiple files are being processed in parallel at the file level (multi-input), per-entry parallelism is suppressed to avoid oversubscribing the thread pool.
 
 ### Structured File Size Caps
 
@@ -32,7 +32,7 @@ Files exceeding the structured processor's size limit are automatically demoted 
 
 ### Pattern Count Limits
 
-The `StreamScanner` rejects pattern sets exceeding 10 000 patterns at construction time. This bounds `RegexSet` automaton memory, which scales linearly with pattern count.
+The `StreamScanner` rejects pattern sets exceeding 10 000 patterns at construction time. This bounds matcher automaton memory: regex patterns contribute to `RegexSet` memory, and literal patterns contribute to the Aho-Corasick automaton.
 
 ### Memory Characteristics for Large Inputs
 
@@ -45,7 +45,7 @@ For 20–100 GB plain-text files, the streaming scanner maintains constant memor
 | Limit | Default Value | Configurable | Notes |
 |-------|---------------|--------------|-------|
 | Max structured file size | 256 MiB | `--max-structured-size` | Applies to JSON, YAML, XML, CSV, and archive entries routed to structured processors. Oversized files fall back to streaming. |
-| Max pattern count | 10 000 | Compile-time (`DEFAULT_MAX_PATTERNS`) | Bounds `RegexSet` automaton memory. |
+| Max pattern count | 10 000 | Compile-time (`DEFAULT_MAX_PATTERNS`) | Bounds matcher automaton memory (`RegexSet` + Aho-Corasick). |
 | Max mapping store entries | 10 000 000 | `--max-mappings` | Prevents unbounded heap growth. |
 | Regex automaton size | 1 MiB | Compile-time (`REGEX_SIZE_LIMIT`) | Per-pattern limit. |
 | Regex DFA cache size | 1 MiB | Compile-time (`REGEX_DFA_SIZE_LIMIT`) | Per-pattern limit. |

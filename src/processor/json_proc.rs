@@ -12,7 +12,7 @@
 //! matches the `email` field inside every object in the `users` array.
 
 use crate::error::{Result, SanitizeError};
-use crate::processor::{find_matching_rule, replace_value, FileTypeProfile, Processor};
+use crate::processor::{build_path, find_matching_rule, replace_value, FileTypeProfile, Processor};
 use crate::store::MappingStore;
 use serde_json::Value;
 
@@ -101,11 +101,7 @@ fn walk_json(
         Value::Object(map) => {
             let keys: Vec<String> = map.keys().cloned().collect();
             for key in keys {
-                let path = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{}.{}", prefix, key)
-                };
+                let path = build_path(prefix, &key);
 
                 if let Some(v) = map.get_mut(&key) {
                     match v {

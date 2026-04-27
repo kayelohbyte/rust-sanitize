@@ -185,7 +185,7 @@ fn pad_or_truncate(s: &str, target: usize, hash: &[u8; 32]) -> String {
     let hex_bytes = hex.as_bytes();
     let mut buf = String::with_capacity(target);
     buf.push_str(s);
-    for i in 0..(target - slen) {
+    for i in 0..target.saturating_sub(slen) {
         buf.push(hex_bytes[i % 64] as char);
     }
     buf
@@ -436,11 +436,19 @@ fn format_windows_sid_lp(hash: &[u8; 32], original: &str, target: usize) -> Stri
     buf
 }
 
-/// Length-preserving URL replacement.
-/// Preserves scheme prefix and structural characters
-/// (`://`, `/`, `?`, `=`, `&`, `#`, `:`); replaces content characters
-/// with deterministic hex.
-fn format_url_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
+/// Shared core for length-preserving hex replacement where a caller-supplied
+/// predicate identifies "structural" characters to preserve as-is.
+///
+/// All non-structural characters are replaced byte-by-byte with deterministic
+/// hex characters derived from `hash`.  Returns `None` if the original
+/// contained no replaceable content (caller should fall back to
+/// [`pad_or_truncate`]).
+fn format_preserving_hex_lp(
+    hash: &[u8; 32],
+    original: &str,
+    target: usize,
+    is_structural: impl Fn(char) -> bool,
+) -> Option<String> {
     let hex = hex_encode(hash);
     let hex_bytes = hex.as_bytes();
     let mut buf = String::with_capacity(target);
@@ -448,10 +456,9 @@ fn format_url_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
     let mut had_content = false;
 
     for ch in original.chars() {
-        if "/:?=&#@.".contains(ch) {
+        if is_structural(ch) {
             buf.push(ch);
         } else {
-            // Emit as many ASCII hex bytes as the original char's UTF-8 length.
             for _ in 0..ch.len_utf8() {
                 buf.push(hex_bytes[hi % 64] as char);
                 hi += 1;
@@ -459,37 +466,25 @@ fn format_url_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
             had_content = true;
         }
     }
-    if !had_content {
-        return pad_or_truncate("", target, hash);
-    }
-    buf
+
+    had_content.then_some(buf)
+}
+
+/// Length-preserving URL replacement.
+/// Preserves scheme prefix and structural characters
+/// (`://`, `/`, `?`, `=`, `&`, `#`, `:`); replaces content characters
+/// with deterministic hex.
+fn format_url_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
+    format_preserving_hex_lp(hash, original, target, |ch| "/:?=&#@.".contains(ch))
+        .unwrap_or_else(|| pad_or_truncate("", target, hash))
 }
 
 /// Length-preserving AWS ARN replacement.
 /// Preserves `:` and `/` separators; replaces alphanumeric content
 /// in account/resource segments with deterministic hex.
 fn format_arn_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
-    let hex = hex_encode(hash);
-    let hex_bytes = hex.as_bytes();
-    let mut buf = String::with_capacity(target);
-    let mut hi = 0usize;
-    let mut had_content = false;
-
-    for ch in original.chars() {
-        if ch == ':' || ch == '/' {
-            buf.push(ch);
-        } else {
-            for _ in 0..ch.len_utf8() {
-                buf.push(hex_bytes[hi % 64] as char);
-                hi += 1;
-            }
-            had_content = true;
-        }
-    }
-    if !had_content {
-        return pad_or_truncate("", target, hash);
-    }
-    buf
+    format_preserving_hex_lp(hash, original, target, |ch| ch == ':' || ch == '/')
+        .unwrap_or_else(|| pad_or_truncate("", target, hash))
 }
 
 /// Length-preserving Azure Resource ID replacement.

@@ -5,6 +5,7 @@
 //! syntactically valid emails, IPv4 addresses with valid IPv4 addresses, etc.
 
 use compact_str::CompactString;
+use std::borrow::Cow;
 use std::fmt;
 
 /// Classification of a sensitive data value. Determines the replacement format.
@@ -100,26 +101,17 @@ impl Category {
         }
     }
 
-    /// Return a stable string key used for HMAC domain separation.
+    /// Return a collision-safe key for HMAC domain separation.
     ///
-    /// Equivalent to [`as_str()`](Self::as_str) for backward compatibility.
-    /// For HMAC domain separation use [`domain_tag_hmac()`](Self::domain_tag_hmac)
-    /// which prefixes custom categories to prevent collisions.
+    /// For `Custom` categories this includes the `custom:` prefix so that
+    /// `Custom("email")` cannot collide with the built-in `Email` tag.
+    /// Returns `Borrowed` for all built-in variants (zero allocation) and
+    /// `Owned` only for `Custom` (one allocation per HMAC call).
     #[must_use]
-    pub fn domain_tag(&self) -> &str {
-        self.as_str()
-    }
-
-    /// Return a collision-safe string key for HMAC domain separation.
-    ///
-    /// For `Custom` categories, this includes the `custom:` prefix to
-    /// prevent collisions with built-in category tags (e.g. a
-    /// `Custom("email")` won't collide with the built-in `Email` tag).
-    #[must_use]
-    pub fn domain_tag_hmac(&self) -> String {
+    pub fn domain_tag_hmac(&self) -> Cow<'_, str> {
         match self {
-            Category::Custom(name) => format!("custom:{name}"),
-            other => other.as_str().to_owned(),
+            Category::Custom(name) => Cow::Owned(format!("custom:{name}")),
+            other => Cow::Borrowed(other.as_str()),
         }
     }
 }

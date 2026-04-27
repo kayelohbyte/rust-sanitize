@@ -124,35 +124,68 @@ pub(crate) fn replace_value(value: &str, rule: &FieldRule, store: &MappingStore)
     Ok(sanitized.to_string())
 }
 
+/// Build a dot-separated key path by appending `key` to `prefix`.
+///
+/// Returns `key` unchanged when `prefix` is empty.
+#[must_use]
+pub(crate) fn build_path(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{}.{}", prefix, key)
+    }
+}
+
+/// Check whether a single glob `pattern` matches `key_path`.
+///
+/// Supported patterns:
+/// - `"*"` — matches anything.
+/// - `"password"` — exact match.
+/// - `"*.password"` — any key ending in `.password`.
+/// - `"db.*"` — any key starting with `db.`.
+#[must_use]
+pub(crate) fn pattern_matches(pattern: &str, key_path: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if pattern == key_path {
+        return true;
+    }
+    // Simple glob: *.suffix
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        if key_path == suffix
+            || key_path
+                .strip_suffix(suffix)
+                .is_some_and(|rest| rest.ends_with('.'))
+        {
+            return true;
+        }
+    }
+    // Simple glob: prefix.*
+    if let Some(prefix) = pattern.strip_suffix(".*") {
+        if key_path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('.'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check whether a dotted key path matches any of the rules in a profile.
 ///
 /// Supports exact matches and simple glob patterns:
 /// - `"password"` matches `"password"` exactly.
 /// - `"*.password"` matches any key ending in `.password`.
 /// - `"db.*"` matches any key starting with `db.`.
+#[must_use]
 pub(crate) fn find_matching_rule<'a>(
     key_path: &str,
     profile: &'a FileTypeProfile,
 ) -> Option<&'a FieldRule> {
-    profile.fields.iter().find(|rule| {
-        if rule.pattern == "*" {
-            return true;
-        }
-        if rule.pattern == key_path {
-            return true;
-        }
-        // Simple glob: *.suffix
-        if let Some(suffix) = rule.pattern.strip_prefix("*.") {
-            if key_path.ends_with(&format!(".{}", suffix)) || key_path == suffix {
-                return true;
-            }
-        }
-        // Simple glob: prefix.*
-        if let Some(prefix) = rule.pattern.strip_suffix(".*") {
-            if key_path.starts_with(&format!("{}.", prefix)) {
-                return true;
-            }
-        }
-        false
-    })
+    profile
+        .fields
+        .iter()
+        .find(|rule| pattern_matches(&rule.pattern, key_path))
 }

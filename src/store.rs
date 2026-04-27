@@ -90,21 +90,6 @@ impl MappingStore {
         }
     }
 
-    /// Create a store pre-sized for `expected` entries (avoids rehashing).
-    #[must_use]
-    pub fn with_expected_capacity(
-        generator: Arc<dyn ReplacementGenerator>,
-        capacity_limit: Option<usize>,
-        expected: usize,
-    ) -> Self {
-        Self {
-            forward: DashMap::with_capacity(expected),
-            generator,
-            len: AtomicUsize::new(0),
-            capacity_limit,
-        }
-    }
-
     // ---------------- Core API ----------------
 
     /// Get or create the sanitized replacement for `(category, original)`.
@@ -209,6 +194,7 @@ impl MappingStore {
     }
 
     /// Look up an existing forward mapping without creating one.
+    #[must_use]
     pub fn forward_lookup(&self, category: &Category, original: &str) -> Option<CompactString> {
         let key = ForwardKey {
             category: category.clone(),
