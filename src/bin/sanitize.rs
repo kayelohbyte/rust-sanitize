@@ -68,13 +68,14 @@ use sanitize_engine::secrets::{
     SecretEntry, SecretsFormat,
 };
 use sanitize_engine::{
-    atomic_write, ArchiveFormat, ArchiveProcessor, ArchiveProgress, AtomicFileWriter, FileReport,
-    HmacGenerator, MappingStore, ProcessorRegistry, RandomGenerator, ReplacementGenerator,
-    ReportBuilder, ReportMetadata, ScanConfig, ScanStats, StreamScanner,
+    atomic_write, ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress, AtomicFileWriter,
+    FileReport, HmacGenerator, MappingStore, ProcessorRegistry, RandomGenerator,
+    ReplacementGenerator, ReportBuilder, ReportMetadata, ScanConfig, ScanStats, StreamScanner,
     DEFAULT_MAX_ARCHIVE_DEPTH,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Cursor, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -818,7 +819,7 @@ fn run_guided() -> Result<(), (String, i32)> {
         progress_interval_ms: DEFAULT_PROGRESS_INTERVAL_MS,
     };
 
-    run_sanitize(cli, deterministic_password.or(run_password))
+    run_sanitize(cli, deterministic_password.or(run_password), HashMap::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,6 +1256,142 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
 }
 
 /// Validate CLI arguments for the default sanitize mode.
+// ---------------------------------------------------------------------------
+// Archive filter pre-parser
+// ---------------------------------------------------------------------------
+
+/// Pre-parse `--only` / `--exclude` flags that are interleaved with archive
+/// paths in the raw argument list, **before** clap sees them.
+///
+/// Syntax:
+/// ```text
+/// archive.zip --only PATTERN... --exclude PATTERN... other.tar.gz --only PATTERN...
+/// ```
+///
+/// Rules:
+/// - `--only` / `--exclude` must appear **after** an archive path.  Using
+///   them before any archive is a hard error.
+/// - A non-flag argument appearing while collecting patterns is treated as
+///   a new archive path if it matches a known archive extension **and** the
+///   file exists on disk.  Otherwise it is a hard error ("non-archive path
+///   cannot appear between filter flags").
+/// - The `--only` / `--exclude` tokens and their value arguments are
+///   **stripped** from the returned cleaned argument list; everything else
+///   passes through to clap unchanged.
+/// - Glob patterns are validated eagerly; invalid syntax is reported before
+///   any archive is opened.
+///
+/// Returns `(filter_map, cleaned_args)` where `filter_map` maps each
+/// archive path (as it appeared on the command line) to its
+/// `(only_patterns, exclude_patterns)` pair.
+fn parse_archive_filters(
+    args: &[OsString],
+) -> Result<(HashMap<PathBuf, (Vec<String>, Vec<String>)>, Vec<OsString>), String> {
+    #[derive(PartialEq)]
+    enum State {
+        Global,
+        AfterArchive,
+        CollectingOnly,
+        CollectingExclude,
+    }
+
+    let mut state = State::Global;
+    let mut current_archive: Option<PathBuf> = None;
+    let mut filter_map: HashMap<PathBuf, (Vec<String>, Vec<String>)> = HashMap::new();
+    let mut cleaned: Vec<OsString> = Vec::with_capacity(args.len());
+
+    // Validate a glob pattern (patterns ending with '/' are directory
+    // prefixes and require no glob validation).
+    let validate_pattern = |p: &str| -> Result<(), String> {
+        if !p.ends_with('/') {
+            glob::Pattern::new(p)
+                .map_err(|e| format!("invalid glob pattern '{p}': {e}"))?;
+        }
+        Ok(())
+    };
+
+    for arg in args {
+        let s = arg.to_string_lossy();
+
+        match s.as_ref() {
+            "--only" => {
+                if state == State::Global {
+                    return Err(
+                        "--only must follow an archive path (e.g. archive.zip --only PATTERN)"
+                            .into(),
+                    );
+                }
+                state = State::CollectingOnly;
+                // strip from cleaned args
+            }
+            "--exclude" => {
+                if state == State::Global {
+                    return Err(
+                        "--exclude must follow an archive path (e.g. archive.zip --exclude PATTERN)"
+                            .into(),
+                    );
+                }
+                state = State::CollectingExclude;
+                // strip from cleaned args
+            }
+            _ if (state == State::CollectingOnly || state == State::CollectingExclude)
+                && !s.starts_with('-') =>
+            {
+                let candidate = PathBuf::from(s.as_ref());
+                if ArchiveFormat::from_path(&s).is_some() && candidate.is_file() {
+                    // Transition: start a new archive group.
+                    filter_map
+                        .entry(candidate.clone())
+                        .or_insert_with(|| (Vec::new(), Vec::new()));
+                    current_archive = Some(candidate.clone());
+                    state = State::AfterArchive;
+                    cleaned.push(arg.clone());
+                } else if candidate.is_file() {
+                    // Plain file (not an archive) between filter flags — hard error.
+                    return Err(format!(
+                        "non-archive path '{}' cannot appear between filter flags; \
+                         move it before or after the archive+filter group",
+                        candidate.display()
+                    ));
+                } else {
+                    // Treat as a pattern value (e.g. "*.json", "config/", "/logs/**").
+                    // Patterns that look like paths but don't exist on disk are valid.
+                    validate_pattern(&s)?;
+                    let key = current_archive.as_ref().unwrap();
+                    let entry = filter_map.entry(key.clone()).or_default();
+                    if state == State::CollectingOnly {
+                        entry.0.push(s.into_owned());
+                    } else {
+                        entry.1.push(s.into_owned());
+                    }
+                    // pattern values are NOT passed to cleaned args
+                }
+            }
+            _ if (state == State::CollectingOnly || state == State::CollectingExclude)
+                && s.starts_with('-') =>
+            {
+                // Another flag ends pattern collection.
+                state = State::AfterArchive;
+                cleaned.push(arg.clone());
+            }
+            _ => {
+                // Regular argument in Global or AfterArchive state.
+                let candidate = PathBuf::from(s.as_ref());
+                if ArchiveFormat::from_path(&s).is_some() {
+                    filter_map
+                        .entry(candidate.clone())
+                        .or_insert_with(|| (Vec::new(), Vec::new()));
+                    current_archive = Some(candidate.clone());
+                    state = State::AfterArchive;
+                }
+                cleaned.push(arg.clone());
+            }
+        }
+    }
+
+    Ok((filter_map, cleaned))
+}
+
 fn validate_args(cli: &Cli) -> Result<(), String> {
     if has_stdin_input(cli) && io::stdin().is_terminal() {
         return Err("stdin was requested but stdin is a terminal.\n\
@@ -1960,6 +2097,7 @@ fn process_archive(
     output_path: &Path,
     deps: ArchiveDeps<'_>,
     format: ArchiveFormat,
+    filter: ArchiveFilter,
     report_builder: Option<&ReportBuilder>,
     progress: Option<&SharedProgressReporter>,
     suppress_inner_parallelism: bool,
@@ -1973,7 +2111,8 @@ fn process_archive(
             Arc::clone(deps.store),
             vec![],
         )
-        .with_max_depth(cli.max_archive_depth);
+        .with_max_depth(cli.max_archive_depth)
+        .with_filter(filter);
 
         // When the outer file-level loop is already running in parallel,
         // suppress per-entry parallelism to avoid oversubscribing the
@@ -2301,7 +2440,26 @@ fn run_decrypt(args: &DecryptArgs) -> Result<(), (String, i32)> {
 // ---------------------------------------------------------------------------
 
 fn run() -> Result<(), (String, i32)> {
-    let cli = Cli::parse();
+    // Pre-parse --only / --exclude flags that are interleaved with archive
+    // paths before handing the cleaned arg list to clap.
+    let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let (raw_filter_map, cleaned_args) =
+        parse_archive_filters(&raw_args).map_err(|e| (e, 1))?;
+
+    // Compile ArchiveFilter objects eagerly so errors are reported before any
+    // file I/O starts.
+    let filter_map: HashMap<PathBuf, ArchiveFilter> = raw_filter_map
+        .into_iter()
+        .map(|(path, (only, exclude))| {
+            ArchiveFilter::new(only, exclude)
+                .map(|f| (path, f))
+                .map_err(|e| (e, 1))
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
+
+    let cli = Cli::parse_from(
+        std::iter::once(OsString::from("sanitize")).chain(cleaned_args),
+    );
 
     // --- initialise logging -------------------------------------------------
     init_logging(&cli.log_format);
@@ -2314,10 +2472,10 @@ fn run() -> Result<(), (String, i32)> {
         None => {} // fall through to default sanitize mode
     }
 
-    run_sanitize(cli, None)
+    run_sanitize(cli, None, filter_map)
 }
 
-fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>) -> Result<(), (String, i32)> {
+fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filter_map: HashMap<PathBuf, ArchiveFilter>) -> Result<(), (String, i32)> {
     // --- install signal handler (graceful shutdown) --------------------------
     if let Err(e) = ctrlc::set_handler(move || {
         INTERRUPTED.store(true, Ordering::SeqCst);
@@ -2507,6 +2665,7 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>) -> R
                 };
                 let input_str = input.to_string_lossy();
                 if let Some(fmt) = ArchiveFormat::from_path(&input_str) {
+                    let filter = filter_map.get(&input).cloned().unwrap_or_default();
                     process_archive(
                         &input,
                         &cli,
@@ -2517,6 +2676,7 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>) -> R
                             store: &store,
                         },
                         fmt,
+                        filter,
                         report_builder.as_ref(),
                         progress_reporter.as_ref(),
                         // suppress per-entry parallelism: file-level parallelism
@@ -2549,6 +2709,7 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>) -> R
                 };
                 let input_str = input.to_string_lossy();
                 if let Some(fmt) = ArchiveFormat::from_path(&input_str) {
+                    let filter = filter_map.get(&input).cloned().unwrap_or_default();
                     process_archive(
                         &input,
                         &cli,
@@ -2559,6 +2720,7 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>) -> R
                             store: &store,
                         },
                         fmt,
+                        filter,
                         report_builder.as_ref(),
                         progress_reporter.as_ref(),
                         // single file target: archive entry parallelism is enabled.

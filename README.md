@@ -79,6 +79,19 @@ sanitize data.log -s secrets.yaml.enc --encrypted-secrets > output.log
 
 # 9. CI gate — fail the build if secrets are detected:
 SANITIZE_PASSWORD="my-password" sanitize config.yaml -s secrets.yaml.enc --encrypted-secrets --fail-on-match
+
+# 10. Filter archive entries — keep only specific paths (--only / --exclude):
+#     Patterns match the full stored path inside the archive.
+#     * does not cross /, ** does. Trailing / is a directory-prefix match.
+sanitize backup.zip --only 'config/' -s secrets.yaml
+sanitize backup.zip --only '**/*.json' --exclude config/secrets.json -s secrets.yaml
+sanitize test.zip --only test/test.config -s secrets.yaml
+
+# 11. Per-archive filters in a single command:
+sanitize a.zip --only 'config/' b.tar.gz --only '**/*.log' -s secrets.yaml
+
+# 12. Mix stdin with file and archive inputs (stdin → stdout):
+cat extra.log | sanitize - backup.zip --only 'logs/' config.yaml -s secrets.yaml
 ```
 
 ### Quick Start - Guided Setup
@@ -110,7 +123,42 @@ cat data.csv | sanitize -s secrets.yaml -f csv -o clean.csv
 
 # Chain with other tools:
 mysqldump mydb | sanitize -s secrets.yaml | gzip > dump.sql.gz
+
+# Mix stdin with file and archive inputs (stdin → stdout; files get per-file outputs):
+cat extra.log | sanitize - backup.zip config.yaml -s secrets.yaml
 ```
+
+### Quick Start — Archive Entry Filtering (`--only` / `--exclude`)
+
+Filter which entries are written into the output archive. Patterns match the **full stored path** inside the archive (e.g. `test/test.config`, not just `test.config`).
+
+- `*` matches within a single directory segment (does **not** cross `/`).
+- `**` matches across directory boundaries.
+- A pattern ending with `/` is a directory-prefix match.
+
+```bash
+# Keep only a specific file (use the full stored path):
+sanitize test.zip --only test/test.config -s secrets.yaml
+
+# Keep all JSON files at any depth:
+sanitize backup.zip --only '**/*.json' -s secrets.yaml
+
+# Keep an entire directory subtree:
+sanitize backup.zip --only 'config/' -s secrets.yaml
+
+# Drop all log files:
+sanitize backup.zip --exclude '**/*.log' -s secrets.yaml
+
+# Combine: keep JSON, then drop the secrets file:
+sanitize backup.zip --only '**/*.json' --exclude config/secrets.json -s secrets.yaml
+
+# Independent filters per archive in one command:
+sanitize a.zip --only 'config/' b.tar.gz --only '**/*.log' -s secrets.yaml
+```
+
+Directory entries always pass through regardless of any filter. Nested archives inherit their parent's filter.
+
+For full pattern syntax and rules see [docs/cli-reference.md — Archive Entry Filtering](docs/cli-reference.md#archive-entry-filtering----only----exclude).
 
 ### Quick Start — Plaintext Secrets (default)
 

@@ -79,7 +79,8 @@ pub(crate) struct ProgressReporter {
     interval: Duration,
     spinner_index: usize,
     last_emit: Option<Instant>,
-    last_units: u64,
+    last_scan_units: u64,
+    last_archive_units: u64,
     rendered_line_len: usize,
 }
 
@@ -91,7 +92,8 @@ impl ProgressReporter {
             interval: Duration::from_millis(progress_interval_ms),
             spinner_index: 0,
             last_emit: None,
-            last_units: 0,
+            last_scan_units: 0,
+            last_archive_units: 0,
             rendered_line_len: 0,
         }
     }
@@ -99,7 +101,8 @@ impl ProgressReporter {
     pub(crate) fn start_task(&mut self, label: &str) {
         self.spinner_index = 0;
         self.last_emit = None;
-        self.last_units = 0;
+        self.last_scan_units = 0;
+        self.last_archive_units = 0;
         if self.policy.live_updates {
             let frame = self.spinner_frame();
             self.render_live_line(format!("{} {}", frame, label));
@@ -110,7 +113,7 @@ impl ProgressReporter {
 
     pub(crate) fn update_scan(&mut self, label: &str, progress: &ScanProgress) {
         let min_delta = 8 * 1024 * 1024;
-        if !self.should_emit(progress.bytes_processed, min_delta) {
+        if !self.should_emit_scan(progress.bytes_processed, min_delta) {
             return;
         }
 
@@ -131,7 +134,7 @@ impl ProgressReporter {
     }
 
     pub(crate) fn update_archive(&mut self, label: &str, progress: &ArchiveProgress) {
-        if !self.should_emit(progress.entries_seen, 1) {
+        if !self.should_emit_archive(progress.entries_seen, 1) {
             return;
         }
 
@@ -170,16 +173,32 @@ impl ProgressReporter {
         }
     }
 
-    fn should_emit(&mut self, units: u64, min_delta: u64) -> bool {
+    fn should_emit_scan(&mut self, units: u64, min_delta: u64) -> bool {
         let now = Instant::now();
         let elapsed_ready = self.last_emit.map_or(true, |last_emit| {
             now.duration_since(last_emit) >= self.interval
         });
-        let delta_ready = units >= self.last_units.saturating_add(min_delta);
+        let delta_ready = units >= self.last_scan_units.saturating_add(min_delta);
 
         if elapsed_ready || delta_ready {
             self.last_emit = Some(now);
-            self.last_units = units;
+            self.last_scan_units = units;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn should_emit_archive(&mut self, units: u64, min_delta: u64) -> bool {
+        let now = Instant::now();
+        let elapsed_ready = self.last_emit.map_or(true, |last_emit| {
+            now.duration_since(last_emit) >= self.interval
+        });
+        let delta_ready = units >= self.last_archive_units.saturating_add(min_delta);
+
+        if elapsed_ready || delta_ready {
+            self.last_emit = Some(now);
+            self.last_archive_units = units;
             true
         } else {
             false
