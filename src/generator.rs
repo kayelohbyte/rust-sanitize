@@ -6,6 +6,12 @@
 //! - `RandomGenerator`: Cryptographically random replacements. Non-deterministic.
 //!
 //! Both produce category-aware, format-preserving replacements.
+//!
+//! # Design Note
+//!
+//! This module contains the category-aware formatters used by the CLI binary.
+//! For an extensible strategy API that allows custom replacement logic, see
+//! the [`crate::strategy`] module.
 
 use crate::category::Category;
 use hmac::{Hmac, Mac};

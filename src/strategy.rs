@@ -5,6 +5,15 @@
 //! [`StrategyGenerator`], an adapter that implements
 //! [`ReplacementGenerator`].
 //!
+//! # Design Note
+//!
+//! This is the **extensibility layer** for library consumers who need custom
+//! replacement logic. The CLI binary uses [`crate::generator::HmacGenerator`]
+//! and [`crate::generator::RandomGenerator`] directly with category-aware
+//! formatters for performance and simplicity. Both paths share the same
+//! [`ReplacementGenerator`] interface. See `ARCHITECTURE.md` section 2 for
+//! details on the dual-path design.
+//!
 //! # Architecture
 //!
 //! ```text

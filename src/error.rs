@@ -20,9 +20,6 @@ pub enum SanitizeError {
     #[error("invalid seed length: expected 32 bytes, got {0}")]
     InvalidSeedLength(usize),
 
-    #[error("replacement generator error: {0}")]
-    GeneratorError(String),
-
     #[error("I/O error: {0}")]
     IoError(String),
 
