@@ -118,7 +118,8 @@ pub use category::Category;
 pub use error::{Result, SanitizeError};
 pub use generator::{HmacGenerator, RandomGenerator, ReplacementGenerator};
 pub use processor::archive::{
-    ArchiveFormat, ArchiveProcessor, ArchiveProgress, ArchiveStats, DEFAULT_MAX_ARCHIVE_DEPTH,
+    ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress, ArchiveStats,
+    DEFAULT_MAX_ARCHIVE_DEPTH,
 };
 pub use processor::{FieldRule, FileTypeProfile, Processor, ProcessorRegistry};
 pub use report::{FileReport, ReportBuilder, ReportMetadata, SanitizeReport};

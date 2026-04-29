@@ -56,6 +56,7 @@ use crate::processor::registry::ProcessorRegistry;
 use crate::scanner::{ScanStats, StreamScanner};
 use crate::store::MappingStore;
 
+use glob::MatchOptions;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, Write};
@@ -101,7 +102,118 @@ const PARALLEL_ENTRY_THRESHOLD: usize = 4;
 /// Per-entry result from parallel zip processing: `(meta_index, sanitized_bytes_and_stats)`.
 type ZipEntryResult = (usize, Result<(Vec<u8>, ArchiveStats)>);
 
-/// Supported archive formats.
+// ---------------------------------------------------------------------------
+// ArchiveFilter
+// ---------------------------------------------------------------------------
+
+/// A compiled glob-based entry filter for archive processing.
+///
+/// Patterns are compiled once at construction time. At processing time
+/// `passes()` is called for each file entry path inside the archive.
+///
+/// ## Pattern semantics
+///
+/// - `*` matches any sequence of characters that does **not** contain `/`.
+/// - `**` matches any sequence of characters including `/`.
+/// - `?` matches any single character except `/`.
+/// - `[abc]` matches one of the listed characters.
+/// - A pattern ending with `/` is a *directory prefix* — it matches
+///   the directory itself and any path underneath it.
+///
+/// ## Filter logic
+///
+/// 1. If `--only` patterns are present: the entry path must match at
+///    least one pattern, otherwise it is dropped.
+/// 2. If `--exclude` patterns are present: if the entry path matches
+///    any pattern, it is dropped.
+/// 3. Only file entries are filtered; directory / symlink entries
+///    always pass through to preserve archive structure.
+#[derive(Default, Clone)]
+pub struct ArchiveFilter {
+    only: Vec<CompiledPattern>,
+    exclude: Vec<CompiledPattern>,
+}
+
+#[derive(Clone)]
+enum CompiledPattern {
+    /// Pattern that ended with `/` — matches the prefix directory and
+    /// everything inside it.
+    DirPrefix(String),
+    /// General glob pattern compiled with `require_literal_separator`.
+    Glob(glob::Pattern),
+}
+
+const GLOB_OPTS: MatchOptions = MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+impl CompiledPattern {
+    fn compile(raw: &str) -> std::result::Result<Self, String> {
+        if raw.ends_with('/') {
+            // Strip trailing slash; matching is done manually in `matches`.
+            Ok(CompiledPattern::DirPrefix(
+                raw.trim_end_matches('/').to_string(),
+            ))
+        } else {
+            glob::Pattern::new(raw)
+                .map(CompiledPattern::Glob)
+                .map_err(|e| format!("invalid glob pattern '{raw}': {e}"))
+        }
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            CompiledPattern::DirPrefix(prefix) => {
+                path == prefix || path.starts_with(&format!("{prefix}/"))
+            }
+            CompiledPattern::Glob(pat) => pat.matches_with(path, GLOB_OPTS),
+        }
+    }
+}
+
+impl ArchiveFilter {
+    /// Compile `only` and `exclude` pattern lists into an `ArchiveFilter`.
+    ///
+    /// Returns an error if any pattern contains invalid glob syntax.
+    pub fn new(
+        only: Vec<String>,
+        exclude: Vec<String>,
+    ) -> std::result::Result<Self, String> {
+        let only = only
+            .iter()
+            .map(|p| CompiledPattern::compile(p))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let exclude = exclude
+            .iter()
+            .map(|p| CompiledPattern::compile(p))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Self { only, exclude })
+    }
+
+    /// Returns `true` when neither `--only` nor `--exclude` patterns are set.
+    pub fn is_empty(&self) -> bool {
+        self.only.is_empty() && self.exclude.is_empty()
+    }
+
+    /// Returns `true` if `path` should be included in the output archive.
+    ///
+    /// Only applies to file entries; directory entries bypass this check.
+    pub fn passes(&self, path: &str) -> bool {
+        if !self.only.is_empty() && !self.only.iter().any(|p| p.matches(path)) {
+            return false;
+        }
+        if self.exclude.iter().any(|p| p.matches(path)) {
+            return false;
+        }
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Archive format enum
+// ---------------------------------------------------------------------------
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
     /// `.zip` archive.
@@ -167,6 +279,8 @@ pub struct ArchiveStats {
     pub file_methods: HashMap<String, String>,
     /// Per-file scan statistics (matches, replacements, bytes, pattern counts).
     pub file_scan_stats: HashMap<String, ScanStats>,
+    /// Number of file entries removed by the [`ArchiveFilter`].
+    pub entries_filtered: u64,
 }
 
 /// Progress snapshot emitted while processing archive entries.
@@ -196,6 +310,7 @@ impl ArchiveStats {
         self.nested_archives += child.nested_archives;
         self.total_input_bytes += child.total_input_bytes;
         self.total_output_bytes += child.total_output_bytes;
+        self.entries_filtered += child.entries_filtered;
         for (k, v) in &child.file_methods {
             self.file_methods.insert(k.clone(), v.clone());
         }
@@ -251,6 +366,9 @@ pub struct ArchiveProcessor {
     /// Minimum number of file entries required to enable parallel entry
     /// sanitization. Default: [`PARALLEL_ENTRY_THRESHOLD`].
     parallel_threshold: usize,
+    /// Entry-level filter controlling which paths are included in the
+    /// output archive. Default: empty (pass all entries).
+    filter: ArchiveFilter,
 }
 
 impl ArchiveProcessor {
@@ -276,6 +394,7 @@ impl ArchiveProcessor {
             max_depth: DEFAULT_MAX_ARCHIVE_DEPTH,
             progress_callback: None,
             parallel_threshold: PARALLEL_ENTRY_THRESHOLD,
+            filter: ArchiveFilter::default(),
         }
     }
 
@@ -304,6 +423,17 @@ impl ArchiveProcessor {
     #[must_use]
     pub fn with_progress_callback(mut self, callback: ArchiveProgressCallback) -> Self {
         self.progress_callback = Some(callback);
+        self
+    }
+
+    /// Apply an [`ArchiveFilter`] that controls which file entries are
+    /// included in the output archive.
+    ///
+    /// Entries that do not pass the filter are **removed** from the
+    /// output entirely. Directory / symlink entries are never filtered.
+    #[must_use]
+    pub fn with_filter(mut self, filter: ArchiveFilter) -> Self {
+        self.filter = filter;
         self
     }
 
@@ -598,6 +728,13 @@ impl ArchiveProcessor {
             // and nested-archive paths buffer internally as required; the
             // scanner path works chunk-by-chunk so peak memory is the output
             // buffer only (half the footprint of the previous approach).
+
+            // Filter: drop entries that do not match the --only/--exclude rules.
+            if !self.filter.passes(&path) {
+                stats.entries_filtered += 1;
+                continue;
+            }
+
             let size_hint = header.size().ok();
             let mut sanitized_buf: Vec<u8> = Vec::new();
             let mut entry_stats = ArchiveStats::default();
@@ -781,6 +918,10 @@ impl ArchiveProcessor {
                 if meta.is_dir {
                     continue;
                 }
+                // Skip loading data for entries that will be filtered out.
+                if !self.filter.passes(&meta.name) {
+                    continue;
+                }
                 let mut entry = zip_in.by_index(i).map_err(|e| {
                     SanitizeError::ArchiveError(format!("zip entry {}: {}", i, e))
                 })?;
@@ -819,6 +960,12 @@ impl ArchiveProcessor {
                     self.emit_progress(&stats, total_entries_hint, &meta.name);
                     continue;
                 }
+                // Filter: drop entries not matching --only/--exclude rules.
+                if !self.filter.passes(&meta.name) {
+                    stats.entries_filtered += 1;
+                    self.emit_progress(&stats, total_entries_hint, &meta.name);
+                    continue;
+                }
                 let (sanitized_buf, entry_stats) = sanitized[i]
                     .take()
                     .expect("file entry sanitization result missing");
@@ -846,6 +993,13 @@ impl ArchiveProcessor {
                         SanitizeError::ArchiveError(format!("add dir '{}': {}", meta.name, e))
                     })?;
                     stats.entries_skipped += 1;
+                    self.emit_progress(&stats, total_entries_hint, &meta.name);
+                    continue;
+                }
+
+                // Filter: drop entries not matching --only/--exclude rules.
+                if !self.filter.passes(&meta.name) {
+                    stats.entries_filtered += 1;
                     self.emit_progress(&stats, total_entries_hint, &meta.name);
                     continue;
                 }

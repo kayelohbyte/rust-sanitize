@@ -229,6 +229,8 @@ Notes:
 | `--max-mappings <N>` | | Maximum unique replacement mappings in memory (default: `10000000`). Use `0` for unlimited. |
 | `--max-structured-size <BYTES>` | | Maximum structured file size in bytes before falling back to streaming (default: `268435456` = 256 MiB). |
 | `--max-archive-depth <N>` | | Maximum nesting depth for recursive archive processing (default: `3`, max: `10`). Each nesting level may buffer up to 256 MiB. |
+| `--only <PATTERN>` | | Keep only archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--only` flags accumulate. Combined with `--exclude`: `--only` narrows first, then `--exclude` removes. Only affects archive inputs; ignored for plain files. |
+| `--exclude <PATTERN>` | | Remove archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--exclude` flags accumulate. |
 | `--log-format <FMT>` | | Log output format: `human` (default) or `json`. |
 | `--progress <MODE>` | | Progress display mode: `auto`, `on`, or `off`. Default: `auto`. |
 | `--no-progress` | | Alias for `--progress off`. |
@@ -237,6 +239,65 @@ Notes:
 | `-V, --version` | `-V` | Print version. |
 
 Log level is controlled via the `SANITIZE_LOG` environment variable (e.g. `SANITIZE_LOG=debug`).
+
+#### Archive Entry Filtering (`--only` / `--exclude`)
+
+`--only` and `--exclude` filter which entries are written into the output archive. They must appear **after** the archive path they apply to. Patterns match the full stored entry path (e.g. `test/test.config`, not just `test.config`).
+
+**Pattern syntax**
+
+| Pattern | Meaning |
+|---------|---------|
+| `*.log` | Matches any `.log` file in the root of the archive. `*` does **not** cross `/`. |
+| `**/*.log` | Matches `.log` files at any depth. `**` crosses `/`. |
+| `logs/` | Directory-prefix match: keeps `logs/` itself and every entry under it. Trailing `/` is required. |
+| `config/app.yaml` | Exact full-path match. |
+| `??.txt` | `?` matches any single character except `/`. |
+| `[abc].txt` | Character-class match for `a.txt`, `b.txt`, or `c.txt`. |
+
+**Rules**
+
+- `--only` and `--exclude` are **per-archive**. Use interleaved syntax to filter multiple archives independently.
+- Both flags can be combined: `--only` narrows the set first, then `--exclude` removes from it.
+- **Directory entries** (entries whose stored type is a directory) always pass through regardless of any filter. Only file entries are filtered.
+- **Nested archives** inherit the same filter applied to their parent archive.
+- `--only` / `--exclude` before any archive path on the command line is a hard error.
+- A non-archive plain file appearing between `--only`/`--exclude` and their pattern values is a hard error.
+
+**Single archive**
+
+```bash
+# Keep only entries matching test/test.config (exact full path):
+sanitize archive.zip --only test/test.config -s secrets.yaml
+
+# Keep only JSON files at any depth:
+sanitize archive.zip --only '**/*.json' -s secrets.yaml
+
+# Keep only entries under the config/ prefix:
+sanitize archive.zip --only 'config/' -s secrets.yaml
+
+# Drop all .log files:
+sanitize archive.zip --exclude '*.log' -s secrets.yaml
+
+# Keep only JSON files, then drop secrets.json:
+sanitize archive.zip --only '**/*.json' --exclude config/secrets.json -s secrets.yaml
+
+# Keep only JSON files in the root (not subdirectories):
+sanitize archive.zip --only '*.json' -s secrets.yaml
+```
+
+**Multiple archives — each gets its own filter**
+
+```bash
+# a.zip keeps only config/, b.tar.gz keeps only *.log files:
+sanitize a.zip --only 'config/' b.tar.gz --only '**/*.log' -s secrets.yaml
+
+# Mix an archive with a plain file — the plain file is not filtered:
+sanitize report.txt backup.zip --only 'logs/' -s secrets.yaml
+
+# Mix stdin with an archive filter:
+cat extra.log | sanitize - backup.zip --only 'logs/' -s secrets.yaml
+```
 
 #### Progress Behavior
 
@@ -326,6 +387,35 @@ grep "error" app.log | sanitize -s secrets.yaml
 
 # Mix stdin with file inputs (stdin goes to stdout, files get per-file outputs):
 cat extra.txt | sanitize - data.log -s secrets.yaml
+
+# Mix stdin with an archive (stdin sanitized to stdout; archive gets its own output file):
+cat extra.log | sanitize - backup.zip -s secrets.yaml
+
+# Archive and plain file together (each gets its own output file):
+sanitize backup.zip config.yaml -s secrets.yaml
+# Produces: backup.sanitized.zip  config-sanitized.yaml
+
+# Filter archive entries — keep only files under config/:
+sanitize backup.zip --only 'config/' -s secrets.yaml
+
+# Filter by glob — keep only JSON files at any depth:
+sanitize backup.zip --only '**/*.json' -s secrets.yaml
+
+# Filter by exact full path (paths are stored as-is inside the archive):
+sanitize test.zip --only test/test.config -s secrets.yaml
+
+# Combine --only and --exclude: keep JSON, drop secrets file:
+sanitize backup.zip --only '**/*.json' --exclude config/secrets.json -s secrets.yaml
+
+# Drop all log files from the output archive:
+sanitize backup.zip --exclude '**/*.log' -s secrets.yaml
+
+# Per-archive filters — each archive has independent --only / --exclude:
+sanitize a.zip --only 'config/' b.tar.gz --only '**/*.log' -s secrets.yaml
+
+# Plain file alongside a filtered archive:
+sanitize report.txt backup.zip --only 'logs/' -s secrets.yaml
+# Produces: report-sanitized.txt  backup.sanitized.zip (with only logs/ entries)
 
 # Force progress to stderr while keeping stdout pipe-safe:
 grep "error" app.log | sanitize -s secrets.yaml --progress on > clean.log 2> progress.log
@@ -482,6 +572,43 @@ sanitize data.csv -s s.enc --encrypted-secrets --password -d
 
 ```bash
 sanitize backup.tar.gz -s s.enc --encrypted-secrets --password -o backup.sanitized.tar.gz --strict
+```
+
+**Filter archive entries — keep only files under a specific path:**
+
+```bash
+# Exact full path (paths are stored as-is inside the archive, e.g. test/test.config):
+sanitize test.zip --only test/test.config -s secrets.yaml
+
+# Keep all JSON files at any depth (**/ crosses directory boundaries):
+sanitize backup.zip --only '**/*.json' -s secrets.yaml
+
+# Keep an entire directory subtree (trailing / = directory-prefix match):
+sanitize backup.zip --only 'config/' -s secrets.yaml
+
+# Drop all log files:
+sanitize backup.zip --exclude '**/*.log' -s secrets.yaml
+
+# Combine: keep JSON files, then drop the secrets file:
+sanitize backup.zip --only '**/*.json' --exclude config/secrets.json -s secrets.yaml
+```
+
+**Per-archive filters — each archive in a multi-input command is filtered independently:**
+
+```bash
+# a.zip keeps only config/; b.tar.gz keeps only *.log files:
+sanitize a.zip --only 'config/' b.tar.gz --only '**/*.log' -s secrets.yaml
+
+# Plain file alongside a filtered archive:
+sanitize report.txt backup.zip --only 'logs/' -s secrets.yaml
+# Produces: report-sanitized.txt  backup.sanitized.zip (logs/ entries only)
+```
+
+**Mix stdin with file and archive inputs:**
+
+```bash
+# stdin goes to stdout; each file/archive gets its own output file:
+cat extra.log | sanitize - backup.zip --only 'logs/' config.yaml -s secrets.yaml
 ```
 
 **Dry-run — see what would be replaced without writing output:**

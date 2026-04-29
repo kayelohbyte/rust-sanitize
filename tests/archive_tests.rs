@@ -14,7 +14,7 @@
 
 use sanitize_engine::category::Category;
 use sanitize_engine::generator::HmacGenerator;
-use sanitize_engine::processor::archive::{ArchiveFormat, ArchiveProcessor};
+use sanitize_engine::processor::archive::{ArchiveFilter, ArchiveFormat, ArchiveProcessor};
 use sanitize_engine::processor::profile::{FieldRule, FileTypeProfile};
 use sanitize_engine::processor::registry::ProcessorRegistry;
 use sanitize_engine::scanner::{ScanConfig, ScanPattern, StreamScanner};
@@ -939,4 +939,249 @@ fn nested_archive_metadata_preserved() {
             assert_eq!(hdr.mtime().unwrap(), 1_700_000_000, "mtime preserved");
         }
     }
+}
+
+// ===========================================================================
+// ArchiveFilter tests
+// ===========================================================================
+
+/// Helper: make a bare ArchiveProcessor with no secrets patterns (filter tests
+/// only care about which entries survive, not their content).
+fn make_filter_processor(filter: ArchiveFilter) -> ArchiveProcessor {
+    let gen = Arc::new(HmacGenerator::new([1u8; 32]));
+    let store = Arc::new(MappingStore::new(gen, None));
+    let scanner = Arc::new(
+        StreamScanner::new(vec![], Arc::clone(&store), ScanConfig::default()).unwrap(),
+    );
+    let registry = Arc::new(ProcessorRegistry::with_builtins());
+    ArchiveProcessor::new(registry, scanner, store, vec![]).with_filter(filter)
+}
+
+fn entry_names(files: &[(String, String)]) -> Vec<&str> {
+    files.iter().map(|(n, _)| n.as_str()).collect()
+}
+
+#[test]
+fn tar_only_exact_path() {
+    let proc = make_filter_processor(
+        ArchiveFilter::new(vec!["a.txt".into()], vec![]).unwrap(),
+    );
+    let input = make_tar(&[("a.txt", b"hello"), ("b.txt", b"world")]);
+    let mut out = Vec::new();
+    let stats = proc.process_tar(&input[..], &mut out).unwrap();
+    let files = read_tar(&out);
+    assert_eq!(entry_names(&files), vec!["a.txt"]);
+    assert_eq!(stats.entries_filtered, 1);
+    assert_eq!(stats.files_processed, 1);
+}
+
+#[test]
+fn tar_exclude_exact_path() {
+    let proc = make_filter_processor(
+        ArchiveFilter::new(vec![], vec!["b.txt".into()]).unwrap(),
+    );
+    let input = make_tar(&[("a.txt", b"hello"), ("b.txt", b"world")]);
+    let mut out = Vec::new();
+    let stats = proc.process_tar(&input[..], &mut out).unwrap();
+    let files = read_tar(&out);
+    assert_eq!(entry_names(&files), vec!["a.txt"]);
+    assert_eq!(stats.entries_filtered, 1);
+}
+
+#[test]
+fn tar_only_glob_star() {
+    // *.json matches root-level json only (does NOT cross /)
+    let proc = make_filter_processor(
+        ArchiveFilter::new(vec!["*.json".into()], vec![]).unwrap(),
+    );
+    let input = make_tar(&[
+        ("a.json", b"{}"),
+        ("b.txt", b"text"),
+        ("sub/c.json", b"{}"), // should NOT match *.json
+    ]);
+    let mut out = Vec::new();
+    let stats = proc.process_tar(&input[..], &mut out).unwrap();
+    let files = read_tar(&out);
+    assert_eq!(entry_names(&files), vec!["a.json"]);
+    assert_eq!(stats.entries_filtered, 2);
+}
+
+#[test]
+fn tar_only_glob_double_star() {
+    // **/*.json matches json at any depth
+    let proc = make_filter_processor(
+        ArchiveFilter::new(vec!["**/*.json".into()], vec![]).unwrap(),
+    );
+    let input = make_tar(&[
+        ("a.json", b"{}"),
+        ("sub/b.json", b"{}"),
+        ("sub/c.txt", b"text"),
+    ]);
+    let mut out = Vec::new();
+    let stats = proc.process_tar(&input[..], &mut out).unwrap();
+    let files = read_tar(&out);
+    let names = entry_names(&files);
+    assert!(names.contains(&"a.json"), "a.json missing: {names:?}");
+    assert!(names.contains(&"sub/b.json"), "sub/b.json missing: {names:?}");
+    assert!(!names.contains(&"sub/c.txt"), "sub/c.txt should be filtered: {names:?}");
+    assert_eq!(stats.entries_filtered, 1);
+}
+
+#[test]
+fn tar_only_directory_prefix() {
+    // "config/" prefix: keeps entries under config/, not at root level
+    let proc = make_filter_processor(
+        ArchiveFilter::new(vec!["config/".into()], vec![]).unwrap(),
+    );
+    let input = make_tar(&[
+        ("config/a.txt", b"cfg"),
+        ("config/sub/b.txt", b"cfg2"),
+        ("other.txt", b"other"),
+    ]);
+    let mut out = Vec::new();
+    let stats = proc.process_tar(&input[..], &mut out).unwrap();
+    let files = read_tar(&out);
+    let names = entry_names(&files);
+    assert!(names.contains(&"config/a.txt"));
+    assert!(names.contains(&"config/sub/b.txt"));
+    assert!(!names.contains(&"other.txt"));
+    assert_eq!(stats.entries_filtered, 1);
+}
+
+#[test]
+fn tar_only_and_exclude_combined() {
+    // --only "*.json" --exclude "secret.json": all json except secret.json
+    let proc = make_filter_processor(
+        ArchiveFilter::new(vec!["*.json".into()], vec!["secret.json".into()]).unwrap(),
+    );
+    let input = make_tar(&[
+        ("data.json", b"{}"),
+        ("secret.json", b"{}"),
+        ("readme.txt", b"text"),
+    ]);
+    let mut out = Vec::new();
+    let stats = proc.process_tar(&input[..], &mut out).unwrap();
+    let files = read_tar(&out);
+    let names = entry_names(&files);
+    assert_eq!(names, vec!["data.json"]);
+    assert_eq!(stats.entries_filtered, 2);
+}
+
+#[test]
+fn zip_only_exact_path() {
+    let proc = make_filter_processor(
+        ArchiveFilter::new(vec!["a.txt".into()], vec![]).unwrap(),
+    );
+    let input = make_zip(&[("a.txt", b"hello"), ("b.txt", b"world")]);
+    let mut out = Cursor::new(Vec::new());
+    let stats = proc
+        .process_zip(&mut Cursor::new(&input), &mut out)
+        .unwrap();
+    let files = read_zip(out.get_ref());
+    assert_eq!(entry_names(&files), vec!["a.txt"]);
+    assert_eq!(stats.entries_filtered, 1);
+}
+
+#[test]
+fn zip_exclude_directory_prefix() {
+    let proc = make_filter_processor(
+        ArchiveFilter::new(vec![], vec!["logs/".into()]).unwrap(),
+    );
+    let input = make_zip(&[
+        ("logs/app.log", b"log line"),
+        ("logs/err.log", b"error line"),
+        ("config.txt", b"cfg"),
+    ]);
+    let mut out = Cursor::new(Vec::new());
+    let stats = proc
+        .process_zip(&mut Cursor::new(&input), &mut out)
+        .unwrap();
+    let files = read_zip(out.get_ref());
+    let names = entry_names(&files);
+    assert!(!names.contains(&"logs/app.log"));
+    assert!(!names.contains(&"logs/err.log"));
+    assert!(names.contains(&"config.txt"));
+    assert_eq!(stats.entries_filtered, 2);
+}
+
+#[test]
+fn tar_dir_entries_pass_through_despite_filter() {
+    // Directory entries must always appear in the output regardless of filter.
+    // Use --exclude "config/" which would filter the files inside config/,
+    // but the explicit directory entry config/ itself must still pass through.
+    let proc = make_filter_processor(
+        ArchiveFilter::new(vec![], vec!["config/".into()]).unwrap(),
+    );
+
+    // Build a tar that has an explicit directory entry followed by file entries.
+    let mut buf = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut buf);
+        // Explicit directory entry.
+        let mut dir_hdr = tar::Header::new_gnu();
+        dir_hdr.set_entry_type(tar::EntryType::Directory);
+        dir_hdr.set_size(0);
+        dir_hdr.set_mode(0o755);
+        dir_hdr.set_mtime(1_700_000_000);
+        dir_hdr.set_cksum();
+        builder.append_data(&mut dir_hdr, "config/", &[][..]).unwrap();
+        // File entries: one inside config/ (excluded), one outside (kept).
+        let mut f_hdr = tar::Header::new_gnu();
+        f_hdr.set_size(2);
+        f_hdr.set_mode(0o644);
+        f_hdr.set_mtime(1_700_000_000);
+        f_hdr.set_cksum();
+        builder.append_data(&mut f_hdr, "config/a.json", &b"{}"[..]).unwrap();
+        let mut f2_hdr = tar::Header::new_gnu();
+        f2_hdr.set_size(6);
+        f2_hdr.set_mode(0o644);
+        f2_hdr.set_mtime(1_700_000_000);
+        f2_hdr.set_cksum();
+        builder.append_data(&mut f2_hdr, "root.txt", &b"rootok"[..]).unwrap();
+        builder.finish().unwrap();
+    }
+
+    let mut out = Vec::new();
+    proc.process_tar(&buf[..], &mut out).unwrap();
+
+    // Collect all entries (including dirs).
+    let mut archive = tar::Archive::new(&out[..]);
+    let mut entry_names_all: Vec<String> = Vec::new();
+    for entry in archive.entries().unwrap() {
+        let e = entry.unwrap();
+        entry_names_all.push(e.path().unwrap().to_string_lossy().to_string());
+    }
+
+    // The directory entry must survive (filter only applies to file entries).
+    assert!(
+        entry_names_all.iter().any(|n| n == "config/" || n == "config"),
+        "directory entry missing from output: {entry_names_all:?}"
+    );
+    // config/a.json is a file entry inside the excluded prefix — it is dropped.
+    assert!(
+        !entry_names_all.contains(&"config/a.json".to_string()),
+        "config/a.json should be filtered: {entry_names_all:?}"
+    );
+    // root.txt is outside the excluded prefix — it survives.
+    assert!(
+        entry_names_all.contains(&"root.txt".to_string()),
+        "root.txt should be present: {entry_names_all:?}"
+    );
+}
+
+#[test]
+fn tar_filter_default_passes_all() {
+    // ArchiveFilter::default() must not filter anything.
+    let proc = make_filter_processor(ArchiveFilter::default());
+    let input = make_tar(&[
+        ("a.txt", b"hello"),
+        ("b.json", b"{}"),
+        ("sub/c.yaml", b"key: value"),
+    ]);
+    let mut out = Vec::new();
+    let stats = proc.process_tar(&input[..], &mut out).unwrap();
+    let files = read_tar(&out);
+    assert_eq!(files.len(), 3);
+    assert_eq!(stats.entries_filtered, 0);
+    assert_eq!(stats.files_processed, 3);
 }
