@@ -34,10 +34,42 @@ The default mode (no subcommand) sanitizes files and archives. When `INPUT` is o
 | `--max-structured-size <BYTES>` | | Maximum structured file size in bytes before falling back to streaming (default: `268435456` = 256 MiB). |
 | `--max-archive-depth <N>` | | Maximum nesting depth for recursive archive processing (default: `3`, max: `10`). Each nesting level may buffer up to 256 MiB. |
 | `--log-format <FMT>` | | Log output format: `human` (default) or `json`. |
+| `--progress <MODE>` | | Progress display mode: `auto`, `on`, or `off`. Default: `auto`. |
+| `--no-progress` | | Alias for `--progress off`. |
+| `--progress-interval-ms <MS>` | | Minimum interval between progress refreshes (default: `200`). |
 | `-h, --help` | `-h` | Print help. |
 | `-V, --version` | `-V` | Print version. |
 
 Log level is controlled via the `SANITIZE_LOG` environment variable (e.g. `SANITIZE_LOG=debug`).
+
+#### Progress Behavior
+
+Progress output is designed to stay safe for pipelines and machine-readable logging:
+
+- Live progress renders on `stderr` only.
+- `stdout` remains reserved for sanitized payloads and explicit report output.
+- In `auto` mode, live progress is disabled when `stderr` is not a TTY, when `TERM=dumb`, when `CI` is set, or when `--log-format json` is active.
+- In `json` log mode, spinner frames are suppressed so logs remain parseable.
+- `--progress on` forces progress reporting, but non-interactive environments fall back to milestone-style status instead of a live spinner.
+
+Examples:
+
+```bash
+# Default behavior: spinner in interactive terminals, silent in CI/non-TTY.
+sanitize large.log -s secrets.enc -p hunter2
+
+# Force progress messages even in non-interactive environments.
+sanitize large.log -s secrets.enc -p hunter2 --progress on
+
+# Disable progress completely.
+sanitize large.log -s secrets.enc -p hunter2 --no-progress
+
+# Redirect sanitized payload and progress separately.
+sanitize large.log -s secrets.enc -p hunter2 --progress on > clean.log 2> progress.log
+
+# Keep machine-readable JSON logs clean (no spinner frames).
+sanitize large.log -s secrets.enc -p hunter2 --log-format json --progress on > clean.log 2> events.jsonl
+```
 
 #### Stdin Support
 
@@ -67,6 +99,9 @@ sanitize data.log -s secrets.enc -p hunter2 -o clean.log
 
 # Pipe from grep:
 grep "error" app.log | sanitize -s secrets.enc -p hunter2
+
+# Force progress to stderr while keeping stdout pipe-safe:
+grep "error" app.log | sanitize -s secrets.enc -p hunter2 --progress on > clean.log 2> progress.log
 
 # Structured stdin processing:
 cat config.yaml | sanitize -s secrets.enc -p pw -f yaml -o clean.yaml
