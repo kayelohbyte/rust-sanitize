@@ -5,11 +5,207 @@
 ```
 sanitize [OPTIONS] [INPUT]
 command | sanitize [OPTIONS]
+sanitize guided
 sanitize encrypt [OPTIONS] <INPUT> <OUTPUT>
 sanitize decrypt [OPTIONS] <INPUT> <OUTPUT>
 ```
 
 The default mode (no subcommand) sanitizes files and archives. When `INPUT` is omitted or set to `-`, data is read from stdin (plain text only; archives require a file path). Use `encrypt` / `decrypt` subcommands to manage encrypted secrets files.
+
+### `sanitize guided`
+
+Interactive wizard for generating a logs-focused starter secrets template.
+
+```
+sanitize guided
+```
+
+What it does:
+
+- Prompts for template strictness (`balanced` vs `aggressive`).
+- Asks for up to 3 company domains to seed domain-specific host/email patterns.
+- Asks for cloud providers (AWS, Azure, GCP) and adds provider-specific entries.
+- Generates a plaintext YAML secrets file (`.yaml`).
+- Optionally encrypts the generated file.
+- Optionally runs sanitization immediately using the generated file.
+
+#### Guided Flow (Step by Step)
+
+1. Starts interactive wizard and checks for a TTY (non-interactive shells are rejected).
+2. Asks for strictness profile:
+   - `Balanced`: core log/network identifiers.
+   - `Aggressive`: balanced set plus token-oriented patterns.
+3. Prompts for company domains (comma-separated, up to 3).
+4. Prompts for cloud provider scope (AWS, Azure, GCP, none).
+5. Prompts for noisy-ID handling (`trace_id`/`span_id`-like high-entropy noise toggle).
+6. Prompts for output path, then forces YAML output (`.yaml`).
+7. Generates secrets entries and validates all regexes by compiling them before writing.
+8. Writes plaintext YAML template.
+9. Optionally encrypts the generated template and writes a sibling `.enc` file.
+10. Optionally continues directly into a sanitize run:
+   - Prompts for input path (or `-` for stdin).
+   - Prompts for optional output path.
+   - Prompts for dry-run choice.
+   - Prompts for deterministic mode choice.
+
+#### What Guided Picks Out to Sanitize
+
+The guided template writes regex rules with these categories and targets.
+
+Always included (balanced + aggressive):
+
+- `email`: email addresses.
+- `hostname`: DNS-style hostnames/FQDNs.
+- `ipv4`: IPv4 addresses.
+- `ipv6`: IPv6 addresses.
+- `mac_address`: MAC addresses with `:` or `-` separators.
+- `uuid`: RFC-like UUIDs.
+- `container_id`: long lowercase hex IDs (12-64 chars).
+- `jwt`: JWT-like `header.payload.signature` tokens.
+- `url`: `http://` and `https://` URLs.
+
+Aggressive-only additions:
+
+- `auth_token`: context-keyed token matches (e.g. `bearer`, `token`, `api_key`, `secret` plus long value).
+- `custom:high_entropy_token`: broad long token pattern (`[A-Za-z0-9_-]{20,}`), unless noisy-ID exclusion is enabled.
+
+#### Balanced Profile Details
+
+`Balanced` is intended to catch common technical identifiers in logs while minimizing broad token captures.
+
+Balanced includes:
+
+- `email`
+- `hostname`
+- `ipv4`
+- `ipv6`
+- `mac_address`
+- `uuid`
+- `container_id`
+- `jwt`
+- `url`
+- Domain-derived `email` and `hostname` rules (if domains are provided)
+- Provider-derived rules for selected clouds (AWS/Azure/GCP)
+
+Balanced excludes:
+
+- `auth_token_context` aggressive token-context regex
+- `custom:high_entropy_token` broad token regex
+
+In practice, `Balanced` reduces false positives in logs with many opaque IDs while still sanitizing network/resource identifiers.
+
+#### Aggressive Profile Details
+
+`Aggressive` is intended to maximize secret/token detection in logs where broad matching is preferred over precision.
+
+Aggressive includes everything in `Balanced`, plus:
+
+- `auth_token_context`: context-keyed token regex for patterns like `bearer`, `token`, `api_key`, `secret` followed by long values.
+- `custom:high_entropy_token`: broad long-token regex (`[A-Za-z0-9_-]{20,}`), unless noisy-ID exclusion is enabled.
+
+Aggressive behavior notes:
+
+- Better coverage for API keys, bearer values, and opaque credential-like strings in unstructured logs.
+- Higher false-positive risk for long identifiers that are not secrets (for example telemetry IDs, synthetic IDs, long slugs).
+- If noisy-ID exclusion is enabled in guided prompts, the broad high-entropy token entry is removed to reduce alert noise.
+
+When to choose `Aggressive`:
+
+- Logs are highly unstructured and frequently contain ad-hoc credential formats.
+- You prefer over-redaction during first pass, then tune patterns down.
+
+When to prefer `Balanced`:
+
+- Logs contain many non-secret high-entropy identifiers.
+- You need lower false-positive rates for initial rollout.
+
+Domain-derived additions (for each provided domain):
+
+- `email`: domain-specific email regex (`...@<domain>`).
+- `hostname`: domain-specific host regex (`*.domain.tld` style).
+
+Cloud-provider additions:
+
+- AWS selected:
+  - `aws_arn`: ARN-like values.
+  - `auth_token`: AWS access key ID shape (`AKIA`/`ASIA` + 16 chars).
+- Azure selected:
+  - `azure_resource_id`: subscription/resourceGroups/provider path shapes.
+- GCP selected:
+  - `custom:gcp_service_account`: service-account email shape.
+  - `custom:gcp_resource`: `projects/<id>/...` resource-path shape.
+
+Intentionally excluded by default (logs-first design):
+
+- `ssn`, `phone`, `credit_card`, `name`, `file_path`.
+
+#### Replacement Behavior for Guided Rules
+
+- All replacements are one-way and length-preserving.
+- Category controls output shape (for example `email` preserves domain; `uuid` preserves dash layout; `url` preserves URL structure).
+- `custom:*` categories use the custom formatter (`__SANITIZED_<hex>__` style adjusted to input length).
+
+#### Example Generated YAML (Guided)
+
+Example (aggressive profile, with domains and GCP selected):
+
+```yaml
+- pattern: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+  kind: regex
+  category: email
+  label: email
+
+- pattern: \b(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)\.)+(?:[a-zA-Z]{2,63})\b
+  kind: regex
+  category: hostname
+  label: hostname
+
+- pattern: \b(?:\d{1,3}\.){3}\d{1,3}\b
+  kind: regex
+  category: ipv4
+  label: ipv4
+
+- pattern: \beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b
+  kind: regex
+  category: jwt
+  label: jwt
+
+- pattern: (?i)\b(?:bearer|token|api[_-]?key|secret)[\s:=]+[A-Za-z0-9._~+/=-]{16,}\b
+  kind: regex
+  category: auth_token
+  label: auth_token_context
+
+- pattern: '[A-Za-z0-9._%+-]+@example\.com'
+  kind: regex
+  category: email
+  label: email_example_com
+
+- pattern: \b(?:[A-Za-z0-9-]+\.)*example\.com\b
+  kind: regex
+  category: hostname
+  label: host_example_com
+
+- pattern: \b[a-z0-9-]+@[a-z0-9-]+\.iam\.gserviceaccount\.com\b
+  kind: regex
+  category: custom:gcp_service_account
+  label: gcp_service_account
+
+- pattern: \bprojects/[a-z][a-z0-9-]{4,30}/[A-Za-z0-9/_-]+\b
+  kind: regex
+  category: custom:gcp_resource
+  label: gcp_resource
+```
+
+Balanced profile note for this example:
+
+- The `auth_token_context` entry above is omitted in `Balanced`.
+- If noisy-ID exclusion is enabled, broad high-entropy token entries are also omitted.
+
+Notes:
+
+- Guided mode is intended for application/system logs and excludes common consumer-PII categories by default.
+- In non-interactive environments, guided mode exits with an error because it requires a TTY.
+- GCP patterns currently use `custom:gcp_*` categories (no built-in GCP formatter yet).
 
 ### Default Mode — Sanitize
 
@@ -162,7 +358,11 @@ sanitize decrypt [OPTIONS] <INPUT> <OUTPUT>
 
 ## Creating and Formatting a Secrets File
 
-The secrets file defines which patterns to detect and how to categorize matches. It can be written in JSON, YAML, or TOML.
+The secrets file defines which patterns to detect and how to categorize matches.
+
+Recommended canonical authoring format: YAML.
+
+Compatibility formats: JSON and TOML remain fully supported for existing workflows and automation.
 
 ### Fields
 
@@ -173,7 +373,21 @@ The secrets file defines which patterns to detect and how to categorize matches.
 | `category` | No | `"custom:secret"` | Controls replacement format. Built-in values: `email`, `name`, `phone`, `ipv4`, `ipv6`, `credit_card`, `ssn`, `hostname`, `mac_address`, `container_id`, `uuid`, `jwt`, `auth_token`, `file_path`, `windows_sid`, `url`, `aws_arn`, `azure_resource_id`. Use `custom:<tag>` for arbitrary categories. |
 | `label` | No | Truncated `pattern` | Human-readable label for reporting and statistics. |
 
-### JSON format
+### YAML format (canonical)
+
+```yaml
+- pattern: "alice@corp\\.com"
+  kind: regex
+  category: email
+  label: alice_email
+
+- pattern: "sk-proj-abc123secret"
+  kind: literal
+  category: "custom:api_key"
+  label: openai_key
+```
+
+### JSON format (compatibility)
 
 ```json
 [
@@ -192,21 +406,7 @@ The secrets file defines which patterns to detect and how to categorize matches.
 ]
 ```
 
-### YAML format
-
-```yaml
-- pattern: "alice@corp\\.com"
-  kind: regex
-  category: email
-  label: alice_email
-
-- pattern: "sk-proj-abc123secret"
-  kind: literal
-  category: "custom:api_key"
-  label: openai_key
-```
-
-### TOML format
+### TOML format (compatibility)
 
 ```toml
 [[secrets]]
@@ -281,17 +481,17 @@ sanitize data.log -s s.enc -p pw --log-format json
 **Use a plaintext (unencrypted) secrets file:**
 
 ```bash
-# Auto-detect — plaintext JSON/YAML/TOML is recognised automatically:
-sanitize data.log -s secrets.json
+# Auto-detect — plaintext YAML/JSON/TOML is recognised automatically:
+sanitize data.log -s secrets.yaml
 
 # Explicit flag:
 sanitize data.log -s secrets.yaml --unencrypted-secrets
 
 # Deterministic mode with plaintext secrets:
-sanitize data.csv -s secrets.json -d
+sanitize data.csv -s secrets.yaml -d
 
 # Fail CI with plaintext secrets:
-sanitize config.yaml -s secrets.json --fail-on-match
+sanitize config.yaml -s secrets.yaml --fail-on-match
 ```
 
 **Encrypted secrets file workflow:**

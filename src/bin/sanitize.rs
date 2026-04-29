@@ -60,7 +60,10 @@
 //! same secrets will produce identical replacements.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use sanitize_engine::secrets::{decrypt_secrets, encrypt_secrets, parse_secrets, SecretsFormat};
+use sanitize_engine::secrets::{
+    decrypt_secrets, encrypt_secrets, entries_to_patterns, parse_secrets, serialize_secrets,
+    SecretEntry, SecretsFormat,
+};
 use sanitize_engine::{
     atomic_write, ArchiveFormat, ArchiveProcessor, ArchiveProgress, AtomicFileWriter, FileReport,
     HmacGenerator, MappingStore, ProcessorRegistry, RandomGenerator, ReplacementGenerator,
@@ -72,6 +75,7 @@ use std::fs;
 use std::io::{self, BufReader, BufWriter, Cursor, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -598,6 +602,12 @@ EXAMPLES:\n  \
   sanitize decrypt secrets.json.enc secrets.json --password \"my-password\"\n  \
   sanitize decrypt secrets.enc out.yaml --password-file /run/secrets/pw")]
     Decrypt(DecryptArgs),
+
+        /// Interactive guided setup for logs-focused secrets templates.
+        #[command(after_help = "\
+EXAMPLES:\n  \
+    sanitize guided")]
+        Guided,
 }
 
 #[derive(Parser, Debug)]
@@ -669,6 +679,427 @@ fn parse_format(s: &str) -> Result<SecretsFormat, String> {
             other
         )),
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum GuidedPreset {
+    Balanced,
+    Aggressive,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+enum CloudProvider {
+    Aws,
+    Azure,
+    Gcp,
+}
+
+#[derive(Clone, Debug)]
+struct GuidedOptions {
+    preset: GuidedPreset,
+    domains: Vec<String>,
+    providers: Vec<CloudProvider>,
+    exclude_noise_ids: bool,
+}
+
+fn prompt_line(prompt: &str) -> Result<String, String> {
+    let mut stdout = io::stdout();
+    write!(stdout, "{}", prompt).map_err(|e| format!("failed to write prompt: {e}"))?;
+    stdout
+        .flush()
+        .map_err(|e| format!("failed to flush prompt: {e}"))?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| format!("failed to read input: {e}"))?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, String> {
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    loop {
+        let answer = prompt_line(&format!("{} {} ", prompt, suffix))?;
+        if answer.is_empty() {
+            return Ok(default_yes);
+        }
+        match answer.to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => eprintln!("Please answer 'y' or 'n'."),
+        }
+    }
+}
+
+fn sanitize_domain(input: &str) -> Option<String> {
+    let trimmed = input.trim().trim_matches('.').to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn prompt_domains() -> Result<Vec<String>, String> {
+    let raw = prompt_line(
+        "Company domains (comma-separated, up to 3, optional; e.g. corp.internal,example.com): ",
+    )?;
+    if raw.trim().is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in raw.split(',') {
+        let Some(domain) = sanitize_domain(item) else {
+            return Err(format!("invalid domain value: '{}'", item.trim()));
+        };
+        if seen.insert(domain.clone()) {
+            out.push(domain);
+        }
+    }
+
+    if out.len() > 3 {
+        return Err("please provide at most 3 domains".into());
+    }
+    Ok(out)
+}
+
+fn prompt_cloud_providers() -> Result<Vec<CloudProvider>, String> {
+    eprintln!("Cloud providers in scope:");
+    eprintln!("  1) AWS");
+    eprintln!("  2) Azure");
+    eprintln!("  3) GCP");
+    eprintln!("  4) None");
+    let raw = prompt_line("Select one or more (comma-separated numbers, default: 4): ")?;
+    if raw.trim().is_empty() || raw.trim() == "4" {
+        return Ok(vec![]);
+    }
+
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for token in raw.split(',').map(|s| s.trim()) {
+        let provider = match token {
+            "1" => CloudProvider::Aws,
+            "2" => CloudProvider::Azure,
+            "3" => CloudProvider::Gcp,
+            "4" => continue,
+            _ => return Err(format!("invalid selection: '{token}'")),
+        };
+        if seen.insert(provider) {
+            selected.push(provider);
+        }
+    }
+    Ok(selected)
+}
+
+fn make_regex_entry(pattern: &str, category: &str, label: &str) -> SecretEntry {
+    SecretEntry {
+        pattern: pattern.to_string(),
+        kind: "regex".to_string(),
+        category: category.to_string(),
+        label: Some(label.to_string()),
+    }
+}
+
+fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
+    let mut entries = vec![
+        make_regex_entry(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            "email",
+            "email",
+        ),
+        make_regex_entry(
+            r"\b(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)\.)+(?:[a-zA-Z]{2,63})\b",
+            "hostname",
+            "hostname",
+        ),
+        make_regex_entry(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "ipv4", "ipv4"),
+        make_regex_entry(r"\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b", "ipv6", "ipv6"),
+        make_regex_entry(
+            r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b",
+            "mac_address",
+            "mac_address",
+        ),
+        make_regex_entry(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b",
+            "uuid",
+            "uuid",
+        ),
+        make_regex_entry(r"\b[a-f0-9]{12,64}\b", "container_id", "container_id"),
+        make_regex_entry(
+            r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+            "jwt",
+            "jwt",
+        ),
+        make_regex_entry(
+            r#"https?://[^\s"'<>]+"#,
+            "url",
+            "url",
+        ),
+    ];
+
+    if matches!(opts.preset, GuidedPreset::Aggressive) {
+        entries.push(make_regex_entry(
+            r"(?i)\b(?:bearer|token|api[_-]?key|secret)[\s:=]+[A-Za-z0-9._~+/=-]{16,}\b",
+            "auth_token",
+            "auth_token_context",
+        ));
+        entries.push(make_regex_entry(
+            r"\b[A-Za-z0-9_\-]{20,}\b",
+            "custom:high_entropy_token",
+            "high_entropy_token",
+        ));
+    }
+
+    for domain in &opts.domains {
+        let escaped = regex::escape(domain);
+        entries.push(make_regex_entry(
+            &format!(r"[A-Za-z0-9._%+-]+@{}", escaped),
+            "email",
+            &format!("email_{}", domain.replace('.', "_")),
+        ));
+        entries.push(make_regex_entry(
+            &format!(r"\b(?:[A-Za-z0-9-]+\.)*{}\b", escaped),
+            "hostname",
+            &format!("host_{}", domain.replace('.', "_")),
+        ));
+    }
+
+    let has_aws = opts.providers.contains(&CloudProvider::Aws);
+    let has_azure = opts.providers.contains(&CloudProvider::Azure);
+    let has_gcp = opts.providers.contains(&CloudProvider::Gcp);
+
+    if has_aws {
+        entries.push(make_regex_entry(
+            r"\barn:aws:[^\s]+\b",
+            "aws_arn",
+            "aws_arn",
+        ));
+        entries.push(make_regex_entry(
+            r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+            "auth_token",
+            "aws_access_key_id",
+        ));
+    }
+    if has_azure {
+        entries.push(make_regex_entry(
+            r"/subscriptions/[0-9a-fA-F-]{8,}/resourceGroups/[^\s/]+(?:/providers/[^\s]+)?",
+            "azure_resource_id",
+            "azure_resource_id",
+        ));
+    }
+    if has_gcp {
+        entries.push(make_regex_entry(
+            r"\b[a-z0-9-]+@[a-z0-9-]+\.iam\.gserviceaccount\.com\b",
+            "custom:gcp_service_account",
+            "gcp_service_account",
+        ));
+        entries.push(make_regex_entry(
+            r"\bprojects/[a-z][a-z0-9-]{4,30}/[A-Za-z0-9/_-]+\b",
+            "custom:gcp_resource",
+            "gcp_resource",
+        ));
+    }
+
+    if opts.exclude_noise_ids {
+        entries.retain(|entry| entry.label.as_deref() != Some("high_entropy_token"));
+    }
+
+    entries
+}
+
+fn normalize_guided_output_path(path: PathBuf) -> PathBuf {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|s| s.to_ascii_lowercase())
+    {
+        Some(ext) if ext == "yaml" || ext == "yml" => path,
+        _ => path.with_extension("yaml"),
+    }
+}
+
+fn prompt_confirm_password() -> Result<String, String> {
+    loop {
+        let pw1 = prompt_password("encryption")?;
+        let pw2 = prompt_password("encryption (confirm)")?;
+        if pw1 == pw2 {
+            return Ok(pw1);
+        }
+        eprintln!("Passwords did not match. Try again.");
+    }
+}
+
+fn run_guided() -> Result<(), (String, i32)> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err((
+            "guided mode requires an interactive terminal (TTY)".into(),
+            1,
+        ));
+    }
+
+    eprintln!("Guided setup: logs-focused secrets template");
+    eprintln!("This wizard creates a starter file you can extend later.\n");
+
+    eprintln!("Template strictness:");
+    eprintln!("  1) Balanced");
+    eprintln!("  2) Aggressive (recommended for logs)");
+    let preset = loop {
+        let answer = prompt_line("Select [1/2] (default: 2): ").map_err(|e| (e, 1))?;
+        match answer.as_str() {
+            "" | "2" => break GuidedPreset::Aggressive,
+            "1" => break GuidedPreset::Balanced,
+            _ => eprintln!("Please enter 1 or 2."),
+        }
+    };
+
+    let domains = prompt_domains().map_err(|e| (e, 1))?;
+    let providers = prompt_cloud_providers().map_err(|e| (e, 1))?;
+    let exclude_noise_ids = prompt_yes_no(
+        "Exclude noisy IDs (trace_id/span_id-like high-entropy values)?",
+        true,
+    )
+    .map_err(|e| (e, 1))?;
+
+    let out_raw = prompt_line("Output secrets file path (YAML; default: secrets.guided.yaml): ")
+        .map_err(|e| (e, 1))?;
+    let requested_output_path = if out_raw.trim().is_empty() {
+        PathBuf::from("secrets.guided.yaml")
+    } else {
+        PathBuf::from(out_raw)
+    };
+    let output_path = normalize_guided_output_path(requested_output_path.clone());
+    if output_path != requested_output_path {
+        eprintln!(
+            "Guided mode writes YAML templates; using {}",
+            output_path.display()
+        );
+    }
+
+    let options = GuidedOptions {
+        preset,
+        domains,
+        providers,
+        exclude_noise_ids,
+    };
+    let entries = build_guided_entries(&options);
+
+    let (_patterns, compile_warnings) = entries_to_patterns(&entries);
+    if !compile_warnings.is_empty() {
+        return Err((
+            format!(
+                "generated template had {} invalid pattern(s)",
+                compile_warnings.len()
+            ),
+            1,
+        ));
+    }
+
+    let plain = serialize_secrets(&entries, SecretsFormat::Yaml)
+        .map_err(|e| (format!("failed to serialize template: {e}"), 1))?;
+
+    if output_path.exists()
+        && !prompt_yes_no(
+            &format!("{} already exists. Overwrite?", output_path.display()),
+            false,
+        )
+        .map_err(|e| (e, 1))?
+    {
+        return Err(("aborted by user".into(), 1));
+    }
+
+    atomic_write(&output_path, &plain)
+        .map_err(|e| (format!("failed to write {}: {e}", output_path.display()), 1))?;
+
+    eprintln!(
+        "Generated {} entries at {}",
+        entries.len(),
+        output_path.display()
+    );
+
+    let encrypt = prompt_yes_no("Encrypt the generated secrets file now?", true)
+        .map_err(|e| (e, 1))?;
+    let mut secrets_for_run = output_path.clone();
+    let mut run_password: Option<String> = None;
+    let mut run_unencrypted = true;
+
+    if encrypt {
+        let pw = prompt_confirm_password().map_err(|e| (e, 1))?;
+        let encrypted = encrypt_secrets(&plain, &pw)
+            .map_err(|e| (format!("failed to encrypt guided secrets file: {e}"), 1))?;
+        let encrypted_path = PathBuf::from(format!("{}.enc", output_path.display()));
+        atomic_write(&encrypted_path, &encrypted)
+            .map_err(|e| (format!("failed to write {}: {e}", encrypted_path.display()), 1))?;
+        eprintln!("Encrypted template written to {}", encrypted_path.display());
+        secrets_for_run = encrypted_path;
+        run_password = Some(pw);
+        run_unencrypted = false;
+    }
+
+    let run_now = prompt_yes_no("Run sanitize now with this secrets file?", true)
+        .map_err(|e| (e, 1))?;
+    if !run_now {
+        eprintln!("Next: sanitize <input> -s {}", secrets_for_run.display());
+        return Ok(());
+    }
+
+    let input_raw = prompt_line("Input file path (or '-' for stdin): ").map_err(|e| (e, 1))?;
+    let input = if input_raw.trim().is_empty() {
+        return Err(("input file path is required to run sanitize now".into(), 1));
+    } else {
+        PathBuf::from(input_raw)
+    };
+
+    let out_raw = prompt_line("Output path (optional; blank = stdout/default): ")
+        .map_err(|e| (e, 1))?;
+    let output = if out_raw.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(out_raw))
+    };
+
+    let dry_run = prompt_yes_no("Dry-run first?", true).map_err(|e| (e, 1))?;
+    let deterministic = prompt_yes_no("Use deterministic replacements?", true)
+        .map_err(|e| (e, 1))?;
+
+    let mut deterministic_password = run_password.clone();
+    if deterministic && deterministic_password.is_none() {
+        deterministic_password = Some(prompt_password("deterministic seed").map_err(|e| (e, 1))?);
+    }
+
+    let cli = Cli {
+        command: None,
+        input: Some(input),
+        output,
+        secrets_file: Some(secrets_for_run),
+        password: deterministic_password.or(run_password),
+        password_file: None,
+        unencrypted_secrets: run_unencrypted,
+        format: None,
+        dry_run,
+        fail_on_match: false,
+        report: None,
+        strict: false,
+        deterministic,
+        include_binary: false,
+        threads: None,
+        chunk_size: 1_048_576,
+        max_mappings: 10_000_000,
+        max_structured_size: DEFAULT_MAX_STRUCTURED_FILE_SIZE,
+        max_archive_depth: DEFAULT_MAX_ARCHIVE_DEPTH,
+        log_format: "human".to_string(),
+        progress: None,
+        no_progress: false,
+        progress_interval_ms: DEFAULT_PROGRESS_INTERVAL_MS,
+    };
+
+    run_sanitize(cli)
 }
 
 // ---------------------------------------------------------------------------
@@ -1921,8 +2352,14 @@ fn run() -> Result<(), (String, i32)> {
     match &cli.command {
         Some(SubCommand::Encrypt(args)) => return run_encrypt(args),
         Some(SubCommand::Decrypt(args)) => return run_decrypt(args),
+        Some(SubCommand::Guided) => return run_guided(),
         None => {} // fall through to default sanitize mode
     }
+
+    run_sanitize(cli)
+}
+
+fn run_sanitize(cli: Cli) -> Result<(), (String, i32)> {
 
     // --- install signal handler (graceful shutdown) --------------------------
     if let Err(e) = ctrlc::set_handler(move || {
@@ -2356,6 +2793,13 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_guided_subcommand() {
+        let cli = Cli::try_parse_from(["sanitize", "guided"]).unwrap();
+        assert!(matches!(cli.command, Some(SubCommand::Guided)));
+        assert!(cli.input.is_none());
+    }
+
+    #[test]
     fn cli_no_input_no_subcommand_is_ok_at_parse_time() {
         // Clap allows it (input is Option); we validate manually in run().
         let cli = Cli::try_parse_from(["sanitize", "--dry-run"]).unwrap();
@@ -2432,5 +2876,35 @@ mod tests {
         assert_eq!(format_to_ext("key-value"), Some("conf"));
         assert_eq!(format_to_ext("text"), None);
         assert_eq!(format_to_ext("unknown"), None);
+    }
+
+    #[test]
+    fn guided_entries_compile_balanced() {
+        let opts = GuidedOptions {
+            preset: GuidedPreset::Balanced,
+            domains: vec!["corp.internal".into()],
+            providers: vec![CloudProvider::Aws],
+            exclude_noise_ids: true,
+        };
+
+        let entries = build_guided_entries(&opts);
+        let (_patterns, warnings) = entries_to_patterns(&entries);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn guided_entries_include_gcp_custom_when_selected() {
+        let opts = GuidedOptions {
+            preset: GuidedPreset::Aggressive,
+            domains: vec![],
+            providers: vec![CloudProvider::Gcp],
+            exclude_noise_ids: false,
+        };
+
+        let entries = build_guided_entries(&opts);
+        assert!(entries
+            .iter()
+            .any(|e| e.category == "custom:gcp_service_account"));
+        assert!(entries.iter().any(|e| e.category == "custom:gcp_resource"));
     }
 }
