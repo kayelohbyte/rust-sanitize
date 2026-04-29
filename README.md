@@ -60,14 +60,24 @@ sanitize encrypt secrets.yaml secrets.yaml.enc --password
 # 3. Remove the plaintext:
 rm secrets.yaml
 
-# 4. Sanitize a file using the encrypted secrets file:
+# 4. Sanitize a file (output goes to data-sanitized.log next to the input):
+sanitize data.log -s secrets.yaml.enc --encrypted-secrets --password
+
+# 5. Sanitize multiple files at once:
+sanitize data.log config.yaml backup.zip -s secrets.yaml.enc --encrypted-secrets --password
+# Produces: data-sanitized.log  config-sanitized.yaml  backup.sanitized.zip
+
+# 6. Send all sanitized files to a directory:
+sanitize data.log config.yaml backup.zip -s secrets.yaml.enc --encrypted-secrets --password -o /tmp/clean/
+
+# 7. Or write a single file to an explicit path:
 sanitize data.log -s secrets.yaml.enc --encrypted-secrets --password -o output.log
 
-# 5. Or write to stdout (use env var to avoid interactive prompt in scripts):
+# 8. Or write to stdout (use env var to avoid interactive prompt in scripts):
 export SANITIZE_PASSWORD="my-password"
 sanitize data.log -s secrets.yaml.enc --encrypted-secrets > output.log
 
-# 6. CI gate — fail the build if secrets are detected:
+# 9. CI gate — fail the build if secrets are detected:
 SANITIZE_PASSWORD="my-password" sanitize config.yaml -s secrets.yaml.enc --encrypted-secrets --fail-on-match
 ```
 
@@ -233,13 +243,26 @@ For the full security model, threat mitigations, and out-of-scope threats, see [
 
 ## Examples
 
-**Sanitize a single file (interactive password prompt):**
+**Sanitize a single file (output goes next to the source as `data-sanitized.log`):**
 
 ```bash
 sanitize data.log -s secrets.enc --password
 ```
 
-**Write output to a file:**
+**Sanitize multiple files in one command:**
+
+```bash
+sanitize test.txt a.json backup.zip -s secrets.enc --password
+# Produces: test-sanitized.txt  a-sanitized.json  backup.sanitized.zip
+```
+
+**Send all outputs to a directory:**
+
+```bash
+sanitize test.txt a.json backup.zip -s secrets.enc --password -o /tmp/clean/
+```
+
+**Write a single file to an explicit path:**
 
 ```bash
 sanitize data.log -s secrets.enc --password -o output.log

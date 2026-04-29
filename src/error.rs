@@ -38,8 +38,26 @@ pub enum SanitizeError {
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
 
-    #[error("secrets error: {0}")]
-    SecretsError(String),
+    #[error("secrets: empty password")]
+    SecretsEmptyPassword,
+
+    #[error("secrets: encrypted file too short (corrupt or truncated)")]
+    SecretsTooShort,
+
+    #[error("secrets: decryption failed — wrong password or corrupted file")]
+    SecretsDecryptFailed,
+
+    #[error("secrets: cipher error: {0}")]
+    SecretsCipherError(String),
+
+    #[error("secrets: {format} error: {message}")]
+    SecretsFormatError { format: String, message: String },
+
+    #[error("secrets: invalid UTF-8: {0}")]
+    SecretsInvalidUtf8(String),
+
+    #[error("secrets: no password provided — file appears encrypted but --encrypted-secrets was not specified")]
+    SecretsPasswordRequired,
 
     #[error("archive error: {0}")]
     ArchiveError(String),

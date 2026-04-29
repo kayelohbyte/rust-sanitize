@@ -17,7 +17,7 @@
 //! | `has_header` | `"true"`| Whether the first row is a header row. |
 
 use crate::error::{Result, SanitizeError};
-use crate::processor::{find_matching_rule, replace_value, FileTypeProfile, Processor};
+use crate::processor::{find_matching_rule, pattern_matches, replace_value, FileTypeProfile, Processor};
 use crate::store::MappingStore;
 
 /// Maximum allowed input size (bytes) for CSV processing (F-04 fix).
@@ -85,14 +85,16 @@ impl Processor for CsvProcessor {
             wtr.write_record(headers.iter())
                 .map_err(|e| SanitizeError::IoError(format!("CSV write error: {}", e)))?;
 
-            // Map each column index to a matching rule index (if any).
+            // Map each column index to the index of its first matching rule (if any).
+            // Uses pattern_matches directly to avoid allocating a temporary
+            // FileTypeProfile for every (header, rule) pair.
             headers
                 .iter()
                 .map(|h| {
-                    profile.fields.iter().position(|r| {
-                        find_matching_rule(h, &FileTypeProfile::new("csv", vec![r.clone()]))
-                            .is_some()
-                    })
+                    profile
+                        .fields
+                        .iter()
+                        .position(|r| pattern_matches(&r.pattern, h))
                 })
                 .collect()
         } else {

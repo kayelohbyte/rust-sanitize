@@ -247,9 +247,7 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Zeroizing<[u8; 32]> {
 /// - AES-256-GCM provides authenticated encryption.
 pub fn encrypt_secrets(plaintext: &[u8], password: &str) -> Result<Vec<u8>> {
     if password.is_empty() {
-        return Err(SanitizeError::SecretsError(
-            "password must not be empty".into(),
-        ));
+        return Err(SanitizeError::SecretsEmptyPassword);
     }
 
     let mut rng = rand::thread_rng();
@@ -265,12 +263,12 @@ pub fn encrypt_secrets(plaintext: &[u8], password: &str) -> Result<Vec<u8>> {
     // Derive key.
     let key = derive_key(password.as_bytes(), &salt);
     let cipher = Aes256Gcm::new_from_slice(key.as_ref())
-        .map_err(|e| SanitizeError::SecretsError(format!("cipher init: {}", e)))?;
+        .map_err(|e| SanitizeError::SecretsCipherError(format!("cipher init: {}", e)))?;
 
     // Encrypt.
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
-        .map_err(|e| SanitizeError::SecretsError(format!("encryption failed: {}", e)))?;
+        .map_err(|e| SanitizeError::SecretsCipherError(format!("encryption: {}", e)))?;
 
     // Assemble: salt || nonce || ciphertext
     let mut output = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
@@ -300,9 +298,7 @@ pub fn encrypt_secrets(plaintext: &[u8], password: &str) -> Result<Vec<u8>> {
 ///   password is wrong, or the ciphertext has been tampered with.
 pub fn decrypt_secrets(encrypted: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>> {
     if encrypted.len() < MIN_ENCRYPTED_LEN {
-        return Err(SanitizeError::SecretsError(
-            "encrypted file too short (corrupt or truncated)".into(),
-        ));
+        return Err(SanitizeError::SecretsTooShort);
     }
 
     let salt = &encrypted[..SALT_LEN];
@@ -313,10 +309,10 @@ pub fn decrypt_secrets(encrypted: &[u8], password: &str) -> Result<Zeroizing<Vec
 
     let key = derive_key(password.as_bytes(), salt);
     let cipher = Aes256Gcm::new_from_slice(key.as_ref())
-        .map_err(|e| SanitizeError::SecretsError(format!("cipher init: {}", e)))?;
+        .map_err(|e| SanitizeError::SecretsCipherError(format!("cipher init: {}", e)))?;
 
     let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
-        SanitizeError::SecretsError("decryption failed: wrong password or corrupted file".into())
+        SanitizeError::SecretsDecryptFailed
     })?;
 
     Ok(Zeroizing::new(plaintext))
@@ -338,16 +334,28 @@ pub fn decrypt_secrets(encrypted: &[u8], password: &str) -> Result<Zeroizing<Vec
 pub fn parse_secrets(plaintext: &[u8], format: Option<SecretsFormat>) -> Result<Vec<SecretEntry>> {
     let fmt = format.unwrap_or_else(|| SecretsFormat::detect(plaintext));
     let text = std::str::from_utf8(plaintext)
-        .map_err(|e| SanitizeError::SecretsError(format!("invalid UTF-8: {}", e)))?;
+        .map_err(|e| SanitizeError::SecretsInvalidUtf8(e.to_string()))?;
 
     match fmt {
-        SecretsFormat::Json => serde_json::from_str(text)
-            .map_err(|e| SanitizeError::SecretsError(format!("JSON parse: {}", e))),
-        SecretsFormat::Yaml => serde_yaml_ng::from_str(text)
-            .map_err(|e| SanitizeError::SecretsError(format!("YAML parse: {}", e))),
+        SecretsFormat::Json => serde_json::from_str(text).map_err(|e| {
+            SanitizeError::SecretsFormatError {
+                format: "JSON".into(),
+                message: e.to_string(),
+            }
+        }),
+        SecretsFormat::Yaml => serde_yaml_ng::from_str(text).map_err(|e| {
+            SanitizeError::SecretsFormatError {
+                format: "YAML".into(),
+                message: e.to_string(),
+            }
+        }),
         SecretsFormat::Toml => {
-            let wrapper: TomlSecrets = toml::from_str(text)
-                .map_err(|e| SanitizeError::SecretsError(format!("TOML parse: {}", e)))?;
+            let wrapper: TomlSecrets = toml::from_str(text).map_err(|e| {
+                SanitizeError::SecretsFormatError {
+                    format: "TOML".into(),
+                    message: e.to_string(),
+                }
+            })?;
             Ok(wrapper.secrets)
         }
     }
@@ -362,16 +370,26 @@ pub fn parse_secrets(plaintext: &[u8], format: Option<SecretsFormat>) -> Result<
 /// Returns [`SanitizeError::SecretsError`] if serialization fails.
 pub fn serialize_secrets(entries: &[SecretEntry], format: SecretsFormat) -> Result<Vec<u8>> {
     match format {
-        SecretsFormat::Json => serde_json::to_vec_pretty(entries)
-            .map_err(|e| SanitizeError::SecretsError(format!("JSON serialize: {}", e))),
+        SecretsFormat::Json => serde_json::to_vec_pretty(entries).map_err(|e| {
+            SanitizeError::SecretsFormatError {
+                format: "JSON-serialize".into(),
+                message: e.to_string(),
+            }
+        }),
         SecretsFormat::Yaml => serde_yaml_ng::to_string(entries)
             .map(|s| s.into_bytes())
-            .map_err(|e| SanitizeError::SecretsError(format!("YAML serialize: {}", e))),
+            .map_err(|e| SanitizeError::SecretsFormatError {
+                format: "YAML-serialize".into(),
+                message: e.to_string(),
+            }),
         SecretsFormat::Toml => {
             let wrapper = TomlSecretsRef { secrets: entries };
             toml::to_string_pretty(&wrapper)
                 .map(|s| s.into_bytes())
-                .map_err(|e| SanitizeError::SecretsError(format!("TOML serialize: {}", e)))
+                .map_err(|e| SanitizeError::SecretsFormatError {
+                    format: "TOML-serialize".into(),
+                    message: e.to_string(),
+                })
         }
     }
 }
@@ -416,6 +434,23 @@ pub fn parse_category(s: &str) -> Category {
 // ---------------------------------------------------------------------------
 // Conversion to ScanPatterns
 // ---------------------------------------------------------------------------
+
+/// Zeroize all sensitive string fields in a `Vec<SecretEntry>` and drop it.
+///
+/// Called after pattern compilation so that secret values do not linger in
+/// heap memory beyond their point of use.
+fn zeroize_and_drop_entries(mut entries: Vec<SecretEntry>) {
+    for entry in &mut entries {
+        entry.pattern.zeroize();
+        entry.kind.zeroize();
+        entry.category.zeroize();
+        if let Some(ref mut l) = entry.label {
+            l.zeroize();
+        }
+    }
+    // entries drops here, running each SecretEntry::drop (which also zeroizes
+    // via the Zeroize impl), giving belt-and-suspenders coverage.
+}
 
 /// Convert parsed [`SecretEntry`]s into compiled [`ScanPattern`]s.
 ///
@@ -489,18 +524,9 @@ pub fn load_encrypted_secrets(
     format: Option<SecretsFormat>,
 ) -> Result<PatternCompileResult> {
     let plaintext = decrypt_secrets(encrypted_bytes, password)?;
-    let mut entries = parse_secrets(&plaintext, format)?;
+    let entries = parse_secrets(&plaintext, format)?;
     let result = entries_to_patterns(&entries);
-    // Explicitly zeroize entries (S-2 fix — belt-and-suspenders with Drop).
-    for entry in &mut entries {
-        entry.pattern.zeroize();
-        entry.kind.zeroize();
-        entry.category.zeroize();
-        if let Some(ref mut l) = entry.label {
-            l.zeroize();
-        }
-    }
-    drop(entries);
+    zeroize_and_drop_entries(entries);
     Ok(result)
 }
 
@@ -529,19 +555,9 @@ pub fn load_plaintext_secrets(
     plaintext: &[u8],
     format: Option<SecretsFormat>,
 ) -> Result<PatternCompileResult> {
-    let mut entries = parse_secrets(plaintext, format)?;
+    let entries = parse_secrets(plaintext, format)?;
     let result = entries_to_patterns(&entries);
-    // Zeroize entries — same belt-and-suspenders approach as
-    // load_encrypted_secrets (S-2 fix).
-    for entry in &mut entries {
-        entry.pattern.zeroize();
-        entry.kind.zeroize();
-        entry.category.zeroize();
-        if let Some(ref mut l) = entry.label {
-            l.zeroize();
-        }
-    }
-    drop(entries);
+    zeroize_and_drop_entries(entries);
     Ok(result)
 }
 
@@ -568,11 +584,11 @@ pub fn looks_encrypted(data: &[u8]) -> bool {
     // plaintext marker, treat it as plaintext.
     if let Ok(text) = std::str::from_utf8(data) {
         let trimmed = text.trim_start();
+        // Recognisable plaintext markers for JSON ('[', '{'), YAML ('-'), TOML ('#').
+        // starts_with('[') already covers "[["; starts_with('-') covers "---".
         let has_marker = trimmed.starts_with('[')
             || trimmed.starts_with('{')
             || trimmed.starts_with('-')
-            || trimmed.starts_with("---")
-            || trimmed.starts_with("[[")
             || trimmed.starts_with('#');
         if has_marker {
             return false;
@@ -615,13 +631,7 @@ pub fn load_secrets_auto(
         let result = load_plaintext_secrets(data, format)?;
         Ok((result, false))
     } else {
-        let pw = password.ok_or_else(|| {
-            SanitizeError::SecretsError(
-                "secrets file appears encrypted but no password was provided; \
-                 add --encrypted-secrets to enable decryption mode"
-                    .into(),
-            )
-        })?;
+        let pw = password.ok_or(SanitizeError::SecretsPasswordRequired)?;
         let result = load_encrypted_secrets(data, pw, format)?;
         Ok((result, true))
     }

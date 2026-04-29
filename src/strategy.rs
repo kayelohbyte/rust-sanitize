@@ -241,7 +241,9 @@ impl Strategy for RandomString {
         // Seed from all 32 entropy bytes via wrapping addition of 4 u64 chunks.
         let mut state = 0u64;
         for chunk in entropy.chunks_exact(8) {
-            state = state.wrapping_add(u64::from_le_bytes(chunk.try_into().unwrap()));
+            // chunks_exact(8) on a [u8; 32] always yields exactly 8-byte slices.
+            let arr: [u8; 8] = chunk.try_into().expect("chunks_exact(8) yields 8-byte slices");
+            state = state.wrapping_add(u64::from_le_bytes(arr));
         }
         if state == 0 {
             state = 0xDEAD_BEEF_CAFE_BABE; // avoid degenerate zero state
@@ -386,7 +388,9 @@ impl Strategy for PreserveLength {
         // Seed from all 32 entropy bytes via wrapping addition of 4 u64 chunks.
         let mut state = 0u64;
         for chunk in entropy.chunks_exact(8) {
-            state = state.wrapping_add(u64::from_le_bytes(chunk.try_into().unwrap()));
+            // chunks_exact(8) on a [u8; 32] always yields exactly 8-byte slices.
+            let arr: [u8; 8] = chunk.try_into().expect("chunks_exact(8) yields 8-byte slices");
+            state = state.wrapping_add(u64::from_le_bytes(arr));
         }
         if state == 0 {
             state = 0xCAFE_BABE_DEAD_BEEFu64;

@@ -16,7 +16,7 @@ understand data-flow, concurrency, and security boundaries.
 │  [INPUT]     │                │  ┌─────────────────┐   │
 │  -o/--output │                │  │ Signal handler   │   │
 │  -s/--secrets-│                │  │ Tracing init     │   │
-│    file      │                │  │ Thread pool      │   │
+│    file      │                │  │ Thread cap resolve│   │
 └─────────────┘                 │  └────────┬────────┘   │
                                 │           │            │
                       ┌─────────▼──────────────────────┐ │
@@ -57,7 +57,7 @@ understand data-flow, concurrency, and security boundaries.
 3. Create `StreamScanner` with chunk+overlap configuration.
 4. Open input as a `Read`, open output via `AtomicFileWriter`.
 5. Call `scan_reader(&mut reader, &mut writer)`.
-6. Scanner reads chunks, applies regex set, calls `MappingStore::get_or_insert` for each match, writes sanitized chunks to the writer.
+6. Scanner reads chunks, matches literals via Aho-Corasick and regex patterns via `RegexSet` pre-filter + per-pattern regex scan, calls `MappingStore::get_or_insert` for each match, and writes sanitized chunks to the writer.
 7. On success, `AtomicFileWriter::finish()` fsyncs + renames. On error/signal, temp file is cleaned up by `Drop`.
 
 ### Archive path
@@ -143,7 +143,7 @@ Both paths are maintained and tested. They share the same `MappingStore` and
 
 | Module | Responsibility |
 |--------|---------------|
-| `scanner` | Streaming regex scanner with configurable chunk/overlap. Memory-bounded reads. |
+| `scanner` | Streaming hybrid scanner with configurable chunk/overlap: Aho-Corasick for literals + regex engine for regex patterns. Memory-bounded reads. |
 | `store` | `DashMap`-backed dedup cache. `get_or_insert` is the single entry-point. Capacity-limited. |
 | `generator` | `ReplacementGenerator` trait. Two impls: `HmacGenerator` (deterministic), `RandomGenerator` (CSPRNG). Contains category-aware formatters used by the CLI. |
 | `strategy` | **Extensibility layer:** `Strategy` trait + `StrategyGenerator` adapter + 5 built-in strategies (`RandomString`, `FakeIp`, etc.). Public API for library users to implement custom replacement logic. |
@@ -186,10 +186,22 @@ fall through to the streaming scanner.
   threads can call `get_or_insert` concurrently; per-shard locking keeps
   contention low.
 - **All public types are `Send + Sync`.**
-- The CLI caps the thread pool to `min(--threads, available_parallelism)`
-  to avoid oversubscription.
-- Archive entries are currently processed **sequentially** within a
-  single archive to preserve ordering determinism.
+- The CLI resolves `--threads` to `min(--threads, available_parallelism)`
+  and initializes the global rayon thread pool to that size at startup.
+- **File-level parallelism:** when multiple `[INPUT]` paths are given, all
+  `InputTarget::File` targets are dispatched via `rayon::par_iter`. Stdin
+  targets always run serially.
+- **Archive-entry parallelism:** for a single-archive input (or when file-level
+  parallelism is not active), archive entries are sanitized in parallel via
+  rayon when the file-entry count meets `parallel_threshold` (default: 4).
+  The rebuilt archive is always written in original entry order — output is
+  deterministic regardless of thread count.
+- **Thread-budget policy:** file-level and entry-level parallelism are mutually
+  exclusive. When multiple files are processed in parallel, archive-entry
+  parallelism inside each one is suppressed (`parallel_threshold = usize::MAX`)
+  to prevent rayon oversubscription.
+- **Progress:** the shared `Arc<Mutex<ProgressReporter>>` serializes all
+  `start_task` / `finish_task` calls, so milestone lines are never interleaved.
 
 ---
 

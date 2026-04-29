@@ -1106,6 +1106,7 @@ name = "sanitize-engine"
 version = "0.2.0"
 dependencies = [
  "aes-gcm",
+ "aho-corasick",
  "clap",
  "compact_str",
  "criterion",

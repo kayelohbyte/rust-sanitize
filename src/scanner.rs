@@ -58,6 +58,7 @@
 use crate::category::Category;
 use crate::error::{Result, SanitizeError};
 use crate::store::MappingStore;
+use aho_corasick::AhoCorasick;
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -167,15 +168,22 @@ impl ScanConfig {
 /// Wraps a compiled [`regex::bytes::Regex`] with a [`Category`] for
 /// replacement lookups and a human-readable label for reporting.
 ///
-/// Both regex and literal patterns are supported. Literals are escaped
-/// and compiled as regex for uniform handling.
+/// Both regex and literal patterns are supported. Literal patterns keep
+/// their original text and are matched by the scanner's Aho-Corasick
+/// automaton for fast multi-literal scanning.
 pub struct ScanPattern {
-    /// Compiled regex matcher.
+    /// Compiled regex matcher (used for non-literal patterns and as a
+    /// fallback; literal patterns are matched via Aho-Corasick instead).
     regex: Regex,
     /// Category for replacement lookups.
     category: Category,
     /// Human-readable label for reporting / stats.
     label: String,
+    /// Original (unescaped) literal string when created via `from_literal`.
+    /// `None` for patterns created via `from_regex`.
+    /// Stored so `StreamScanner` can build an Aho-Corasick automaton for
+    /// fast SIMD literal matching instead of running the regex engine.
+    literal: Option<String>,
 }
 
 impl std::fmt::Debug for ScanPattern {
@@ -184,6 +192,7 @@ impl std::fmt::Debug for ScanPattern {
             .field("pattern", &self.regex.as_str())
             .field("category", &self.category)
             .field("label", &self.label)
+            .field("literal", &self.literal.as_deref())
             .finish()
     }
 }
@@ -217,6 +226,7 @@ impl ScanPattern {
             regex,
             category,
             label: label.into(),
+            literal: None,
         })
     }
 
@@ -256,6 +266,7 @@ impl ScanPattern {
             regex,
             category,
             label: label.into(),
+            literal: Some(literal.to_owned()),
         })
     }
 
@@ -288,7 +299,7 @@ impl ScanPattern {
 // ---------------------------------------------------------------------------
 
 /// A single match found during scanning (internal).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct RawMatch {
     /// Start byte offset within the scan window.
     start: usize,
@@ -296,6 +307,40 @@ struct RawMatch {
     end: usize,
     /// Index into the `StreamScanner::patterns` vector.
     pattern_idx: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Per-scan scratch buffers
+// ---------------------------------------------------------------------------
+
+/// Scratch buffers reused across chunks within a single scan call.
+///
+/// Allocating these once per `scan_reader_with_progress` invocation
+/// and reusing them each chunk eliminates the per-chunk heap pressure
+/// that would otherwise come from `Vec` allocations in `find_matches`
+/// and `apply_replacements`.
+struct ScanScratch {
+    /// Accumulates raw matches from all patterns before deduplication.
+    all_matches: Vec<RawMatch>,
+    /// Non-overlapping matches selected for the current window
+    /// (populated by `find_matches`, consumed by `apply_replacements`).
+    selected: Vec<RawMatch>,
+    /// Output bytes for the committed region, written by `apply_replacements`.
+    output: Vec<u8>,
+    /// Per-pattern match counts indexed by `pattern_idx`.
+    /// Reset to zero after each chunk's counts are folded into `ScanStats`.
+    pattern_counts: Vec<u64>,
+}
+
+impl ScanScratch {
+    fn new(pattern_count: usize, chunk_size: usize, overlap_size: usize) -> Self {
+        Self {
+            all_matches: Vec::new(),
+            selected: Vec::new(),
+            output: Vec::with_capacity(chunk_size + overlap_size),
+            pattern_counts: vec![0u64; pattern_count],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -381,12 +426,22 @@ pub struct ScanProgress {
 ///     .any(|w| w == b"alice@corp.com"));
 /// ```
 pub struct StreamScanner {
-    /// Compiled scan patterns.
+    /// Compiled scan patterns (both literal and regex).
     patterns: Vec<ScanPattern>,
-    /// Pre-compiled set for fast multi-pattern pre-filtering.
-    /// `matches()` returns which pattern indices matched, avoiding
-    /// running every individual regex on each chunk (R-3 optimisation).
+    /// Pre-compiled set for fast multi-pattern pre-filtering of **regex**
+    /// (non-literal) patterns only.  `matches()` returns which regex-pattern
+    /// indices matched, avoiding running every individual regex on each chunk
+    /// (R-3 optimisation).
     regex_set: RegexSet,
+    /// Maps a `RegexSet` index → index into `self.patterns`.
+    /// Only non-literal patterns are in the `RegexSet`.
+    regex_indices: Vec<usize>,
+    /// Aho-Corasick automaton for fast SIMD literal matching.
+    /// `None` when there are no literal patterns.
+    aho_corasick: Option<AhoCorasick>,
+    /// Maps an Aho-Corasick pattern index → index into `self.patterns`.
+    /// Only literal patterns appear here.
+    literal_indices: Vec<usize>,
     /// Thread-safe dedup replacement store.
     store: Arc<MappingStore>,
     /// Scanner configuration.
@@ -444,18 +499,45 @@ impl StreamScanner {
             )));
         }
 
-        // Build a RegexSet from all pattern strings for fast pre-filtering.
-        let regex_set = if patterns.is_empty() {
+        // Partition patterns into literal (Aho-Corasick) and regex (RegexSet)
+        // so each is matched by the most efficient engine.
+        let mut literal_bytes: Vec<Vec<u8>> = Vec::new();
+        let mut literal_indices: Vec<usize> = Vec::new();
+        let mut regex_strs: Vec<&str> = Vec::new();
+        let mut regex_indices: Vec<usize> = Vec::new();
+
+        for (i, pattern) in patterns.iter().enumerate() {
+            if let Some(lit) = &pattern.literal {
+                literal_bytes.push(lit.as_bytes().to_vec());
+                literal_indices.push(i);
+            } else {
+                regex_strs.push(pattern.regex_pattern());
+                regex_indices.push(i);
+            }
+        }
+
+        // Build Aho-Corasick automaton for literal patterns (SIMD-accelerated,
+        // single O(n) pass over the input per chunk).
+        let aho_corasick = if literal_bytes.is_empty() {
+            None
+        } else {
+            Some(
+                AhoCorasick::new(&literal_bytes)
+                    .map_err(|e| SanitizeError::PatternCompileError(e.to_string()))?,
+            )
+        };
+
+        // Build RegexSet from non-literal patterns only (R-3 pre-filter).
+        let regex_set = if regex_strs.is_empty() {
             RegexSetBuilder::new(Vec::<&str>::new())
                 .size_limit(REGEX_SIZE_LIMIT)
                 .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
                 .build()
                 .map_err(|e| SanitizeError::PatternCompileError(e.to_string()))?
         } else {
-            let pattern_strs: Vec<&str> = patterns.iter().map(|p| p.regex_pattern()).collect();
-            RegexSetBuilder::new(&pattern_strs)
-                .size_limit(REGEX_SIZE_LIMIT * pattern_strs.len().max(1))
-                .dfa_size_limit(REGEX_DFA_SIZE_LIMIT * pattern_strs.len().max(1))
+            RegexSetBuilder::new(&regex_strs)
+                .size_limit(REGEX_SIZE_LIMIT * regex_strs.len().max(1))
+                .dfa_size_limit(REGEX_DFA_SIZE_LIMIT * regex_strs.len().max(1))
                 .build()
                 .map_err(|e| SanitizeError::PatternCompileError(e.to_string()))?
         };
@@ -463,6 +545,9 @@ impl StreamScanner {
         Ok(Self {
             patterns,
             regex_set,
+            regex_indices,
+            aho_corasick,
+            literal_indices,
             store,
             config,
         })
@@ -525,6 +610,14 @@ impl StreamScanner {
         let mut window: Vec<u8> =
             Vec::with_capacity(self.config.chunk_size + self.config.overlap_size);
 
+        // Scratch buffers reused every chunk to eliminate per-chunk heap
+        // pressure from match collection, output building, and stats tracking.
+        let mut scratch = ScanScratch::new(
+            self.patterns.len(),
+            self.config.chunk_size,
+            self.config.overlap_size,
+        );
+
         loop {
             // Read the next chunk.
             let bytes_read = read_fully(&mut reader, &mut read_buf)?;
@@ -548,8 +641,8 @@ impl StreamScanner {
                 break;
             }
 
-            // Find all non-overlapping matches in the window.
-            let matches = self.find_matches(&window);
+            // Find all non-overlapping matches in the window (fills scratch.selected).
+            self.find_matches(&window, &mut scratch);
 
             // Determine the commit point — how much of the window we can
             // safely emit this iteration.
@@ -560,21 +653,35 @@ impl StreamScanner {
             };
 
             let commit_point =
-                self.adjusted_commit_point(&matches, base_commit, window.len(), is_eof);
+                self.adjusted_commit_point(&scratch.selected, base_commit, window.len(), is_eof);
 
-            // Select matches that fall entirely within the committed region.
-            let committed_matches: Vec<&RawMatch> = matches
-                .iter()
-                .filter(|m| m.start < commit_point && m.end <= commit_point)
-                .collect();
+            // Build output into scratch.output and update stats counters.
+            // Matches beyond commit_point are filtered inside apply_replacements.
+            self.apply_replacements(
+                &window[..commit_point],
+                &scratch.selected,
+                &mut stats,
+                &mut scratch.output,
+                &mut scratch.pattern_counts,
+            )?;
 
-            // Apply replacements and write the committed output.
-            let output =
-                self.apply_replacements(&window[..commit_point], &committed_matches, &mut stats)?;
             writer
-                .write_all(&output)
+                .write_all(&scratch.output)
                 .map_err(|e| SanitizeError::IoError(e.to_string()))?;
-            stats.bytes_output += output.len() as u64;
+            stats.bytes_output += scratch.output.len() as u64;
+
+            // Fold per-chunk pattern counts into stats.
+            // label.clone() is called at most once per distinct pattern per
+            // chunk (not once per match hit), which is far cheaper at scale.
+            for (idx, count) in scratch.pattern_counts.iter_mut().enumerate() {
+                if *count > 0 {
+                    *stats
+                        .pattern_counts
+                        .entry(self.patterns[idx].label.clone())
+                        .or_insert(0) += *count;
+                    *count = 0; // reset for next chunk
+                }
+            }
 
             on_progress(&ScanProgress {
                 bytes_processed: stats.bytes_processed,
@@ -718,48 +825,78 @@ impl StreamScanner {
 
     /// Find all non-overlapping matches across all patterns.
     ///
-    /// Strategy: use the `RegexSet` for a fast check of which patterns
-    /// have *any* match in the window, then run only those individual
-    /// regexes for precise match positions.  This avoids running every
-    /// pattern on every chunk (R-3 optimisation).
-    fn find_matches(&self, window: &[u8]) -> Vec<RawMatch> {
-        let mut all_matches = Vec::new();
+    /// Fills `scratch.selected` with the winning non-overlapping matches
+    /// for the given `window`.  All three scratch `Vec`s are cleared and
+    /// repopulated on each call so callers can freely reuse the same
+    /// `ScanScratch` instance across chunks.
+    ///
+    /// ## Strategy
+    ///
+    /// 1. **Aho-Corasick** (`aho_corasick`): single O(n) SIMD pass over the
+    ///    window reporting every occurrence of every literal pattern,
+    ///    including overlapping ones.  This replaces O(k·n) individual regex
+    ///    scans for the literal subset.
+    /// 2. **RegexSet pre-filter** (R-3 optimisation): fast check of which
+    ///    *non-literal* regex patterns have any match in the window.
+    /// 3. **Individual regex `find_iter`**: only for regex patterns flagged
+    ///    by step 2.
+    /// 4. **Sort + greedy dedup**: all raw matches are sorted by start
+    ///    (ascending), then length (descending), and a single greedy pass
+    ///    selects the final non-overlapping set.
+    fn find_matches(&self, window: &[u8], scratch: &mut ScanScratch) {
+        scratch.all_matches.clear();
+        scratch.selected.clear();
 
-        // Fast pre-filter: which patterns have at least one match?
-        let active: Vec<usize> = self.regex_set.matches(window).into_iter().collect();
-
-        // Only run individual regexes for patterns that matched.
-        for &idx in &active {
-            let pattern = &self.patterns[idx];
-            for m in pattern.regex.find_iter(window) {
-                all_matches.push(RawMatch {
-                    start: m.start(),
-                    end: m.end(),
-                    pattern_idx: idx,
+        // Step 1: Aho-Corasick overlapping scan for all literal patterns.
+        // find_overlapping_iter reports every match position including
+        // overlapping ones, so the sort+greedy step below correctly resolves
+        // ambiguities between literals (e.g. "abc" vs "abcd" at same offset).
+        if let Some(ac) = &self.aho_corasick {
+            for mat in ac.find_overlapping_iter(window) {
+                scratch.all_matches.push(RawMatch {
+                    start: mat.start(),
+                    end: mat.end(),
+                    pattern_idx: self.literal_indices[mat.pattern().as_usize()],
                 });
             }
         }
 
-        // Sort: primary by start (ascending), secondary by length
-        // (descending — prefer longer matches when they start at the
-        // same position).
-        all_matches.sort_by(|a, b| {
+        // Steps 2+3: RegexSet pre-filter then individual scan for non-literal
+        // patterns.  regex_set only contains non-literal pattern strings, so
+        // literals are never scanned twice.
+        for rs_idx in self.regex_set.matches(window) {
+            let pattern_idx = self.regex_indices[rs_idx];
+            for m in self.patterns[pattern_idx].regex.find_iter(window) {
+                scratch.all_matches.push(RawMatch {
+                    start: m.start(),
+                    end: m.end(),
+                    pattern_idx,
+                });
+            }
+        }
+
+        // Step 4: sort then greedy non-overlapping selection.
+        // Skip entirely when no matches were found (the common case for
+        // clean data), avoiding an unnecessary sort of an empty Vec.
+        if scratch.all_matches.is_empty() {
+            return;
+        }
+
+        // Primary: start ascending. Secondary: length descending (longer
+        // match wins when two matches begin at the same position).
+        scratch.all_matches.sort_unstable_by(|a, b| {
             a.start
                 .cmp(&b.start)
                 .then_with(|| (b.end - b.start).cmp(&(a.end - a.start)))
         });
 
-        // Greedily select non-overlapping matches.
-        let mut selected = Vec::new();
         let mut last_end = 0;
-        for m in all_matches {
+        for m in scratch.all_matches.drain(..) {
             if m.start >= last_end {
                 last_end = m.end;
-                selected.push(m);
+                scratch.selected.push(m);
             }
         }
-
-        selected
     }
 
     /// Adjust the commit point to avoid splitting a match across the
@@ -793,49 +930,68 @@ impl StreamScanner {
         commit.min(window_len)
     }
 
-    /// Build the output buffer for the committed region by splicing in
-    /// replacements for every match.
+    /// Build the output for the committed region by splicing in replacements.
+    ///
+    /// Writes into `output_buf` (cleared on entry) and increments
+    /// `stats.matches_found` / `stats.replacements_applied` for each applied
+    /// replacement.  Per-pattern hit counts are written to `pattern_counts`
+    /// (indexed by `pattern_idx`); the caller is responsible for folding
+    /// these into `ScanStats::pattern_counts` and resetting them.
+    ///
+    /// `matches` is the full selected set for the window (may include matches
+    /// in the carry region beyond `committed`).  Because `adjusted_commit_point`
+    /// guarantees no match straddles the boundary, any match with
+    /// `start < committed.len()` also has `end <= committed.len()`.  The
+    /// loop breaks early once `m.start >= committed.len()` since matches are
+    /// sorted by start.
+    ///
+    /// # Note on `from_utf8_lossy`
+    ///
+    /// `String::from_utf8_lossy` returns `Cow::Borrowed(&str)` for valid
+    /// UTF-8 input (the common case for ASCII secrets) — no heap allocation
+    /// on the hot path.
     fn apply_replacements(
         &self,
         committed: &[u8],
-        matches: &[&RawMatch],
+        matches: &[RawMatch],
         stats: &mut ScanStats,
-    ) -> Result<Vec<u8>> {
-        if matches.is_empty() {
-            return Ok(committed.to_vec());
-        }
+        output_buf: &mut Vec<u8>,
+        pattern_counts: &mut [u64],
+    ) -> Result<()> {
+        output_buf.clear();
 
-        let mut output = Vec::with_capacity(committed.len());
         let mut last_end = 0;
 
-        for m in matches {
-            // Emit the non-matching region before this match.
-            output.extend_from_slice(&committed[last_end..m.start]);
+        for &m in matches {
+            // Matches are sorted by start; those at or beyond the committed
+            // region belong to the carry window — stop here.
+            if m.start >= committed.len() {
+                break;
+            }
 
-            // Extract the matched text (lossy UTF-8 for binary safety).
-            let matched_bytes = &committed[m.start..m.end];
-            let matched_text = String::from_utf8_lossy(matched_bytes);
+            // Emit bytes before this match verbatim.
+            output_buf.extend_from_slice(&committed[last_end..m.start]);
 
-            // Look up or create the one-way replacement.
+            // Decode matched bytes.  from_utf8_lossy is zero-copy (Cow::Borrowed)
+            // for valid UTF-8, which covers all ASCII secrets.
+            let matched_text = String::from_utf8_lossy(&committed[m.start..m.end]);
+
+            // One-way deterministic replacement via the MappingStore.
             let pattern = &self.patterns[m.pattern_idx];
             let replacement = self.store.get_or_insert(&pattern.category, &matched_text)?;
 
-            output.extend_from_slice(replacement.as_bytes());
+            output_buf.extend_from_slice(replacement.as_bytes());
             last_end = m.end;
 
-            // Accumulate per-match stats.
             stats.matches_found += 1;
             stats.replacements_applied += 1;
-            *stats
-                .pattern_counts
-                .entry(pattern.label.clone())
-                .or_insert(0) += 1;
+            pattern_counts[m.pattern_idx] += 1;
         }
 
-        // Emit trailing non-matching region.
-        output.extend_from_slice(&committed[last_end..]);
+        // Emit the trailing non-matching tail.
+        output_buf.extend_from_slice(&committed[last_end..]);
 
-        Ok(output)
+        Ok(())
     }
 }
 

@@ -121,6 +121,13 @@ impl Write for AtomicFileWriter {
     }
 }
 
+impl io::Seek for AtomicFileWriter {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.writer.flush()?;
+        self.writer.get_mut().seek(pos)
+    }
+}
+
 impl Drop for AtomicFileWriter {
     fn drop(&mut self) {
         if !self.finished {

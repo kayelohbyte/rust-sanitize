@@ -3,7 +3,7 @@
 //! # Usage
 //!
 //! ```text
-//! sanitize [OPTIONS] [INPUT]
+//! sanitize [OPTIONS] [INPUT]...
 //! sanitize encrypt [OPTIONS] <INPUT> <OUTPUT>
 //! sanitize decrypt [OPTIONS] <INPUT> <OUTPUT>
 //!
@@ -58,7 +58,11 @@
 //! is no restore mode. Re-running with the `--deterministic` flag and the
 //! same secrets will produce identical replacements.
 
-use clap::{Parser, Subcommand, ValueEnum};
+mod progress;
+use progress::{ProgressContext, ProgressMode, ProgressPolicy, ProgressReporter, SharedProgressReporter, with_progress_scope};
+
+use clap::{Parser, Subcommand};
+use rayon::prelude::*;
 use sanitize_engine::secrets::{
     decrypt_secrets, encrypt_secrets, entries_to_patterns, parse_secrets, serialize_secrets,
     SecretEntry, SecretsFormat,
@@ -66,7 +70,7 @@ use sanitize_engine::secrets::{
 use sanitize_engine::{
     atomic_write, ArchiveFormat, ArchiveProcessor, ArchiveProgress, AtomicFileWriter, FileReport,
     HmacGenerator, MappingStore, ProcessorRegistry, RandomGenerator, ReplacementGenerator,
-    ReportBuilder, ReportMetadata, ScanConfig, ScanProgress, ScanStats, StreamScanner,
+    ReportBuilder, ReportMetadata, ScanConfig, ScanStats, StreamScanner,
     DEFAULT_MAX_ARCHIVE_DEPTH,
 };
 use std::collections::HashSet;
@@ -77,9 +81,9 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 use tracing::{info, warn};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 /// Maximum size (in bytes) for a structured file to be fully loaded into
 /// memory for format-aware processing (F-03 fix). Files exceeding this
@@ -98,303 +102,11 @@ fn is_interrupted() -> bool {
     INTERRUPTED.load(Ordering::Relaxed)
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum ProgressMode {
-    Auto,
-    On,
-    Off,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct ProgressPolicy {
-    live_updates: bool,
-    milestone_updates: bool,
-}
-
-type SharedProgressReporter = Arc<Mutex<ProgressReporter>>;
-
 #[derive(Copy, Clone)]
 struct ArchiveDeps<'a> {
     scanner: &'a Arc<StreamScanner>,
     registry: &'a Arc<ProcessorRegistry>,
     store: &'a Arc<MappingStore>,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct ProgressContext {
-    stderr_is_terminal: bool,
-    is_ci: bool,
-    term_is_dumb: bool,
-    json_logs: bool,
-}
-
-impl ProgressContext {
-    fn detect(log_format: &str) -> Self {
-        let term = env::var("TERM").unwrap_or_default();
-        let ci = env::var_os("CI").is_some();
-
-        Self {
-            stderr_is_terminal: io::stderr().is_terminal(),
-            is_ci: ci,
-            term_is_dumb: term.eq_ignore_ascii_case("dumb"),
-            json_logs: log_format == "json",
-        }
-    }
-}
-
-impl ProgressPolicy {
-    fn from_mode(mode: ProgressMode, context: ProgressContext) -> Self {
-        match mode {
-            ProgressMode::Off => Self {
-                live_updates: false,
-                milestone_updates: false,
-            },
-            ProgressMode::On => Self {
-                live_updates: context.stderr_is_terminal && !context.json_logs,
-                milestone_updates: true,
-            },
-            ProgressMode::Auto => {
-                let allow_live = context.stderr_is_terminal
-                    && !context.is_ci
-                    && !context.term_is_dumb
-                    && !context.json_logs;
-                Self {
-                    live_updates: allow_live,
-                    milestone_updates: allow_live,
-                }
-            }
-        }
-    }
-}
-
-struct ProgressReporter {
-    policy: ProgressPolicy,
-    json_logs: bool,
-    interval: Duration,
-    spinner_index: usize,
-    last_emit: Option<Instant>,
-    last_units: u64,
-    rendered_line_len: usize,
-}
-
-impl ProgressReporter {
-    fn new(policy: ProgressPolicy, json_logs: bool, progress_interval_ms: u64) -> Self {
-        Self {
-            policy,
-            json_logs,
-            interval: Duration::from_millis(progress_interval_ms),
-            spinner_index: 0,
-            last_emit: None,
-            last_units: 0,
-            rendered_line_len: 0,
-        }
-    }
-
-    fn start_task(&mut self, label: &str) {
-        self.spinner_index = 0;
-        self.last_emit = None;
-        self.last_units = 0;
-        if self.policy.live_updates {
-            let frame = self.spinner_frame();
-            self.render_live_line(format!("{} {}", frame, label));
-        } else if self.policy.milestone_updates {
-            self.emit_milestone(label, None);
-        }
-    }
-
-    fn update_scan(&mut self, label: &str, progress: &ScanProgress) {
-        let min_delta = 8 * 1024 * 1024;
-        if !self.should_emit(progress.bytes_processed, min_delta) {
-            return;
-        }
-
-        if self.policy.live_updates {
-            let frame = self.spinner_frame();
-            self.render_live_line(format!(
-                "{} {}: {}",
-                frame,
-                label,
-                format_scan_progress(progress)
-            ));
-        } else if self.policy.milestone_updates {
-            self.emit_milestone(
-                label,
-                Some(format!("processed {}", format_scan_progress(progress))),
-            );
-        }
-    }
-
-    fn update_archive(&mut self, label: &str, progress: &ArchiveProgress) {
-        if !self.should_emit(progress.entries_seen, 1) {
-            return;
-        }
-
-        let detail = match progress.total_entries {
-            Some(total) => format!(
-                "entry {}/{} ({})",
-                progress.entries_seen, total, progress.current_entry
-            ),
-            None => format!(
-                "entry {} ({})",
-                progress.entries_seen, progress.current_entry
-            ),
-        };
-
-        if self.policy.live_updates {
-            let frame = self.spinner_frame();
-            self.render_live_line(format!("{} {}: {}", frame, label, detail));
-        } else if self.policy.milestone_updates {
-            self.emit_milestone(label, Some(detail));
-        }
-    }
-
-    fn finish_task(&mut self, label: &str) {
-        if self.policy.live_updates {
-            self.render_final_line(format!("done: {}", label));
-        } else if self.policy.milestone_updates {
-            self.emit_milestone(label, Some("done".into()));
-        }
-    }
-
-    fn fail_task(&mut self, label: &str) {
-        if self.policy.live_updates {
-            self.render_final_line(format!("stopped: {}", label));
-        } else if self.policy.milestone_updates {
-            self.emit_milestone(label, Some("stopped".into()));
-        }
-    }
-
-    fn should_emit(&mut self, units: u64, min_delta: u64) -> bool {
-        let now = Instant::now();
-        let elapsed_ready = self.last_emit.map_or(true, |last_emit| {
-            now.duration_since(last_emit) >= self.interval
-        });
-        let delta_ready = units >= self.last_units.saturating_add(min_delta);
-
-        if elapsed_ready || delta_ready {
-            self.last_emit = Some(now);
-            self.last_units = units;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn emit_milestone(&mut self, label: &str, detail: Option<String>) {
-        if self.json_logs {
-            if let Some(detail) = detail {
-                info!(task = label, detail = %detail, "progress update");
-            } else {
-                info!(task = label, "progress update");
-            }
-            return;
-        }
-
-        self.clear_live_line();
-        match detail {
-            Some(detail) => eprintln!("{}: {}", label, detail),
-            None => eprintln!("{}", label),
-        }
-    }
-
-    fn spinner_frame(&mut self) -> char {
-        const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
-        let frame = FRAMES[self.spinner_index % FRAMES.len()];
-        self.spinner_index = (self.spinner_index + 1) % FRAMES.len();
-        frame
-    }
-
-    fn render_live_line(&mut self, line: String) {
-        let padded_line = if line.len() < self.rendered_line_len {
-            format!(
-                "{}{}",
-                line,
-                " ".repeat(self.rendered_line_len - line.len())
-            )
-        } else {
-            line
-        };
-        self.rendered_line_len = padded_line.len();
-        let mut stderr = io::stderr().lock();
-        let _ = write!(stderr, "\r{}", padded_line);
-        let _ = stderr.flush();
-    }
-
-    fn render_final_line(&mut self, line: String) {
-        self.render_live_line(line);
-        let mut stderr = io::stderr().lock();
-        let _ = writeln!(stderr);
-        let _ = stderr.flush();
-        self.rendered_line_len = 0;
-    }
-
-    fn clear_live_line(&mut self) {
-        if self.rendered_line_len == 0 {
-            return;
-        }
-
-        let mut stderr = io::stderr().lock();
-        let _ = write!(stderr, "\r{}\r", " ".repeat(self.rendered_line_len));
-        let _ = stderr.flush();
-        self.rendered_line_len = 0;
-    }
-}
-
-fn format_scan_progress(progress: &ScanProgress) -> String {
-    match progress.total_bytes {
-        Some(total_bytes) if total_bytes > 0 => format!(
-            "{} / {} ({:.0}%)",
-            format_bytes(progress.bytes_processed),
-            format_bytes(total_bytes),
-            (progress.bytes_processed as f64 / total_bytes as f64) * 100.0
-        ),
-        _ => format_bytes(progress.bytes_processed),
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-
-    let mut value = bytes as f64;
-    let mut unit_index = 0;
-    while value >= 1024.0 && unit_index < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit_index += 1;
-    }
-
-    if unit_index == 0 {
-        format!("{} {}", bytes, UNITS[unit_index])
-    } else {
-        format!("{value:.1} {}", UNITS[unit_index])
-    }
-}
-
-fn with_progress_scope<T, F>(
-    progress: Option<&SharedProgressReporter>,
-    label: &str,
-    action: F,
-) -> Result<T, String>
-where
-    F: FnOnce(Option<SharedProgressReporter>) -> Result<T, String>,
-{
-    let progress = progress.cloned();
-
-    if let Some(reporter) = &progress {
-        reporter.lock().unwrap().start_task(label);
-    }
-
-    let result = action(progress.clone());
-
-    if let Some(reporter) = &progress {
-        let mut reporter = reporter.lock().unwrap();
-        if result.is_ok() {
-            reporter.finish_task(label);
-        } else {
-            reporter.fail_task(label);
-        }
-    }
-
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -442,14 +154,13 @@ struct Cli {
     #[command(subcommand)]
     command: Option<SubCommand>,
 
-    /// Path to the file or archive to sanitize. When omitted or set
-    /// to "-", reads from stdin (plain text only; archives require a
-    /// file path).
+    /// Path(s) to files or archives to sanitize. When omitted, reads
+    /// from stdin. Use "-" to include stdin alongside file paths.
     #[arg(value_name = "INPUT")]
-    input: Option<PathBuf>,
+    input: Vec<PathBuf>,
 
-    /// Output path. Defaults to stdout for plain files and to
-    /// `<input>.sanitized.<ext>` for archives.
+    /// Output path. For a single input stream, writes to this file.
+    /// For multiple inputs, this is treated as an output directory.
     #[arg(short = 'o', long, value_name = "FILE")]
     output: Option<PathBuf>,
 
@@ -517,8 +228,10 @@ struct Cli {
     #[arg(long)]
     include_binary: bool,
 
-    /// Number of worker threads (currently advisory; reserved for
-    /// future parallel archive entry processing). Capped to the
+    /// Number of worker threads. When multiple input files are provided,
+    /// files are processed in parallel up to this limit. For a single
+    /// archive input, entries are sanitized in parallel using the same
+    /// budget. Defaults to the number of logical CPUs. Capped to the
     /// system's available parallelism.
     #[arg(long, value_name = "N")]
     threads: Option<usize>,
@@ -926,13 +639,14 @@ fn normalize_guided_output_path(path: PathBuf) -> PathBuf {
     }
 }
 
-fn prompt_confirm_password() -> Result<String, String> {
+fn prompt_confirm_password() -> Result<Zeroizing<String>, String> {
     loop {
         let pw1 = prompt_password("encryption")?;
         let pw2 = prompt_password("encryption (confirm)")?;
         if pw1 == pw2 {
             return Ok(pw1);
         }
+        // pw1 and pw2 are Zeroizing<String>; both zeroed on drop here.
         eprintln!("Passwords did not match. Try again.");
     }
 }
@@ -1027,7 +741,7 @@ fn run_guided() -> Result<(), (String, i32)> {
     let encrypt =
         prompt_yes_no("Encrypt the generated secrets file now?", true).map_err(|e| (e, 1))?;
     let mut secrets_for_run = output_path.clone();
-    let mut run_password: Option<String> = None;
+    let mut run_password: Option<Zeroizing<String>> = None;
     let mut run_unencrypted = true;
 
     if encrypt {
@@ -1073,14 +787,14 @@ fn run_guided() -> Result<(), (String, i32)> {
     let deterministic =
         prompt_yes_no("Use deterministic replacements?", true).map_err(|e| (e, 1))?;
 
-    let mut deterministic_password = run_password.clone();
+    let mut deterministic_password: Option<Zeroizing<String>> = run_password.clone();
     if deterministic && deterministic_password.is_none() {
         deterministic_password = Some(prompt_password("deterministic seed").map_err(|e| (e, 1))?);
     }
 
     let cli = Cli {
         command: None,
-        input: Some(input),
+        input: vec![input],
         output,
         secrets_file: Some(secrets_for_run),
         password: false,
@@ -1122,7 +836,7 @@ fn resolve_password(
     password_flag: bool,
     cli_password_file: &Option<PathBuf>,
     interactive_label: &str,
-) -> Result<String, String> {
+) -> Result<Zeroizing<String>, String> {
     // 1. Explicit --password flag → interactive prompt.
     if password_flag {
         if !io::stdin().is_terminal() {
@@ -1145,7 +859,7 @@ fn resolve_password(
     if let Ok(pw) = std::env::var("SANITIZE_PASSWORD") {
         if !pw.is_empty() {
             eprintln!("info: using password from SANITIZE_PASSWORD environment variable");
-            return Ok(pw);
+            return Ok(Zeroizing::new(pw));
         }
     }
 
@@ -1155,7 +869,7 @@ fn resolve_password(
 
 /// Read a password from a file, enforcing strict Unix permissions.
 #[cfg(unix)]
-fn read_password_file(path: &Path) -> Result<String, String> {
+fn read_password_file(path: &Path) -> Result<Zeroizing<String>, String> {
     use nix::sys::stat::fstat;
     use std::os::unix::io::AsRawFd;
 
@@ -1181,7 +895,7 @@ fn read_password_file(path: &Path) -> Result<String, String> {
 
 /// Read a password from a file (no permission checks on non-Unix platforms).
 #[cfg(not(unix))]
-fn read_password_file(path: &Path) -> Result<String, String> {
+fn read_password_file(path: &Path) -> Result<Zeroizing<String>, String> {
     eprintln!(
         "warning: password-file permission checks are only available on Unix. \
          Ensure {} is not world-readable.",
@@ -1191,9 +905,22 @@ fn read_password_file(path: &Path) -> Result<String, String> {
 }
 
 /// Shared helper: read and trim password file contents.
-fn read_password_file_contents(path: &Path) -> Result<String, String> {
-    let mut contents = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read password file {}: {e}", path.display()))?;
+fn read_password_file_contents(path: &Path) -> Result<Zeroizing<String>, String> {
+    const MAX_PASSWORD_FILE_BYTES: u64 = 4096;
+    let size = fs::metadata(path)
+        .map_err(|e| format!("cannot stat password file {}: {e}", path.display()))?
+        .len();
+    if size > MAX_PASSWORD_FILE_BYTES {
+        return Err(format!(
+            "password file {} is too large ({size} bytes); expected ≤ {MAX_PASSWORD_FILE_BYTES} bytes",
+            path.display(),
+        ));
+    }
+
+    let mut contents = Zeroizing::new(
+        fs::read_to_string(path)
+            .map_err(|e| format!("cannot read password file {}: {e}", path.display()))?,
+    );
 
     // Trim a single trailing newline (common in files created by echo/printf).
     if contents.ends_with('\n') {
@@ -1204,26 +931,26 @@ fn read_password_file_contents(path: &Path) -> Result<String, String> {
     }
 
     if contents.is_empty() {
-        contents.zeroize();
         return Err(format!("password file {} is empty", path.display()));
+        // contents is Zeroizing<String> — zeroed on drop.
     }
 
     Ok(contents)
 }
 
 /// Prompt for a password on stderr with hidden input.
-fn prompt_password(label: &str) -> Result<String, String> {
+fn prompt_password(label: &str) -> Result<Zeroizing<String>, String> {
     let pw = rpassword::prompt_password(format!("Enter {label} password: "))
         .map_err(|e| format!("failed to read password: {e}"))?;
 
     if pw.is_empty() {
         return Err("password must not be empty".into());
     }
-    Ok(pw)
+    Ok(Zeroizing::new(pw))
 }
 
 /// Resolve password for the default sanitize mode.
-fn resolve_sanitize_password(cli: &Cli) -> Result<String, String> {
+fn resolve_sanitize_password(cli: &Cli) -> Result<Zeroizing<String>, String> {
     resolve_password(cli.password, &cli.password_file, "secrets decryption")
 }
 
@@ -1244,12 +971,12 @@ fn looks_binary(data: &[u8]) -> bool {
 /// Build an `Arc<MappingStore>` with the chosen generator mode.
 fn build_store(
     deterministic: bool,
-    password: &Option<String>,
+    password: Option<&str>,
     max_mappings: usize,
 ) -> std::result::Result<Arc<MappingStore>, String> {
     let generator: Arc<dyn ReplacementGenerator> = if deterministic {
         let seed = match password {
-            Some(ref k) => {
+            Some(k) => {
                 use hmac::Hmac;
                 use sha2::Sha256;
                 use zeroize::Zeroizing;
@@ -1284,7 +1011,11 @@ fn build_scan_config(chunk_size: usize) -> Result<ScanConfig, String> {
     if chunk_size == 0 {
         return Err("--chunk-size must be greater than 0".into());
     }
-    let overlap = chunk_size.clamp(256, 4096);
+    // Overlap = 25% of chunk, capped at 4 KiB, minimum 1 byte.
+    // This replaces the previous `chunk_size.clamp(256, 4096)` which
+    // returned chunk_size itself for any value in [256, 4096], making
+    // overlap >= chunk_size and causing every small chunk to be rejected.
+    let overlap = (chunk_size / 4).clamp(1, 4096);
     if overlap >= chunk_size {
         return Err(format!(
             "--chunk-size ({chunk_size}) is too small; must be > {overlap} bytes"
@@ -1359,11 +1090,16 @@ fn init_logging(log_format: &str) {
 // ---------------------------------------------------------------------------
 
 /// Returns `true` when input should be read from stdin.
-fn is_stdin_input(cli: &Cli) -> bool {
-    match &cli.input {
-        None => true,
-        Some(p) => p.as_os_str() == "-",
-    }
+fn has_stdin_input(cli: &Cli) -> bool {
+    cli.input.is_empty() || cli.input.iter().any(|p| p.as_os_str() == "-")
+}
+
+/// Returns file-path inputs, excluding explicit stdin markers ("-").
+fn file_inputs(cli: &Cli) -> Vec<&PathBuf> {
+    cli.input
+        .iter()
+        .filter(|p| p.as_os_str() != "-")
+        .collect()
 }
 
 /// Map the `--format` value to extension-like string for structured processor
@@ -1380,27 +1116,165 @@ fn format_to_ext(fmt: &str) -> Option<&str> {
     }
 }
 
-/// Validate CLI arguments for the default sanitize mode.
-fn validate_args(cli: &Cli) -> Result<(), String> {
-    if is_stdin_input(cli) {
-        // stdin mode — check for incompatible options
-        if io::stdin().is_terminal() {
-            return Err("no input file given and stdin is a terminal.\n\
-                 Provide a file path or pipe data into sanitize.\n\n\
-                 Usage: sanitize [OPTIONS] [INPUT]\n       \
-                 command | sanitize -s secrets.yaml"
-                .into());
+fn default_plain_output(input: &Path) -> PathBuf {
+    let name = input
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("output");
+
+    let output_name = if let Some((stem, ext)) = name.rsplit_once('.') {
+        format!("{stem}-sanitized.{ext}")
+    } else {
+        format!("{name}-sanitized")
+    };
+
+    input.with_file_name(output_name)
+}
+
+fn split_name_for_suffix(name: &str) -> (String, String) {
+    if let Some(stem) = name.strip_suffix(".tar.gz") {
+        return (stem.to_string(), ".tar.gz".to_string());
+    }
+    if let Some((stem, ext)) = name.rsplit_once('.') {
+        return (stem.to_string(), format!(".{ext}"));
+    }
+    (name.to_string(), String::new())
+}
+
+fn uniquify_output_path(path: PathBuf, used: &mut HashSet<PathBuf>) -> PathBuf {
+    if !path.exists() && !used.contains(&path) {
+        used.insert(path.clone());
+        return path;
+    }
+
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("output")
+        .to_string();
+    let (stem, ext) = split_name_for_suffix(&name);
+
+    let mut idx = 1usize;
+    loop {
+        let candidate = parent.join(format!("{stem}-{idx}{ext}"));
+        if !candidate.exists() && !used.contains(&candidate) {
+            used.insert(candidate.clone());
+            return candidate;
+        }
+        idx += 1;
+    }
+}
+
+enum InputTarget {
+    Stdin { output: Option<PathBuf> },
+    File { input: PathBuf, output: PathBuf },
+}
+
+fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
+    let has_implicit_stdin = cli.input.is_empty();
+    let explicit_stdin_count = cli.input.iter().filter(|p| p.as_os_str() == "-").count();
+
+    if explicit_stdin_count > 1 {
+        return Err("stdin marker '-' can be specified at most once".into());
+    }
+
+    let mut units = Vec::new();
+    if has_implicit_stdin {
+        units.push(InputTarget::Stdin {
+            output: cli.output.clone(),
+        });
+        return Ok(units);
+    }
+
+    let input_count = cli.input.len();
+    let multi_input = input_count > 1;
+    let mut used_outputs = HashSet::new();
+
+    let output_dir = if multi_input {
+        if let Some(path) = &cli.output {
+            if path.exists() && !path.is_dir() {
+                return Err(format!(
+                    "--output must be a directory when multiple inputs are provided: {}",
+                    path.display()
+                ));
+            }
+            if !path.exists() {
+                fs::create_dir_all(path).map_err(|e| {
+                    format!("failed to create output directory {}: {e}", path.display())
+                })?;
+            }
+            Some(path.clone())
+        } else {
+            None
         }
     } else {
-        let input = cli.input.as_ref().unwrap();
+        None
+    };
+
+    for input in &cli.input {
+        if input.as_os_str() == "-" {
+            let stdin_output = if multi_input { None } else { cli.output.clone() };
+            units.push(InputTarget::Stdin {
+                output: stdin_output,
+            });
+            continue;
+        }
+
+        let format = ArchiveFormat::from_path(&input.to_string_lossy());
+        let default_out = match format {
+            Some(fmt) => default_archive_output(input, fmt),
+            None => default_plain_output(input),
+        };
+
+        let planned_out = if multi_input {
+            let out_name = default_out
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("output")
+                .to_string();
+
+            if let Some(dir) = &output_dir {
+                uniquify_output_path(dir.join(out_name), &mut used_outputs)
+            } else {
+                uniquify_output_path(default_out, &mut used_outputs)
+            }
+        } else if let Some(out) = &cli.output {
+            out.clone()
+        } else {
+            default_out
+        };
+
+        units.push(InputTarget::File {
+            input: input.clone(),
+            output: planned_out,
+        });
+    }
+
+    Ok(units)
+}
+
+/// Validate CLI arguments for the default sanitize mode.
+fn validate_args(cli: &Cli) -> Result<(), String> {
+    if has_stdin_input(cli) && io::stdin().is_terminal() {
+        return Err("stdin was requested but stdin is a terminal.\n\
+             Provide file path(s) only, or pipe data into sanitize when using '-'.\n\n\
+             Usage: sanitize [OPTIONS] [INPUT]...\n       \
+             command | sanitize -s secrets.yaml"
+            .into());
+    }
+
+    let explicit_stdin_count = cli.input.iter().filter(|p| p.as_os_str() == "-").count();
+    if explicit_stdin_count > 1 {
+        return Err("stdin marker '-' can be specified at most once".into());
+    }
+
+    for input in file_inputs(cli) {
         if !input.exists() {
             return Err(format!("input file not found: {}", input.display()));
         }
         if !input.is_file() {
-            return Err(format!(
-                "input path is not a regular file: {}",
-                input.display()
-            ));
+            return Err(format!("input path is not a regular file: {}", input.display()));
         }
     }
 
@@ -1471,7 +1345,7 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
     let has_password_source = cli.password
         || cli.password_file.is_some()
         || std::env::var("SANITIZE_PASSWORD")
-            .map_or(false, |v| !v.is_empty());
+            .is_ok_and(|v| !v.is_empty());
     if has_password_source && !cli.encrypted_secrets {
         return Err(
             "password input (--password, --password-file, or SANITIZE_PASSWORD) \
@@ -1503,6 +1377,7 @@ fn resolve_thread_count(requested: Option<usize>) -> usize {
 /// Process input from stdin. Returns `true` if matches were found.
 fn process_stdin(
     cli: &Cli,
+    output_path: Option<&Path>,
     scanner: &Arc<StreamScanner>,
     registry: &Arc<ProcessorRegistry>,
     store: &Arc<MappingStore>,
@@ -1532,7 +1407,14 @@ fn process_stdin(
             let cursor = Cursor::new(input_bytes);
             let chained = cursor.chain(io::stdin().lock());
             let reader = BufReader::new(chained);
-            return process_stdin_streaming(reader, cli, scanner, report_builder, progress);
+            return process_stdin_streaming(
+                reader,
+                output_path,
+                cli,
+                scanner,
+                report_builder,
+                progress,
+            );
         }
 
         let store_len_before = store.len();
@@ -1563,7 +1445,7 @@ fn process_stdin(
                         ));
                     }
                     if !cli.dry_run {
-                        write_output(cli, &output_bytes)?;
+                        write_output(output_path, &output_bytes)?;
                     }
                     return Ok(had_matches);
                 }
@@ -1588,7 +1470,7 @@ fn process_stdin(
                 ));
             }
             if !cli.dry_run {
-                write_output(cli, &output_bytes)?;
+                write_output(output_path, &output_bytes)?;
             }
             Ok(had_matches)
         });
@@ -1596,12 +1478,13 @@ fn process_stdin(
 
     // Plain text streaming from stdin.
     let reader = BufReader::new(io::stdin().lock());
-    process_stdin_streaming(reader, cli, scanner, report_builder, progress)
+    process_stdin_streaming(reader, output_path, cli, scanner, report_builder, progress)
 }
 
 /// Stream stdin through the scanner, writing to output (stdout or file).
 fn process_stdin_streaming<R: io::Read>(
     reader: BufReader<R>,
+    output_path: Option<&Path>,
     cli: &Cli,
     scanner: &Arc<StreamScanner>,
     report_builder: Option<&ReportBuilder>,
@@ -1621,7 +1504,7 @@ fn process_stdin_streaming<R: io::Read>(
             let stats = scanner
                 .scan_reader_with_progress(reader, io::sink(), None, move |scan_progress| {
                     if let Some(reporter) = &progress_for_scan {
-                        reporter.lock().unwrap().update_scan(label, scan_progress);
+                        reporter.lock().expect("progress reporter lock").update_scan(label, scan_progress);
                     }
                 })
                 .map_err(|e| format!("scanner error: {e}"))?;
@@ -1643,7 +1526,7 @@ fn process_stdin_streaming<R: io::Read>(
             return Ok(had_matches);
         }
 
-        if let Some(ref out_path) = cli.output {
+        if let Some(out_path) = output_path {
             let mut atomic_writer = AtomicFileWriter::new(out_path)
                 .map_err(|e| format!("failed to create output: {e}"))?;
 
@@ -1651,7 +1534,7 @@ fn process_stdin_streaming<R: io::Read>(
             let stats = scanner
                 .scan_reader_with_progress(reader, &mut atomic_writer, None, move |scan_progress| {
                     if let Some(reporter) = &progress_for_scan {
-                        reporter.lock().unwrap().update_scan(label, scan_progress);
+                        reporter.lock().expect("progress reporter lock").update_scan(label, scan_progress);
                     }
                 })
                 .map_err(|e| format!("scanner error: {e}"))?;
@@ -1681,7 +1564,7 @@ fn process_stdin_streaming<R: io::Read>(
             let stats = scanner
                 .scan_reader_with_progress(reader, writer, None, move |scan_progress| {
                     if let Some(reporter) = &progress_for_scan {
-                        reporter.lock().unwrap().update_scan(label, scan_progress);
+                        reporter.lock().expect("progress reporter lock").update_scan(label, scan_progress);
                     }
                 })
                 .map_err(|e| format!("scanner error: {e}"))?;
@@ -1702,9 +1585,11 @@ fn process_stdin_streaming<R: io::Read>(
 }
 
 /// Process a plain (non-archive) file. Returns `true` if matches were found.
+#[allow(clippy::too_many_arguments)]
 fn process_plain_file(
     input: &Path,
     cli: &Cli,
+    output_path: Option<&Path>,
     scanner: &Arc<StreamScanner>,
     registry: &Arc<ProcessorRegistry>,
     store: &Arc<MappingStore>,
@@ -1836,7 +1721,7 @@ fn process_plain_file(
                         return Ok(had_matches);
                     }
                 }
-                write_output(cli, &output_bytes)?;
+                write_output(output_path, &output_bytes)?;
                 Ok(had_matches)
             });
         }
@@ -1886,7 +1771,7 @@ fn process_plain_file(
             );
             Ok(had_matches)
         })
-    } else if let Some(ref out_path) = cli.output {
+    } else if let Some(out_path) = output_path {
         // Real streaming output.
         let label = format!("Scanning {}", input.display());
         let progress_label = label.clone();
@@ -2017,33 +1902,92 @@ fn scanner_fallback(
     Ok((output, stats))
 }
 
+/// A `Write + Seek` sink that discards all bytes.
+///
+/// Used for dry-run zip processing: `ZipWriter` requires `Seek` to finalize
+/// the central directory, so `io::sink()` alone is insufficient.
+struct NullSeekWriter {
+    pos: u64,
+    len: u64,
+}
+
+impl io::Write for NullSeekWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = buf.len() as u64;
+        self.pos += n;
+        if self.pos > self.len {
+            self.len = self.pos;
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl io::Seek for NullSeekWriter {
+    fn seek(&mut self, from: io::SeekFrom) -> io::Result<u64> {
+        let new_pos: u64 = match from {
+            io::SeekFrom::Start(n) => n,
+            io::SeekFrom::Current(n) => {
+                if n >= 0 {
+                    self.pos.saturating_add(n as u64)
+                } else {
+                    self.pos.saturating_sub((-n) as u64)
+                }
+            }
+            io::SeekFrom::End(n) => {
+                if n >= 0 {
+                    self.len.saturating_add(n as u64)
+                } else {
+                    self.len.saturating_sub((-n) as u64)
+                }
+            }
+        };
+        self.pos = new_pos;
+        if new_pos > self.len {
+            self.len = new_pos;
+        }
+        Ok(self.pos)
+    }
+}
+
 /// Process an archive file. Returns `true` if entries were processed.
+#[allow(clippy::too_many_arguments)]
 fn process_archive(
     input: &Path,
     cli: &Cli,
+    output_path: &Path,
     deps: ArchiveDeps<'_>,
     format: ArchiveFormat,
     report_builder: Option<&ReportBuilder>,
     progress: Option<&SharedProgressReporter>,
+    suppress_inner_parallelism: bool,
 ) -> Result<bool, String> {
-    let output_path = cli
-        .output
-        .clone()
-        .unwrap_or_else(|| default_archive_output(input, format));
     let label = format!("Processing archive {}", input.display());
 
     with_progress_scope(progress, &label, |progress| {
+        let base_proc = ArchiveProcessor::new(
+            Arc::clone(deps.registry),
+            Arc::clone(deps.scanner),
+            Arc::clone(deps.store),
+            vec![],
+        )
+        .with_max_depth(cli.max_archive_depth);
+
+        // When the outer file-level loop is already running in parallel,
+        // suppress per-entry parallelism to avoid oversubscribing the
+        // rayon thread pool.
+        let base_proc = if suppress_inner_parallelism {
+            base_proc.with_parallel_threshold(usize::MAX)
+        } else {
+            base_proc
+        };
+
         let archive_proc = if let Some(progress) = &progress {
             let label = label.clone();
             let progress = Arc::clone(progress);
-            ArchiveProcessor::new(
-                Arc::clone(deps.registry),
-                Arc::clone(deps.scanner),
-                Arc::clone(deps.store),
-                vec![],
-            )
-            .with_max_depth(cli.max_archive_depth)
-            .with_progress_callback(Arc::new(
+            base_proc.with_progress_callback(Arc::new(
                 move |archive_progress: &ArchiveProgress| {
                     progress
                         .lock()
@@ -2052,13 +1996,7 @@ fn process_archive(
                 },
             ))
         } else {
-            ArchiveProcessor::new(
-                Arc::clone(deps.registry),
-                Arc::clone(deps.scanner),
-                Arc::clone(deps.store),
-                vec![],
-            )
-            .with_max_depth(cli.max_archive_depth)
+            base_proc
         };
 
         if cli.dry_run {
@@ -2068,9 +2006,8 @@ fn process_archive(
                         fs::File::open(input)
                             .map_err(|e| format!("failed to open archive: {e}"))?,
                     );
-                    let mut sink = Vec::new();
                     archive_proc
-                        .process_tar(reader, &mut sink)
+                        .process_tar(reader, io::sink())
                         .map_err(|e| format!("archive error: {e}"))?
                 }
                 ArchiveFormat::TarGz => {
@@ -2078,9 +2015,8 @@ fn process_archive(
                         fs::File::open(input)
                             .map_err(|e| format!("failed to open archive: {e}"))?,
                     );
-                    let mut sink = Vec::new();
                     archive_proc
-                        .process_tar_gz(reader, &mut sink)
+                        .process_tar_gz(reader, io::sink())
                         .map_err(|e| format!("archive error: {e}"))?
                 }
                 ArchiveFormat::Zip => {
@@ -2088,9 +2024,9 @@ fn process_archive(
                         fs::File::open(input)
                             .map_err(|e| format!("failed to open archive: {e}"))?,
                     );
-                    let mut cursor_out = Cursor::new(Vec::new());
+                    let mut null_out = NullSeekWriter { pos: 0, len: 0 };
                     archive_proc
-                        .process_zip(&mut reader, &mut cursor_out)
+                        .process_zip(&mut reader, &mut null_out)
                         .map_err(|e| format!("archive error: {e}"))?
                 }
             };
@@ -2114,7 +2050,7 @@ fn process_archive(
                 let reader = BufReader::new(
                     fs::File::open(input).map_err(|e| format!("failed to open input: {e}"))?,
                 );
-                let mut atomic_writer = AtomicFileWriter::new(&output_path)
+                let mut atomic_writer = AtomicFileWriter::new(output_path)
                     .map_err(|e| format!("failed to create output: {e}"))?;
                 let stats = archive_proc
                     .process_tar(reader, &mut atomic_writer)
@@ -2131,7 +2067,7 @@ fn process_archive(
                 let reader = BufReader::new(
                     fs::File::open(input).map_err(|e| format!("failed to open input: {e}"))?,
                 );
-                let mut atomic_writer = AtomicFileWriter::new(&output_path)
+                let mut atomic_writer = AtomicFileWriter::new(output_path)
                     .map_err(|e| format!("failed to create output: {e}"))?;
                 let stats = archive_proc
                     .process_tar_gz(reader, &mut atomic_writer)
@@ -2148,15 +2084,17 @@ fn process_archive(
                 let mut reader = BufReader::new(
                     fs::File::open(input).map_err(|e| format!("failed to open archive: {e}"))?,
                 );
-                let mut cursor_out = Cursor::new(Vec::new());
+                let mut atomic_writer = AtomicFileWriter::new(output_path)
+                    .map_err(|e| format!("failed to create output: {e}"))?;
                 let stats = archive_proc
-                    .process_zip(&mut reader, &mut cursor_out)
+                    .process_zip(&mut reader, &mut atomic_writer)
                     .map_err(|e| format!("archive processing error: {e}"))?;
                 if is_interrupted() {
                     return Err("interrupted — partial output discarded".into());
                 }
-                atomic_write(&output_path, &cursor_out.into_inner())
-                    .map_err(|e| format!("failed to write output: {e}"))?;
+                atomic_writer
+                    .finish()
+                    .map_err(|e| format!("failed to finalize output: {e}"))?;
                 stats
             }
         };
@@ -2164,7 +2102,7 @@ fn process_archive(
         if let Some(rb) = report_builder {
             record_archive_stats(rb, &stats);
         }
-        print_archive_stats(&output_path, &stats);
+        print_archive_stats(output_path, &stats);
 
         Ok(stats.files_processed > 0)
     })
@@ -2225,8 +2163,8 @@ fn print_archive_stats(output: &Path, stats: &sanitize_engine::ArchiveStats) {
 }
 
 /// Write output bytes atomically to the given path, or stdout.
-fn write_output(cli: &Cli, data: &[u8]) -> Result<(), String> {
-    match &cli.output {
+fn write_output(output_path: Option<&Path>, data: &[u8]) -> Result<(), String> {
+    match output_path {
         Some(path) => {
             atomic_write(path, data)
                 .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
@@ -2379,7 +2317,7 @@ fn run() -> Result<(), (String, i32)> {
     run_sanitize(cli, None)
 }
 
-fn run_sanitize(cli: Cli, pre_resolved_password: Option<String>) -> Result<(), (String, i32)> {
+fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>) -> Result<(), (String, i32)> {
     // --- install signal handler (graceful shutdown) --------------------------
     if let Err(e) = ctrlc::set_handler(move || {
         INTERRUPTED.store(true, Ordering::SeqCst);
@@ -2404,6 +2342,13 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<String>) -> Result<(), (
     };
 
     let thread_count = resolve_thread_count(cli.threads);
+
+    // Initialise the global rayon thread pool from the resolved thread count.
+    // build_global() is a no-op if called more than once (e.g. in tests).
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .build_global();
+
     info!(
         threads = thread_count,
         deterministic = cli.deterministic,
@@ -2415,7 +2360,7 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<String>) -> Result<(), (
         "starting sanitization"
     );
 
-    let effective_password: Option<String> = if cli.encrypted_secrets {
+    let effective_password: Option<Zeroizing<String>> = if cli.encrypted_secrets {
         if let Some(pw) = pre_resolved_password {
             Some(pw)
         } else {
@@ -2424,10 +2369,11 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<String>) -> Result<(), (
     } else {
         None
     };
+    // effective_password is Zeroizing<String> — scrubbed automatically on drop.
 
     // --- build core components ----------------------------------------------
     let scan_config = build_scan_config(cli.chunk_size).map_err(|e| (e, 1))?;
-    let store = build_store(cli.deterministic, &effective_password, cli.max_mappings)
+    let store = build_store(cli.deterministic, effective_password.as_ref().map(|s| s.as_str()), cli.max_mappings)
         .map_err(|e| (e, 1))?;
     let registry = Arc::new(ProcessorRegistry::with_builtins());
 
@@ -2443,12 +2389,9 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<String>) -> Result<(), (
             )
         })?;
 
-        // Resolve password (may be None for plaintext mode).
-        let password = effective_password.clone();
-
         let ((patterns, warnings), was_encrypted) = sanitize_engine::secrets::load_secrets_auto(
             &raw_bytes,
-            password.as_deref(),
+            effective_password.as_ref().map(|s| s.as_str()),
             None,
             !cli.encrypted_secrets,
         )
@@ -2519,47 +2462,130 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<String>) -> Result<(), (
         None
     };
 
-    // --- detect stdin vs archive vs plain file --------------------------------
-    let had_matches = if is_stdin_input(&cli) {
-        process_stdin(
+    let input_targets = plan_input_targets(&cli).map_err(|e| (e, 1))?;
+
+    // --- split stdin (serial) from file targets (parallel) ------------------
+    // Stdin must always be processed serially to preserve stream semantics and
+    // terminal UX. File targets are processed in parallel via rayon when
+    // thread_count > 1 and there is more than one file target.
+    let (stdin_targets, file_targets): (Vec<_>, Vec<_>) = input_targets
+        .into_iter()
+        .partition(|t| matches!(t, InputTarget::Stdin { .. }));
+
+    let mut had_matches = false;
+
+    // Process stdin targets sequentially.
+    for target in stdin_targets {
+        let InputTarget::Stdin { output } = target else {
+            unreachable!()
+        };
+        let result = process_stdin(
             &cli,
+            output.as_deref(),
             &scanner,
             &registry,
             &store,
             report_builder.as_ref(),
             progress_reporter.as_ref(),
         )
-        .map_err(|e| (e, 1))?
+        .map_err(|e| (e, 1))?;
+        had_matches |= result;
+    }
+
+    // Process file targets in parallel when multiple are present.
+    // Each worker gets Arc clones — all inner state is Send + Sync.
+    // Results are collected and folded after all workers finish.
+    let file_results: Vec<Result<bool, (String, i32)>> = if file_targets.len() > 1 {
+        file_targets
+            .into_par_iter()
+            .map(|target| {
+                if is_interrupted() {
+                    return Ok(false);
+                }
+                let InputTarget::File { input, output } = target else {
+                    unreachable!()
+                };
+                let input_str = input.to_string_lossy();
+                if let Some(fmt) = ArchiveFormat::from_path(&input_str) {
+                    process_archive(
+                        &input,
+                        &cli,
+                        &output,
+                        ArchiveDeps {
+                            scanner: &scanner,
+                            registry: &registry,
+                            store: &store,
+                        },
+                        fmt,
+                        report_builder.as_ref(),
+                        progress_reporter.as_ref(),
+                        // suppress per-entry parallelism: file-level parallelism
+                        // is already consuming the thread budget.
+                        true,
+                    )
+                    .map_err(|e| (e, 1))
+                } else {
+                    process_plain_file(
+                        &input,
+                        &cli,
+                        Some(output.as_path()),
+                        &scanner,
+                        &registry,
+                        &store,
+                        report_builder.as_ref(),
+                        progress_reporter.as_ref(),
+                    )
+                    .map_err(|e| (e, 1))
+                }
+            })
+            .collect()
     } else {
-        let input = cli.input.as_ref().unwrap();
-        let input_str = input.to_string_lossy();
-        if let Some(fmt) = ArchiveFormat::from_path(&input_str) {
-            process_archive(
-                input,
-                &cli,
-                ArchiveDeps {
-                    scanner: &scanner,
-                    registry: &registry,
-                    store: &store,
-                },
-                fmt,
-                report_builder.as_ref(),
-                progress_reporter.as_ref(),
-            )
-            .map_err(|e| (e, 1))?
-        } else {
-            process_plain_file(
-                input,
-                &cli,
-                &scanner,
-                &registry,
-                &store,
-                report_builder.as_ref(),
-                progress_reporter.as_ref(),
-            )
-            .map_err(|e| (e, 1))?
-        }
+        // Single file target — run on the current thread (no rayon overhead).
+        file_targets
+            .into_iter()
+            .map(|target| {
+                let InputTarget::File { input, output } = target else {
+                    unreachable!()
+                };
+                let input_str = input.to_string_lossy();
+                if let Some(fmt) = ArchiveFormat::from_path(&input_str) {
+                    process_archive(
+                        &input,
+                        &cli,
+                        &output,
+                        ArchiveDeps {
+                            scanner: &scanner,
+                            registry: &registry,
+                            store: &store,
+                        },
+                        fmt,
+                        report_builder.as_ref(),
+                        progress_reporter.as_ref(),
+                        // single file target: archive entry parallelism is enabled.
+                        false,
+                    )
+                    .map_err(|e| (e, 1))
+                } else {
+                    process_plain_file(
+                        &input,
+                        &cli,
+                        Some(output.as_path()),
+                        &scanner,
+                        &registry,
+                        &store,
+                        report_builder.as_ref(),
+                        progress_reporter.as_ref(),
+                    )
+                    .map_err(|e| (e, 1))
+                }
+            })
+            .collect()
     };
+
+    // Return the first error encountered (if any), then fold had_matches.
+    for result in file_results {
+        had_matches |= result?;
+    }
 
     // --- check for interruption ---------------------------------------------
     if is_interrupted() {
@@ -2621,6 +2647,7 @@ fn main() {
 mod tests {
     use super::*;
     use clap::Parser;
+    use tempfile::tempdir;
 
     fn make_progress_context(
         stderr_is_terminal: bool,
@@ -2647,15 +2674,28 @@ mod tests {
     #[test]
     fn cli_parses_basic_input() {
         let cli = Cli::try_parse_from(["sanitize", "input.txt"]).unwrap();
-        assert_eq!(cli.input.unwrap(), PathBuf::from("input.txt"));
+        assert_eq!(cli.input, vec![PathBuf::from("input.txt")]);
         assert!(cli.command.is_none());
     }
 
     #[test]
     fn cli_parses_input_with_output() {
         let cli = Cli::try_parse_from(["sanitize", "input.txt", "-o", "output.txt"]).unwrap();
-        assert_eq!(cli.input.unwrap(), PathBuf::from("input.txt"));
+        assert_eq!(cli.input, vec![PathBuf::from("input.txt")]);
         assert_eq!(cli.output.unwrap(), PathBuf::from("output.txt"));
+    }
+
+    #[test]
+    fn cli_parses_multiple_inputs() {
+        let cli = Cli::try_parse_from(["sanitize", "test.txt", "a.json", "b.zip"]).unwrap();
+        assert_eq!(
+            cli.input,
+            vec![
+                PathBuf::from("test.txt"),
+                PathBuf::from("a.json"),
+                PathBuf::from("b.zip")
+            ]
+        );
     }
 
     #[test]
@@ -2738,7 +2778,7 @@ mod tests {
     #[test]
     fn validate_args_rejects_zero_progress_interval() {
         let mut cli = Cli::try_parse_from(["sanitize", "input.txt"]).unwrap();
-        cli.input = Some(std::env::current_dir().unwrap().join("Cargo.toml"));
+        cli.input = vec![std::env::current_dir().unwrap().join("Cargo.toml")];
         cli.progress_interval_ms = 0;
         let err = validate_args(&cli).unwrap_err();
         assert!(err.contains("--progress-interval-ms must be greater than 0"));
@@ -2795,7 +2835,7 @@ mod tests {
         ])
         .unwrap();
         assert!(cli.command.is_some());
-        assert!(cli.input.is_none());
+        assert!(cli.input.is_empty());
     }
 
     #[test]
@@ -2809,21 +2849,21 @@ mod tests {
         ])
         .unwrap();
         assert!(cli.command.is_some());
-        assert!(cli.input.is_none());
+        assert!(cli.input.is_empty());
     }
 
     #[test]
     fn cli_parses_guided_subcommand() {
         let cli = Cli::try_parse_from(["sanitize", "guided"]).unwrap();
         assert!(matches!(cli.command, Some(SubCommand::Guided)));
-        assert!(cli.input.is_none());
+        assert!(cli.input.is_empty());
     }
 
     #[test]
     fn cli_no_input_no_subcommand_is_ok_at_parse_time() {
-        // Clap allows it (input is Option); we validate manually in run().
+        // Clap allows it (input is Vec); we validate manually in run().
         let cli = Cli::try_parse_from(["sanitize", "--dry-run"]).unwrap();
-        assert!(cli.input.is_none());
+        assert!(cli.input.is_empty());
         assert!(cli.command.is_none());
     }
 
@@ -2871,19 +2911,26 @@ mod tests {
     #[test]
     fn cli_stdin_dash_input() {
         let cli = Cli::try_parse_from(["sanitize", "-", "-s", "s.json"]).unwrap();
-        assert!(is_stdin_input(&cli));
+        assert!(has_stdin_input(&cli));
     }
 
     #[test]
     fn cli_stdin_no_input() {
         let cli = Cli::try_parse_from(["sanitize", "-s", "s.json"]).unwrap();
-        assert!(is_stdin_input(&cli));
+        assert!(has_stdin_input(&cli));
     }
 
     #[test]
     fn cli_file_input_not_stdin() {
         let cli = Cli::try_parse_from(["sanitize", "data.log"]).unwrap();
-        assert!(!is_stdin_input(&cli));
+        assert!(!has_stdin_input(&cli));
+    }
+
+    #[test]
+    fn cli_file_and_stdin_mix_is_supported() {
+        let cli = Cli::try_parse_from(["sanitize", "test.txt", "-", "-s", "s.json"]).unwrap();
+        assert!(has_stdin_input(&cli));
+        assert_eq!(file_inputs(&cli).len(), 1);
     }
 
     #[test]
@@ -2895,6 +2942,90 @@ mod tests {
         assert_eq!(format_to_ext("key-value"), Some("conf"));
         assert_eq!(format_to_ext("text"), None);
         assert_eq!(format_to_ext("unknown"), None);
+    }
+
+    #[test]
+    fn plan_multi_input_outputs_preserve_types() {
+        let tmp = tempdir().unwrap();
+        let input_dir = tmp.path().join("in");
+        let out_dir = tmp.path().join("out");
+        fs::create_dir_all(&input_dir).unwrap();
+
+        let txt = input_dir.join("test.txt");
+        let json = input_dir.join("a.json");
+        let zip = input_dir.join("b.zip");
+        fs::write(&txt, "x").unwrap();
+        fs::write(&json, "{}\n").unwrap();
+        fs::write(&zip, "PK\x03\x04").unwrap();
+
+        let cli = Cli::try_parse_from([
+            "sanitize",
+            txt.to_str().unwrap(),
+            json.to_str().unwrap(),
+            zip.to_str().unwrap(),
+            "--output",
+            out_dir.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let targets = plan_input_targets(&cli).unwrap();
+        let mut outputs = targets
+            .into_iter()
+            .filter_map(|t| match t {
+                InputTarget::File { output, .. } => {
+                    Some(output.file_name().unwrap().to_string_lossy().to_string())
+                }
+                InputTarget::Stdin { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        outputs.sort();
+
+        assert_eq!(
+            outputs,
+            vec![
+                "a-sanitized.json".to_string(),
+                "b.sanitized.zip".to_string(),
+                "test-sanitized.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_multi_input_collision_adds_numeric_suffix() {
+        let tmp = tempdir().unwrap();
+        let dir1 = tmp.path().join("dir1");
+        let dir2 = tmp.path().join("dir2");
+        let out_dir = tmp.path().join("out");
+        fs::create_dir_all(&dir1).unwrap();
+        fs::create_dir_all(&dir2).unwrap();
+
+        let f1 = dir1.join("same.txt");
+        let f2 = dir2.join("same.txt");
+        fs::write(&f1, "x").unwrap();
+        fs::write(&f2, "y").unwrap();
+
+        let cli = Cli::try_parse_from([
+            "sanitize",
+            f1.to_str().unwrap(),
+            f2.to_str().unwrap(),
+            "--output",
+            out_dir.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let targets = plan_input_targets(&cli).unwrap();
+        let outputs = targets
+            .into_iter()
+            .filter_map(|t| match t {
+                InputTarget::File { output, .. } => {
+                    Some(output.file_name().unwrap().to_string_lossy().to_string())
+                }
+                InputTarget::Stdin { .. } => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(outputs.contains(&"same-sanitized.txt".to_string()));
+        assert!(outputs.contains(&"same-sanitized-1.txt".to_string()));
     }
 
     #[test]

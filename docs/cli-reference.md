@@ -3,14 +3,14 @@
 ## `sanitize`
 
 ```
-sanitize [OPTIONS] [INPUT]
+sanitize [OPTIONS] [INPUT]...
 command | sanitize [OPTIONS]
 sanitize guided
 sanitize encrypt [OPTIONS] <INPUT> <OUTPUT>
 sanitize decrypt [OPTIONS] <INPUT> <OUTPUT>
 ```
 
-The default mode (no subcommand) sanitizes files and archives. When `INPUT` is omitted or set to `-`, data is read from stdin (plain text only; archives require a file path). Use `encrypt` / `decrypt` subcommands to manage encrypted secrets files.
+The default mode (no subcommand) sanitizes one or more files and archives. Multiple `INPUT` paths may be given in a single invocation and may mix plain files, structured files, and archives freely. When `INPUT` is omitted, data is read from stdin; use `-` to include stdin alongside file paths. Use `encrypt` / `decrypt` subcommands to manage encrypted secrets files.
 
 ### `sanitize guided`
 
@@ -211,8 +211,8 @@ Notes:
 
 | Flag / Argument | Short | Description |
 |-----------------|-------|-------------|
-| `[INPUT]` | | Path to the file or archive to sanitize. Omit or use `-` to read from stdin. |
-| `-o, --output <FILE>` | `-o` | Output path. Plain files default to stdout; archives default to `<input>.sanitized.<ext>`. |
+| `[INPUT]...` | | One or more paths to sanitize. Any mix of plain files, structured files, and archives is accepted. Omit to read from stdin; use `-` to include stdin alongside file paths. `-` may appear at most once. |
+| `-o, --output <FILE>` | `-o` | Output path. For a **single input stream** this is the output file path. For **multiple inputs** this is treated as an output directory (created automatically if absent); output files are written there instead. |}
 | `-s, --secrets-file <FILE>` | `-s` | Path to a secrets file. Plaintext (`.json`, `.yaml`, `.toml`) is loaded directly by default. Use `--encrypted-secrets` to decrypt an AES-256-GCM encrypted file. |
 | `-p, --password` | `-p` | Trigger an interactive password prompt (masked input, never echoed). Requires `--encrypted-secrets`. Providing this flag without `--encrypted-secrets` is an error. For non-interactive automation use `--password-file` or `SANITIZE_PASSWORD` instead. |
 | `-P, --password-file <FILE>` | `-P` | Read the decryption password from a file. Requires `--encrypted-secrets`. The file must have permissions `0600` or `0400` (owner-only). Trailing newline is stripped. |
@@ -224,7 +224,7 @@ Notes:
 | `--strict` | | Abort on the first error instead of skipping and continuing. |
 | `-d, --deterministic` | `-d` | Use HMAC-deterministic replacements (reproducible across runs with the same seed). |
 | `--include-binary` | | Process entries that appear to be binary data (default: skip). |
-| `--threads <N>` | | Number of worker threads (currently advisory; reserved for future parallel archive processing). Capped to available parallelism. |
+| `--threads <N>` | | Number of worker threads. When multiple input files are given, files are processed in parallel up to this limit. For a single archive input, entries are sanitized in parallel using the same budget. Defaults to the number of logical CPUs. Capped to available parallelism. |
 | `--chunk-size <BYTES>` | | Chunk size for the streaming scanner in bytes (default: `1048576` = 1 MiB). |
 | `--max-mappings <N>` | | Maximum unique replacement mappings in memory (default: `10000000`). Use `0` for unlimited. |
 | `--max-structured-size <BYTES>` | | Maximum structured file size in bytes before falling back to streaming (default: `268435456` = 256 MiB). |
@@ -267,9 +267,26 @@ sanitize large.log -s secrets.enc --encrypted-secrets --password --progress on >
 sanitize large.log -s secrets.enc --encrypted-secrets --password --log-format json --progress on > clean.log 2> events.jsonl
 ```
 
+#### Output Naming
+
+When no `--output` is given, each input gets its own output file written next to the source:
+
+| Input type | Default output name |
+|------------|--------------------|
+| Plain / structured file (`foo.txt`, `a.json`) | `<stem>-sanitized.<ext>` — e.g. `foo-sanitized.txt`, `a-sanitized.json` |
+| Archive (`data.tar`, `data.tar.gz`, `archive.zip`) | `<stem>.sanitized.<ext>` — e.g. `data.sanitized.tar`, `data.sanitized.tar.gz`, `archive.sanitized.zip` |
+| Stdin (no file path) | stdout |
+
+When multiple inputs map to the same computed output name within one run, a numeric suffix is appended automatically (e.g. `same-sanitized-1.txt`, `same-sanitized-2.txt`).
+
+When `--output <PATH>` is given:
+- **Single input:** writes to that exact path.
+- **Multiple inputs:** `PATH` is treated as a directory. The directory is created if absent. Output files are placed inside it using the per-input naming rules above.
+
+
 #### Stdin Support
 
-When no input file is given (or input is `-`), `sanitize` reads from stdin:
+When no input path is given (or one of the paths is `-`), `sanitize` reads from stdin. `-` may be mixed freely with file paths and may appear at most once. Stdin output defaults to stdout unless `--output` is given.
 
 ```bash
 # Pipe from grep with a plaintext secrets file:
@@ -291,14 +308,24 @@ Stdin mode supports plain text streaming by default. Use `--format` / `-f` to en
 #### Examples
 
 ```bash
-# Sanitize a log file using a plaintext secrets file (default):
+# Sanitize a single log file (output goes to data-sanitized.log):
 sanitize data.log -s secrets.yaml
 
-# Write output to a file (plaintext secrets):
+# Sanitize multiple files in one command:
+sanitize test.txt a.json b.zip -s secrets.yaml
+# Produces: test-sanitized.txt  a-sanitized.json  b.sanitized.zip
+
+# Send all sanitized files to a specific output directory:
+sanitize test.txt a.json b.zip -s secrets.yaml -o /tmp/clean/
+
+# Override output path for a single file:
 sanitize data.log -s secrets.yaml -o clean.log
 
 # Pipe from grep (plaintext secrets):
 grep "error" app.log | sanitize -s secrets.yaml
+
+# Mix stdin with file inputs (stdin goes to stdout, files get per-file outputs):
+cat extra.txt | sanitize - data.log -s secrets.yaml
 
 # Force progress to stderr while keeping stdout pipe-safe:
 grep "error" app.log | sanitize -s secrets.yaml --progress on > clean.log 2> progress.log
@@ -431,9 +458,9 @@ category = "custom:api_key"
 label = "openai_key"
 ```
 
-> **Note on regex patterns:** When `kind` is `"regex"`, the `pattern` field is compiled as a Rust regular expression. Metacharacters (`.`, `*`, `+`, `?`, `(`, `)`, `[`, `]`, `{`, `}`, `\`, `^`, `$`, `|`) must be escaped with a backslash to match literally. When `kind` is `"literal"`, the pattern is automatically escaped before compilation — no manual escaping is needed.
+> **Note on regex patterns:** When `kind` is `"regex"`, the `pattern` field is compiled as a Rust regular expression. Metacharacters (`.`, `*`, `+`, `?`, `(`, `)`, `[`, `]`, `{`, `}`, `\`, `^`, `$`, `|`) must be escaped with a backslash to match literally. When `kind` is `"literal"`, the pattern is treated as exact text — no manual escaping is needed.
 
-All patterns from the secrets file are compiled into a single `RegexSet` for efficient multi-pattern matching. Each match triggers a one-way replacement through the `MappingStore`, formatted according to the pattern's category.
+At runtime, literal patterns are matched by an Aho-Corasick automaton (single multi-literal scan), while regex patterns are matched via `RegexSet` pre-filtering plus per-pattern regex scans. Each match triggers a one-way replacement through the `MappingStore`, formatted according to the pattern's category.
 
 ---
 

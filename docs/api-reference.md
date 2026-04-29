@@ -73,6 +73,7 @@ All public types are re-exported from the crate root (`sanitize_engine::*`) for 
 | `ArchiveProcessor` | Processes `.tar`, `.tar.gz`, and `.zip` archives entry-by-entry. Routes entries to structured processors or the streaming scanner. Recursively processes nested archives up to a configurable depth. |
 | `ArchiveProcessor::new(registry, scanner, store, profiles)` | Create from a `ProcessorRegistry`, `StreamScanner`, `MappingStore`, and file-type profiles. |
 | `ArchiveProcessor::with_max_depth(depth)` | Builder method: set the maximum nesting depth for recursive archive processing (clamped to `MAX_ALLOWED_ARCHIVE_DEPTH`). |
+| `ArchiveProcessor::with_parallel_threshold(threshold)` | Builder method: set the minimum file-entry count required to enable parallel entry sanitization. Default: `4`. Set to `usize::MAX` to disable entry-level parallelism (e.g. when outer file-level parallelism already saturates the thread budget). |
 | `ArchiveFormat` | Enum: `Tar`, `TarGz`, `Zip`. |
 | `ArchiveStats` | Processing results: `files_processed`, `entries_skipped`, `structured_hits`, `scanner_fallback`, `nested_archives`, `total_input_bytes`, `total_output_bytes`, `file_methods`, `file_scan_stats`. |
 | `DEFAULT_MAX_ARCHIVE_DEPTH` | Default maximum nesting depth for recursive archive processing (`3`). |
@@ -108,12 +109,15 @@ All public types are re-exported from the crate root (`sanitize_engine::*`) for 
 | `encrypt_secrets(plaintext, password)` | Encrypt a byte slice with AES-256-GCM (PBKDF2 key derivation). |
 | `decrypt_secrets(encrypted, password)` | Decrypt and return `Zeroizing<Vec<u8>>`. |
 | `parse_secrets(content, format)` | Parse plaintext secrets into `Vec<SecretEntry>`. |
+| `serialize_secrets(entries, format)` | Serialize `Vec<SecretEntry>` back to JSON, YAML, or TOML bytes. |
+| `entries_to_patterns(entries)` | Convert `Vec<SecretEntry>` to `(Vec<ScanPattern>, warnings)`. Patterns that fail to compile are skipped and returned in warnings. |
+| `parse_category(s)` | Parse a category string (`"email"`, `"custom:tag"`, etc.) into a `Category`. |
 
 ## Error Module (`error`)
 
 | Type | Description |
 |------|-------------|
-| `SanitizeError` | Non-exhaustive error enum: `CapacityExceeded`, `InvalidSeedLength`, `GeneratorError`, `IoError`, `ParseError`, `RecursionDepthExceeded`, `InputTooLarge`, `PatternCompileError`, `InvalidConfig`, `SecretsError`, `ArchiveError`. |
+| `SanitizeError` | Non-exhaustive error enum: `CapacityExceeded`, `InvalidSeedLength`, `IoError`, `ParseError`, `RecursionDepthExceeded`, `InputTooLarge`, `PatternCompileError`, `InvalidConfig`, `SecretsEmptyPassword`, `SecretsTooShort`, `SecretsDecryptFailed`, `SecretsCipherError(String)`, `SecretsFormatError { format, message }`, `SecretsInvalidUtf8(String)`, `SecretsPasswordRequired`, `ArchiveError`. |
 | `Result<T>` | Type alias for `std::result::Result<T, SanitizeError>`. |
 
 ## Category Module (`category`)

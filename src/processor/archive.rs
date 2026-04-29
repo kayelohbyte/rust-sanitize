@@ -56,6 +56,7 @@ use crate::processor::registry::ProcessorRegistry;
 use crate::scanner::{ScanStats, StreamScanner};
 use crate::store::MappingStore;
 
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
@@ -64,6 +65,12 @@ use std::sync::Arc;
 /// memory for structured processing. Entries larger than this are
 /// streamed through the scanner instead (M-3 fix).
 const MAX_STRUCTURED_ENTRY_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Maximum total uncompressed data size (bytes) across all zip entries
+/// before the parallel processing path is disabled.  Above this threshold
+/// the zip processor falls back to sequential (one entry at a time) to
+/// avoid loading the entire archive into memory simultaneously.
+const MAX_PARALLEL_ZIP_DATA_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
 
 /// Default maximum nesting depth for recursive archive processing.
 ///
@@ -82,9 +89,17 @@ pub const DEFAULT_MAX_ARCHIVE_DEPTH: u32 = 3;
 /// 256 MiB).
 const MAX_ALLOWED_ARCHIVE_DEPTH: u32 = 10;
 
+/// Minimum number of file entries in an archive before parallel entry
+/// processing is enabled. Below this threshold the overhead of spawning
+/// rayon tasks exceeds the savings.
+const PARALLEL_ENTRY_THRESHOLD: usize = 4;
+
 // ---------------------------------------------------------------------------
 // Archive format enum
 // ---------------------------------------------------------------------------
+
+/// Per-entry result from parallel zip processing: `(meta_index, sanitized_bytes_and_stats)`.
+type ZipEntryResult = (usize, Result<(Vec<u8>, ArchiveStats)>);
 
 /// Supported archive formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +248,9 @@ pub struct ArchiveProcessor {
     max_depth: u32,
     /// Optional callback for per-entry progress updates.
     progress_callback: Option<ArchiveProgressCallback>,
+    /// Minimum number of file entries required to enable parallel entry
+    /// sanitization. Default: [`PARALLEL_ENTRY_THRESHOLD`].
+    parallel_threshold: usize,
 }
 
 impl ArchiveProcessor {
@@ -257,6 +275,7 @@ impl ArchiveProcessor {
             profiles,
             max_depth: DEFAULT_MAX_ARCHIVE_DEPTH,
             progress_callback: None,
+            parallel_threshold: PARALLEL_ENTRY_THRESHOLD,
         }
     }
 
@@ -268,6 +287,16 @@ impl ArchiveProcessor {
     #[must_use]
     pub fn with_max_depth(mut self, depth: u32) -> Self {
         self.max_depth = depth.min(MAX_ALLOWED_ARCHIVE_DEPTH);
+        self
+    }
+
+    /// Override the minimum entry count required to enable parallel
+    /// entry sanitization. Set to `usize::MAX` to disable parallelism
+    /// entirely for this processor instance (e.g. when outer file-level
+    /// parallelism is already saturating the thread budget).
+    #[must_use]
+    pub fn with_parallel_threshold(mut self, threshold: usize) -> Self {
+        self.parallel_threshold = threshold;
         self
     }
 
@@ -293,6 +322,33 @@ impl ArchiveProcessor {
                 current_entry: current_entry.to_string(),
             });
         }
+    }
+
+    /// Sanitize a file entry given its raw bytes.
+    ///
+    /// Returns the sanitized bytes together with a fresh [`ArchiveStats`]
+    /// covering only this entry. This is the core work unit for parallel
+    /// entry processing in [`process_tar_at_depth`] and
+    /// [`process_zip_at_depth`].
+    fn sanitize_entry_bytes(
+        &self,
+        filename: &str,
+        data: &[u8],
+        entry_size_hint: Option<u64>,
+        depth: u32,
+    ) -> Result<(Vec<u8>, ArchiveStats)> {
+        let mut out: Vec<u8> = Vec::with_capacity(data.len());
+        let mut entry_stats = ArchiveStats::default();
+        let mut reader = io::Cursor::new(data);
+        self.sanitize_entry(
+            filename,
+            &mut reader,
+            &mut out,
+            &mut entry_stats,
+            entry_size_hint,
+            depth,
+        )?;
+        Ok((out, entry_stats))
     }
 
     /// Sanitize the content of a single file entry.
@@ -487,6 +543,12 @@ impl ArchiveProcessor {
     }
 
     /// Internal: process a tar archive at a given nesting depth.
+    ///
+    /// Processes entries one at a time in a single streaming pass so only
+    /// one entry's bytes are in memory at a time (bounded by
+    /// `MAX_STRUCTURED_ENTRY_SIZE`). File-level parallelism (multiple
+    /// archive files processed concurrently by the outer loop) replaces
+    /// intra-archive parallelism, which required buffering the whole archive.
     fn process_tar_at_depth<R: Read, W: Write>(
         &self,
         reader: R,
@@ -497,11 +559,11 @@ impl ArchiveProcessor {
         let mut archive = tar::Archive::new(reader);
         let mut builder = tar::Builder::new(writer);
 
-        let entries = archive
+        let entries_iter = archive
             .entries()
             .map_err(|e| SanitizeError::ArchiveError(format!("read tar entries: {}", e)))?;
 
-        for entry_result in entries {
+        for entry_result in entries_iter {
             let mut entry = entry_result
                 .map_err(|e| SanitizeError::ArchiveError(format!("read tar entry: {}", e)))?;
 
@@ -511,40 +573,44 @@ impl ArchiveProcessor {
                 .map_err(|e| SanitizeError::ArchiveError(format!("entry path: {}", e)))?
                 .to_string_lossy()
                 .to_string();
+            let is_file = header.entry_type().is_file();
 
-            let entry_type = header.entry_type();
-
-            // Only process regular files.
-            if !entry_type.is_file() {
-                // Pass through directories, symlinks, etc. unchanged.
-                // We need to read the entry data (even if empty) to
-                // advance the archive cursor.
+            if !is_file {
+                // Non-file entries (dirs, symlinks): pass through unchanged.
                 let mut data = Vec::new();
                 entry.read_to_end(&mut data).map_err(|e| {
-                    SanitizeError::ArchiveError(format!("read non-file entry '{}': {}", path, e))
+                    SanitizeError::ArchiveError(format!("read tar entry '{}': {}", path, e))
                 })?;
+                drop(entry);
                 builder.append(&header, &*data).map_err(|e| {
-                    SanitizeError::ArchiveError(format!("append entry '{}': {}", path, e))
+                    SanitizeError::ArchiveError(format!(
+                        "append non-file entry '{}': {}",
+                        path, e
+                    ))
                 })?;
                 stats.entries_skipped += 1;
                 self.emit_progress(&stats, None, &path);
                 continue;
             }
 
-            // Sanitize the file content.
+            // File entry: pipe the entry reader directly into the sanitizer,
+            // eliminating the intermediate input buffer. Structured processors
+            // and nested-archive paths buffer internally as required; the
+            // scanner path works chunk-by-chunk so peak memory is the output
+            // buffer only (half the footprint of the previous approach).
+            let size_hint = header.size().ok();
             let mut sanitized_buf: Vec<u8> = Vec::new();
-            let entry_size = header.size().ok();
+            let mut entry_stats = ArchiveStats::default();
             self.sanitize_entry(
                 &path,
                 &mut entry,
                 &mut sanitized_buf,
-                &mut stats,
-                entry_size,
+                &mut entry_stats,
+                size_hint,
                 depth,
             )?;
+            drop(entry);
 
-            // Build a new header with the sanitized content length but
-            // preserved metadata.
             let mut new_header = header.clone();
             new_header.set_size(sanitized_buf.len() as u64);
             new_header.set_cksum();
@@ -552,7 +618,9 @@ impl ArchiveProcessor {
             builder.append(&new_header, &*sanitized_buf).map_err(|e| {
                 SanitizeError::ArchiveError(format!("append entry '{}': {}", path, e))
             })?;
+            drop(sanitized_buf);
 
+            stats.merge(&entry_stats);
             stats.files_processed += 1;
             self.emit_progress(&stats, None, &path);
         }
@@ -585,7 +653,7 @@ impl ArchiveProcessor {
         depth: u32,
     ) -> Result<ArchiveStats> {
         let gz_reader = flate2::read::GzDecoder::new(reader);
-        let gz_writer = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
+        let gz_writer = flate2::write::GzEncoder::new(writer, flate2::Compression::fast());
 
         let stats = self.process_tar_at_depth(gz_reader, gz_writer, depth)?;
         // GzEncoder is flushed when the tar builder finishes and the
@@ -620,90 +688,203 @@ impl ArchiveProcessor {
     }
 
     /// Internal: process a zip archive at a given nesting depth.
+    ///
+    /// Uses a lightweight metadata pre-pass (local-header reads, no data
+    /// decompression) to decide between parallel and sequential strategies:
+    ///
+    /// - **Parallel** (total uncompressed ≤ `MAX_PARALLEL_ZIP_DATA_SIZE` AND
+    ///   file count ≥ threshold AND depth == 0): load all entry data into
+    ///   memory, sanitize with rayon, write in order.
+    /// - **Sequential** (everything else): read → sanitize → write one entry
+    ///   at a time.  Peak memory is bounded to 2 × largest single entry.
+    #[allow(clippy::too_many_lines)]
     fn process_zip_at_depth<R: Read + Seek, W: Write + Seek>(
         &self,
         reader: R,
         writer: W,
         depth: u32,
     ) -> Result<ArchiveStats> {
-        let mut stats = ArchiveStats::default();
-        let mut zip_in = zip::ZipArchive::new(reader)
-            .map_err(|e| SanitizeError::ArchiveError(format!("open zip: {}", e)))?;
-        let mut zip_out = zip::ZipWriter::new(writer);
-        let total_entries = Some(zip_in.len() as u64);
-
-        for i in 0..zip_in.len() {
-            let mut entry = zip_in
-                .by_index(i)
-                .map_err(|e| SanitizeError::ArchiveError(format!("zip entry {}: {}", i, e)))?;
-
-            let name = entry.name().to_string();
-
-            // Security note: entry names are preserved verbatim (including any
-            // "../" or absolute-path components) because this tool writes a
-            // sanitised *archive*, not a filesystem tree.  Path traversal is
-            // therefore not exploitable here.  Consumers that later *extract*
-            // the output archive must apply their own path validation.
-
-            // Directories and non-files: pass through.
-            if entry.is_dir() {
-                let options = zip::write::FileOptions::default()
-                    .last_modified_time(entry.last_modified())
-                    .compression_method(entry.compression());
-
-                #[cfg(unix)]
-                let options = if let Some(mode) = entry.unix_mode() {
-                    options.unix_permissions(mode)
-                } else {
-                    options
-                };
-
-                zip_out.add_directory(&name, options).map_err(|e| {
-                    SanitizeError::ArchiveError(format!("add dir '{}': {}", name, e))
-                })?;
-                stats.entries_skipped += 1;
-                self.emit_progress(&stats, total_entries, &name);
-                continue;
-            }
-
-            // Build write options preserving metadata.
-            let options = zip::write::FileOptions::default()
-                .compression_method(entry.compression())
-                .last_modified_time(entry.last_modified());
-
-            #[cfg(unix)]
-            let options = if let Some(mode) = entry.unix_mode() {
-                options.unix_permissions(mode)
-            } else {
-                options
-            };
-
-            // Sanitize the file.
-            let mut sanitized_buf: Vec<u8> = Vec::new();
-            let entry_size = Some(entry.size());
-            self.sanitize_entry(
-                &name,
-                &mut entry,
-                &mut sanitized_buf,
-                &mut stats,
-                entry_size,
-                depth,
-            )?;
-
-            zip_out.start_file(&name, options).map_err(|e| {
-                SanitizeError::ArchiveError(format!("start file '{}': {}", name, e))
-            })?;
-            zip_out.write_all(&sanitized_buf).map_err(|e| {
-                SanitizeError::ArchiveError(format!("write file '{}': {}", name, e))
-            })?;
-
-            stats.files_processed += 1;
-            self.emit_progress(&stats, total_entries, &name);
+        // --- Stage 0: metadata pre-pass (no data reads) ---------------------
+        // Read local file headers to collect names, sizes, and options.
+        // This does N seeks but decompresses nothing, keeping memory flat.
+        struct ZipMeta {
+            name: String,
+            is_dir: bool,
+            compression: zip::CompressionMethod,
+            last_modified: zip::DateTime,
+            unix_mode: Option<u32>,
+            size: u64,
         }
 
-        zip_out
-            .finish()
-            .map_err(|e| SanitizeError::ArchiveError(format!("finalize zip: {}", e)))?;
+        let mut zip_in = zip::ZipArchive::new(reader)
+            .map_err(|e| SanitizeError::ArchiveError(format!("open zip: {}", e)))?;
+        let total_entries = zip_in.len();
+        let total_entries_hint = Some(total_entries as u64);
+
+        let mut metas: Vec<ZipMeta> = Vec::with_capacity(total_entries);
+        let mut file_count = 0usize;
+        let mut total_uncompressed_size: u64 = 0;
+
+        for i in 0..total_entries {
+            let entry = zip_in
+                .by_index(i)
+                .map_err(|e| SanitizeError::ArchiveError(format!("zip entry {}: {}", i, e)))?;
+            let is_dir = entry.is_dir();
+            let size = entry.size();
+            if !is_dir {
+                file_count += 1;
+                total_uncompressed_size = total_uncompressed_size.saturating_add(size);
+            }
+            metas.push(ZipMeta {
+                name: entry.name().to_string(),
+                is_dir,
+                compression: entry.compression(),
+                last_modified: entry.last_modified(),
+                unix_mode: entry.unix_mode(),
+                size,
+            });
+            // entry dropped here — no data decompressed
+        }
+
+        // Parallel only when the total data fits comfortably in memory.
+        // Parallel when: enough entries, data fits in memory, and we are not
+        // already running inside a rayon worker thread (nested parallelism
+        // would over-subscribe the pool without proportional gains).
+        let use_parallel = file_count >= self.parallel_threshold
+            && rayon::current_thread_index().is_none()
+            && total_uncompressed_size <= MAX_PARALLEL_ZIP_DATA_SIZE;
+
+        let mut stats = ArchiveStats::default();
+
+        // Helper: build FileOptions for a metadata entry.
+        let make_options = |m: &ZipMeta| {
+            let opts = zip::write::FileOptions::default()
+                .compression_method(m.compression)
+                .last_modified_time(m.last_modified);
+            if let Some(mode) = m.unix_mode {
+                opts.unix_permissions(mode)
+            } else {
+                opts
+            }
+        };
+
+        if use_parallel {
+            // --- Parallel path: load all data then sanitize concurrently ----
+            struct ZipEntry {
+                meta_idx: usize,
+                data: Vec<u8>,
+            }
+
+            let mut file_entries: Vec<ZipEntry> = Vec::with_capacity(file_count);
+
+            for (i, meta) in metas.iter().enumerate() {
+                if meta.is_dir {
+                    continue;
+                }
+                let mut entry = zip_in.by_index(i).map_err(|e| {
+                    SanitizeError::ArchiveError(format!("zip entry {}: {}", i, e))
+                })?;
+                let mut data = Vec::new();
+                entry.read_to_end(&mut data).map_err(|e| {
+                    SanitizeError::ArchiveError(format!("read zip entry '{}': {}", meta.name, e))
+                })?;
+                file_entries.push(ZipEntry { meta_idx: i, data });
+            }
+
+            let results: Vec<ZipEntryResult> = file_entries
+                .into_par_iter()
+                .map(|e| {
+                    let meta = &metas[e.meta_idx];
+                    let result =
+                        self.sanitize_entry_bytes(&meta.name, &e.data, Some(meta.size), depth);
+                    (e.meta_idx, result)
+                })
+                .collect();
+
+            // Collect into a positional Vec (indexed by metas position) for
+            // O(1) ordered writes, avoiding HashMap hashing overhead.
+            let mut sanitized: Vec<Option<(Vec<u8>, ArchiveStats)>> = vec![None; metas.len()];
+            for (meta_idx, r) in results {
+                sanitized[meta_idx] = Some(r?);
+            }
+
+            let mut zip_out = zip::ZipWriter::new(writer);
+            for (i, meta) in metas.iter().enumerate() {
+                let options = make_options(meta);
+                if meta.is_dir {
+                    zip_out.add_directory(&meta.name, options).map_err(|e| {
+                        SanitizeError::ArchiveError(format!("add dir '{}': {}", meta.name, e))
+                    })?;
+                    stats.entries_skipped += 1;
+                    self.emit_progress(&stats, total_entries_hint, &meta.name);
+                    continue;
+                }
+                let (sanitized_buf, entry_stats) = sanitized[i]
+                    .take()
+                    .expect("file entry sanitization result missing");
+                stats.merge(&entry_stats);
+                zip_out.start_file(&meta.name, options).map_err(|e| {
+                    SanitizeError::ArchiveError(format!("start file '{}': {}", meta.name, e))
+                })?;
+                zip_out.write_all(&sanitized_buf).map_err(|e| {
+                    SanitizeError::ArchiveError(format!("write file '{}': {}", meta.name, e))
+                })?;
+                stats.files_processed += 1;
+                self.emit_progress(&stats, total_entries_hint, &meta.name);
+            }
+            zip_out
+                .finish()
+                .map_err(|e| SanitizeError::ArchiveError(format!("finalize zip: {}", e)))?;
+        } else {
+            // --- Sequential path: one entry at a time -----------------------
+            // Only one entry's data (input + sanitized output) is live at once.
+            let mut zip_out = zip::ZipWriter::new(writer);
+            for (i, meta) in metas.iter().enumerate() {
+                let options = make_options(meta);
+                if meta.is_dir {
+                    zip_out.add_directory(&meta.name, options).map_err(|e| {
+                        SanitizeError::ArchiveError(format!("add dir '{}': {}", meta.name, e))
+                    })?;
+                    stats.entries_skipped += 1;
+                    self.emit_progress(&stats, total_entries_hint, &meta.name);
+                    continue;
+                }
+
+                let data = {
+                    let mut entry = zip_in.by_index(i).map_err(|e| {
+                        SanitizeError::ArchiveError(format!("zip entry {}: {}", i, e))
+                    })?;
+                    let mut buf = Vec::new();
+                    entry.read_to_end(&mut buf).map_err(|e| {
+                        SanitizeError::ArchiveError(format!(
+                            "read zip entry '{}': {}",
+                            meta.name, e
+                        ))
+                    })?;
+                    buf
+                    // entry dropped here
+                };
+
+                let (sanitized_buf, entry_stats) =
+                    self.sanitize_entry_bytes(&meta.name, &data, Some(meta.size), depth)?;
+                drop(data);
+
+                zip_out.start_file(&meta.name, options).map_err(|e| {
+                    SanitizeError::ArchiveError(format!("start file '{}': {}", meta.name, e))
+                })?;
+                zip_out.write_all(&sanitized_buf).map_err(|e| {
+                    SanitizeError::ArchiveError(format!("write file '{}': {}", meta.name, e))
+                })?;
+                drop(sanitized_buf);
+
+                stats.merge(&entry_stats);
+                stats.files_processed += 1;
+                self.emit_progress(&stats, total_entries_hint, &meta.name);
+            }
+            zip_out
+                .finish()
+                .map_err(|e| SanitizeError::ArchiveError(format!("finalize zip: {}", e)))?;
+        }
 
         Ok(stats)
     }
@@ -1136,7 +1317,7 @@ mod tests {
         let proc = make_archive_processor().with_progress_callback({
             let updates = Arc::clone(&updates);
             Arc::new(move |progress| {
-                updates.lock().unwrap().push(progress.clone());
+                updates.lock().expect("archive progress lock").push(progress.clone());
             })
         });
         let input = build_test_tar(&[("a.txt", b"alice@corp.com"), ("b.txt", b"SUPERSECRET")]);
@@ -1160,7 +1341,7 @@ mod tests {
         let proc = make_archive_processor().with_progress_callback({
             let updates = Arc::clone(&updates);
             Arc::new(move |progress| {
-                updates.lock().unwrap().push(progress.clone());
+                updates.lock().expect("archive progress lock").push(progress.clone());
             })
         });
         let zip_data = build_test_zip(&[

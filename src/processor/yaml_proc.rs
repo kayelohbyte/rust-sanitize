@@ -8,7 +8,7 @@
 //! Key paths use the same dot-separated convention as the JSON processor.
 
 use crate::error::{Result, SanitizeError};
-use crate::processor::{find_matching_rule, replace_value, FileTypeProfile, Processor};
+use crate::processor::{build_path, find_matching_rule, replace_value, FileTypeProfile, Processor};
 use crate::store::MappingStore;
 use serde_yaml_ng::Value;
 
@@ -140,11 +140,7 @@ fn walk_yaml(
             let keys: Vec<Value> = map.keys().cloned().collect();
             for key in keys {
                 let key_str = yaml_key_to_string(&key);
-                let path = if prefix.is_empty() {
-                    key_str.clone()
-                } else {
-                    format!("{}.{}", prefix, key_str)
-                };
+                let path = build_path(prefix, &key_str);
 
                 if let Some(v) = map.get_mut(&key) {
                     match v {

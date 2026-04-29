@@ -11,12 +11,14 @@ readme = "README.md"
 categories = ["command-line-utilities", "text-processing"]
 keywords = ["sanitization", "redaction", "privacy", "pii"]
 exclude = ["tests/", "fuzz/", ".github/", "docs/", "target/"]
+autobins = false
 
 [features]
 default = []
 bench = []
 
 [dependencies]
+aho-corasick = "1"
 dashmap = "6"
 hmac = "0.12"
 sha2 = "0.10"
@@ -41,6 +43,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 ctrlc = { version = ">=3, <3.5", features = ["termination"] }
 rpassword = "7"
+rayon = "1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["fs"] }
@@ -48,7 +51,6 @@ nix = { version = "0.29", features = ["fs"] }
 [dev-dependencies]
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
-rayon = "1"
 tempfile = "3"
 
 [[bench]]
