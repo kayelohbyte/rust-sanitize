@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-04-29
+
+### Added
+
+- **`--profile <FILE>` flag** — enables structured field-level sanitization. A profile YAML or JSON file maps file extensions to processors and field rules (e.g. replace `*.password` with `custom:password` category). Profiles are evaluated before the streaming scanner.
+
+- **Two-phase pipeline** — when `--profile` is supplied, profile-matched files are processed first (serially) to populate the replacement store with discovered field values. The streaming scanner used for all other files is then augmented with those values as literal patterns, so the same secret found in `config.yaml` is automatically replaced in `app.log` with the same replacement.
+
+- **Format-preserving structured pass** — the structured processor populates the store with field-value mappings, then the original file bytes are scanned with a per-file scanner containing those literals. Comments, indentation, key ordering, blank lines, and quoting style are all preserved exactly.
+
+- **`include` / `exclude` globs on `FileTypeProfile`** — profiles can now restrict which files they apply to beyond extension matching. `include` narrows to filenames matching at least one glob; `exclude` skips matching filenames. Patterns without a path separator are matched against both the filename and the full path.
+
+- **Discovered-value persistence** (`--deterministic` + `--profile`) — when `--deterministic` is set alongside `--profile`, values discovered by the structured pass are appended to `--secrets-file` after the run (creating the file if absent, deduplicating if it exists). Subsequent runs against unstructured files load those patterns and produce consistent replacements.
+
+- **`--deterministic` without `--encrypted-secrets`** — `--deterministic` can now be used with a plaintext secrets file. The password (via `SANITIZE_PASSWORD`, `--password-file`, or `-p`) is used as the HMAC seed only; `--encrypted-secrets` is no longer required when using deterministic mode without an encrypted secrets file.
+
+- **Archive structured discovery pre-pass** — archives in Phase 2 are opened once before the augmented scanner is built. Profile-matched entries inside the archive populate the store, so their values are included in the augmented scanner used for all Phase 2 processing.
+
+- **`ScanPattern::Clone`** — `ScanPattern` now implements `Clone` (via the internally ref-counted `regex::bytes::Regex`).
+
+- **`StreamScanner::with_extra_literals`** — builds an extended copy of a scanner with additional literal patterns appended. Used internally for per-file scanners in the structured pass.
+
+- **`MappingStore::snapshot_keys`** — returns a `HashSet` of all current `(Category, original)` keys. Used to diff the store before and after structured processing to find newly discovered literals.
+
 ### Changed
 
 - **Default secrets mode is now plaintext** — `sanitize` loads secrets files as

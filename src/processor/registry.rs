@@ -41,6 +41,10 @@ impl ProcessorRegistry {
         reg.register(Arc::new(super::yaml_proc::YamlProcessor));
         reg.register(Arc::new(super::xml_proc::XmlProcessor));
         reg.register(Arc::new(super::csv_proc::CsvProcessor));
+        reg.register(Arc::new(super::toml_proc::TomlProcessor));
+        reg.register(Arc::new(super::env_proc::EnvProcessor));
+        reg.register(Arc::new(super::ini_proc::IniProcessor));
+        reg.register(Arc::new(super::log_line::LogLineProcessor::new()));
         reg
     }
 

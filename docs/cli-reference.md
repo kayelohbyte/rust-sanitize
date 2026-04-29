@@ -222,13 +222,14 @@ Notes:
 | `--fail-on-match` | | Exit with code 2 if any matches are found. |
 | `-r, --report [PATH]` | `-r` | Write a JSON report to `PATH` (or stderr if no path given). Use `--report -` to write the report to stdout. |
 | `--strict` | | Abort on the first error instead of skipping and continuing. |
-| `-d, --deterministic` | `-d` | Use HMAC-deterministic replacements (reproducible across runs with the same seed). |
+| `-d, --deterministic` | `-d` | Use HMAC-deterministic replacements (reproducible across runs with the same password). Requires a password via `SANITIZE_PASSWORD`, `--password-file`, or `-p`. When combined with `--profile`, values discovered by structured scanning are saved to `--secrets-file` (creating the file if absent). |
 | `--include-binary` | | Process entries that appear to be binary data (default: skip). |
 | `--threads <N>` | | Number of worker threads. When multiple input files are given, files are processed in parallel up to this limit. For a single archive input, entries are sanitized in parallel using the same budget. Defaults to the number of logical CPUs. Capped to available parallelism. |
 | `--chunk-size <BYTES>` | | Chunk size for the streaming scanner in bytes (default: `1048576` = 1 MiB). |
 | `--max-mappings <N>` | | Maximum unique replacement mappings in memory (default: `10000000`). Use `0` for unlimited. |
 | `--max-structured-size <BYTES>` | | Maximum structured file size in bytes before falling back to streaming (default: `268435456` = 256 MiB). |
 | `--max-archive-depth <N>` | | Maximum nesting depth for recursive archive processing (default: `3`, max: `10`). Each nesting level may buffer up to 256 MiB. |
+| `--profile <FILE>` | | Path to a file-type profile (JSON or YAML). Enables structured field-level sanitization for matched files. See [Structured Processing](structured-processing.md). |
 | `--only <PATTERN>` | | Keep only archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--only` flags accumulate. Combined with `--exclude`: `--only` narrows first, then `--exclude` removes. Only affects archive inputs; ignored for plain files. |
 | `--exclude <PATTERN>` | | Remove archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--exclude` flags accumulate. |
 | `--log-format <FMT>` | | Log output format: `human` (default) or `json`. |
@@ -560,6 +561,30 @@ At runtime, literal patterns are matched by an Aho-Corasick automaton (single mu
 
 ```bash
 sanitize data.log -s secrets.enc --encrypted-secrets --password
+```
+
+**Structured field-level sanitization with a profile:**
+
+```bash
+# Sanitize only the password and username fields in config YAML files:
+sanitize config.yaml -s secrets.yaml --profile profile.yaml
+
+# Process a config file and log file together:
+# values found in config.yaml are also replaced in app.log
+sanitize config.yaml app.log --profile profile.yaml -s secrets.yaml
+```
+
+**Deterministic mode with profile (saves discovered values to secrets file):**
+
+```bash
+# First run: discovers "hunter2" as a password, appends it to secrets.yaml
+SANITIZE_PASSWORD=secret sanitize config.yaml \
+  --profile profile.yaml --deterministic --secrets-file secrets.yaml
+
+# Second run against a log: "hunter2" is now in secrets.yaml and gets
+# the same replacement as in the first run
+SANITIZE_PASSWORD=secret sanitize app.log \
+  --deterministic --secrets-file secrets.yaml
 ```
 
 **Deterministic mode (same seed → same replacements every run):**

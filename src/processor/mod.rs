@@ -39,10 +39,14 @@
 
 pub mod archive;
 pub mod csv_proc;
+pub mod env_proc;
+pub mod ini_proc;
 pub mod json_proc;
 pub mod key_value;
+pub mod log_line;
 pub mod profile;
 pub mod registry;
+pub mod toml_proc;
 pub mod xml_proc;
 pub mod yaml_proc;
 

@@ -311,12 +311,10 @@ impl ArchiveStats {
         self.total_input_bytes += child.total_input_bytes;
         self.total_output_bytes += child.total_output_bytes;
         self.entries_filtered += child.entries_filtered;
-        for (k, v) in &child.file_methods {
-            self.file_methods.insert(k.clone(), v.clone());
-        }
-        for (k, v) in &child.file_scan_stats {
-            self.file_scan_stats.insert(k.clone(), v.clone());
-        }
+        self.file_methods
+            .extend(child.file_methods.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.file_scan_stats
+            .extend(child.file_scan_stats.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 }
 
@@ -369,6 +367,10 @@ pub struct ArchiveProcessor {
     /// Entry-level filter controlling which paths are included in the
     /// output archive. Default: empty (pass all entries).
     filter: ArchiveFilter,
+    /// When true, bypass all structured processors and use only the
+    /// streaming scanner for every entry. Trades format preservation
+    /// for maximum sanitization coverage.
+    force_text: bool,
 }
 
 impl ArchiveProcessor {
@@ -395,6 +397,7 @@ impl ArchiveProcessor {
             progress_callback: None,
             parallel_threshold: PARALLEL_ENTRY_THRESHOLD,
             filter: ArchiveFilter::default(),
+            force_text: false,
         }
     }
 
@@ -434,6 +437,18 @@ impl ArchiveProcessor {
     #[must_use]
     pub fn with_filter(mut self, filter: ArchiveFilter) -> Self {
         self.filter = filter;
+        self
+    }
+
+    /// When set, bypass all structured processors and use only the
+    /// streaming scanner for every archive entry.
+    ///
+    /// Trades format preservation for maximum sanitization coverage.
+    /// Useful when the user is uncertain about field rules or wants a
+    /// belt-and-suspenders guarantee that every byte is scanned.
+    #[must_use]
+    pub fn with_force_text(mut self, force_text: bool) -> Self {
+        self.force_text = force_text;
         self
     }
 
@@ -514,14 +529,14 @@ impl ArchiveProcessor {
             );
         }
 
-        // --- Structured / scanner processing (unchanged) ---
+        // --- Structured / scanner processing ---
 
         // Try structured processing first, but only if the entry is
-        // within the size cap.  Oversized entries fall through to the
-        // streaming scanner (M-3 fix).
+        // within the size cap and --force-text is not set.
+        // Oversized entries fall through to the streaming scanner (M-3 fix).
         let within_size_cap = entry_size_hint.map_or(true, |sz| sz <= MAX_STRUCTURED_ENTRY_SIZE); // unknown size → allow (conservative)
 
-        if within_size_cap {
+        if !self.force_text && within_size_cap {
             if let Some(profile) = self.find_profile(filename) {
                 // Structured processors need the full content in memory.
                 let mut content = Vec::new();
@@ -531,20 +546,33 @@ impl ArchiveProcessor {
 
                 stats.total_input_bytes += content.len() as u64;
 
-                if let Some(output) = self.registry.process(&content, profile, &self.store)? {
-                    stats.structured_hits += 1;
-                    stats.total_output_bytes += output.len() as u64;
-                    stats.file_methods.insert(
-                        filename.to_string(),
-                        format!("structured:{}", profile.processor),
-                    );
-                    writer.write_all(&output).map_err(|e| {
-                        SanitizeError::ArchiveError(format!("write entry '{filename}': {e}"))
-                    })?;
-                    return Ok(());
+                // A parse error (e.g. binary content with a .yaml extension, like
+                // macOS resource-fork ._* files) falls through to the scanner
+                // rather than failing the whole archive.
+                match self.registry.process(&content, profile, &self.store) {
+                    Ok(Some(structured_out)) => {
+                        // Double-pass: run the streaming scanner on the structured
+                        // output to catch anything the field rules missed.
+                        let (output, scan_stats) = self.scanner.scan_bytes(&structured_out)?;
+                        stats.structured_hits += 1;
+                        stats.total_output_bytes += output.len() as u64;
+                        stats.file_methods.insert(
+                            filename.to_string(),
+                            format!("structured+scan:{}", profile.processor),
+                        );
+                        stats
+                            .file_scan_stats
+                            .insert(filename.to_string(), scan_stats);
+                        writer.write_all(&output).map_err(|e| {
+                            SanitizeError::ArchiveError(format!("write entry '{filename}': {e}"))
+                        })?;
+                        return Ok(());
+                    }
+                    Ok(None) => {} // heuristic rejected — fall through to scanner below
+                    Err(_) => {}  // parse failed — fall through to scanner below
                 }
 
-                // Processor didn't match content heuristic — fall back to
+                // Processor didn't match or failed — fall back to
                 // scanner with the already-buffered content.
                 let (output, scan_stats) = self.scanner.scan_bytes(&content)?;
                 stats.scanner_fallback += 1;
@@ -655,6 +683,87 @@ impl ArchiveProcessor {
     }
 
     // -----------------------------------------------------------------------
+    // Profile discovery passes (two-phase support)
+    // -----------------------------------------------------------------------
+    //
+    // These methods perform a read-only pre-pass over an archive, running the
+    // structured processor on every profile-matched entry and discarding the
+    // output.  The side-effect is that `self.store` is populated with the
+    // original→replacement mappings for those fields, so a subsequent call to
+    // `build_augmented_scanner` can inject those values as literals into the
+    // scanner used for the real processing pass.
+
+    /// Run the structured processor on every profile-matched entry in a
+    /// `.tar` archive, recording replacements into the store.  Output is
+    /// discarded; the archive is not modified.
+    pub fn discover_profiles_tar<R: Read>(&self, reader: R) -> Result<()> {
+        if self.profiles.is_empty() {
+            return Ok(());
+        }
+        let mut archive = tar::Archive::new(reader);
+        let entries = archive
+            .entries()
+            .map_err(|e| SanitizeError::ArchiveError(format!("discover tar entries: {e}")))?;
+        for entry_result in entries {
+            let mut entry = entry_result
+                .map_err(|e| SanitizeError::ArchiveError(format!("discover tar entry: {e}")))?;
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            let path = entry
+                .path()
+                .map_err(|e| SanitizeError::ArchiveError(format!("entry path: {e}")))?
+                .to_string_lossy()
+                .to_string();
+            let Some(profile) = self.find_profile(&path) else {
+                continue;
+            };
+            let mut content = Vec::new();
+            entry
+                .read_to_end(&mut content)
+                .map_err(|e| SanitizeError::ArchiveError(format!("read '{path}': {e}")))?;
+            let _ = self.registry.process(&content, profile, &self.store);
+        }
+        Ok(())
+    }
+
+    /// Run the structured processor on every profile-matched entry in a
+    /// `.tar.gz` archive, recording replacements into the store.  Output is
+    /// discarded; the archive is not modified.
+    pub fn discover_profiles_tar_gz<R: Read>(&self, reader: R) -> Result<()> {
+        let gz = flate2::read::GzDecoder::new(reader);
+        self.discover_profiles_tar(gz)
+    }
+
+    /// Run the structured processor on every profile-matched entry in a
+    /// `.zip` archive, recording replacements into the store.  Output is
+    /// discarded; the archive is not modified.
+    pub fn discover_profiles_zip<R: Read + Seek>(&self, reader: R) -> Result<()> {
+        if self.profiles.is_empty() {
+            return Ok(());
+        }
+        let mut zip = zip::ZipArchive::new(reader)
+            .map_err(|e| SanitizeError::ArchiveError(format!("open zip for discovery: {e}")))?;
+        for i in 0..zip.len() {
+            let mut entry = zip
+                .by_index(i)
+                .map_err(|e| SanitizeError::ArchiveError(format!("zip entry {i}: {e}")))?;
+            if entry.is_dir() {
+                continue;
+            }
+            let name = entry.name().to_string();
+            let Some(profile) = self.find_profile(&name) else {
+                continue;
+            };
+            let mut content = Vec::new();
+            entry
+                .read_to_end(&mut content)
+                .map_err(|e| SanitizeError::ArchiveError(format!("read '{name}': {e}")))?;
+            let _ = self.registry.process(&content, profile, &self.store);
+        }
+        Ok(())
+    }
+
     // Tar processing
     // -----------------------------------------------------------------------
 
@@ -1232,7 +1341,7 @@ mod tests {
         assert_eq!(stats.scanner_fallback, 0);
         assert_eq!(
             stats.file_methods.get("config.json").unwrap(),
-            "structured:json"
+            "structured+scan:json"
         );
 
         // Verify sanitized output.

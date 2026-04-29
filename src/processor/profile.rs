@@ -4,6 +4,7 @@
 //! to use and which fields/keys within the file should be sanitized.
 
 use crate::category::Category;
+use glob::Pattern;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -66,22 +67,31 @@ impl FieldRule {
 
 /// Specifies which processor to use and what fields to sanitize.
 ///
-/// # Example (serialized as JSON)
+/// # File matching
 ///
-/// ```json
-/// {
-///   "processor": "key_value",
-///   "extensions": [".rb", ".conf"],
-///   "fields": [
-///     { "pattern": "*.password", "category": "custom:password" },
-///     { "pattern": "*.secret",   "category": "custom:secret"   },
-///     { "pattern": "smtp_address", "category": "hostname" }
-///   ],
-///   "options": {
-///     "delimiter": "=",
-///     "comment_prefix": "#"
-///   }
-/// }
+/// A file is processed by this profile when **all** of the following hold:
+///
+/// 1. Its name ends with one of the `extensions` (required — an empty list
+///    matches nothing).
+/// 2. If `include` is non-empty, the filename matches **at least one** of
+///    those glob patterns.
+/// 3. The filename does **not** match any `exclude` glob pattern.
+///
+/// Glob patterns use `*` (any chars within a path component) and `**`
+/// (any chars including path separators).
+///
+/// # Example (YAML)
+///
+/// ```yaml
+/// - processor: json
+///   extensions: [".json"]
+///   # Only apply to files whose names start with "config"
+///   include: ["config*.json"]
+///   # Never apply to log files
+///   exclude: ["*.log.json", "logs/**"]
+///   fields:
+///     - pattern: "*.password"
+///       category: "custom:password"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileTypeProfile {
@@ -91,6 +101,16 @@ pub struct FileTypeProfile {
     /// File extensions this profile applies to (e.g. `[".rb", ".conf"]`).
     #[serde(default)]
     pub extensions: Vec<String>,
+
+    /// If non-empty, the filename must match at least one of these glob
+    /// patterns in addition to the extension check.
+    #[serde(default)]
+    pub include: Vec<String>,
+
+    /// Filenames matching any of these glob patterns are excluded from
+    /// structured processing even if they match the extension (and include).
+    #[serde(default)]
+    pub exclude: Vec<String>,
 
     /// Field rules: which keys/paths to sanitize.
     pub fields: Vec<FieldRule>,
@@ -107,6 +127,8 @@ impl FileTypeProfile {
         Self {
             processor: processor.into(),
             extensions: Vec::new(),
+            include: Vec::new(),
+            exclude: Vec::new(),
             fields,
             options: std::collections::HashMap::new(),
         }
@@ -126,9 +148,15 @@ impl FileTypeProfile {
         self
     }
 
-    /// Check whether a filename matches this profile's extensions.
+    /// Check whether a filename should be processed by this profile.
     ///
-    /// Returns `false` if the profile has no extensions.
+    /// Returns `true` when all three conditions hold:
+    ///
+    /// 1. The filename ends with one of `extensions` (an empty list → `false`).
+    /// 2. If `include` is non-empty, the filename matches at least one glob.
+    /// 3. The filename does **not** match any `exclude` glob.
+    ///
+    /// Invalid glob patterns in `include`/`exclude` are silently skipped.
     ///
     /// # Examples
     ///
@@ -137,21 +165,81 @@ impl FileTypeProfile {
     /// use sanitize_engine::processor::profile::FileTypeProfile;
     ///
     /// let profile = FileTypeProfile::new("json", vec![])
-    ///     .with_extension(".json")
-    ///     .with_extension(".jsonc");
+    ///     .with_extension(".json");
     ///
     /// assert!(profile.matches_filename("config.json"));
-    /// assert!(profile.matches_filename("deep/path/app.jsonc"));
+    /// assert!(profile.matches_filename("logs/app.json"));
     /// assert!(!profile.matches_filename("config.yml"));
-    /// assert!(!FileTypeProfile::new("json", vec![]).matches_filename("any.json"));
+    ///
+    /// // Exclude log-formatted JSON files.
+    /// let profile = FileTypeProfile::new("json", vec![])
+    ///     .with_extension(".json")
+    ///     .with_exclude("*.log.json")
+    ///     .with_exclude("logs/**");
+    ///
+    /// assert!(profile.matches_filename("config.json"));
+    /// assert!(!profile.matches_filename("app.log.json"));
+    /// assert!(!profile.matches_filename("logs/events.json"));
+    ///
+    /// // Include only config files.
+    /// let profile = FileTypeProfile::new("json", vec![])
+    ///     .with_extension(".json")
+    ///     .with_include("config*.json");
+    ///
+    /// assert!(profile.matches_filename("config.json"));
+    /// assert!(profile.matches_filename("config-prod.json"));
+    /// assert!(!profile.matches_filename("events.json"));
     /// ```
     pub fn matches_filename(&self, filename: &str) -> bool {
+        // 1. Extension must match.
         if self.extensions.is_empty() {
             return false;
         }
-        self.extensions
-            .iter()
-            .any(|ext| filename.ends_with(ext.as_str()))
+        if !self.extensions.iter().any(|ext| filename.ends_with(ext.as_str())) {
+            return false;
+        }
+
+        // Extract the basename for patterns that don't contain a path separator.
+        // This lets users write `config*.json` and have it match
+        // `/any/path/config-prod.json` without needing a `**/` prefix.
+        let basename: &str = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(filename);
+
+        let glob_matches = |pat: &str| {
+            Pattern::new(pat).map_or(false, |p| {
+                p.matches(filename) || p.matches(basename)
+            })
+        };
+
+        // 2. Include filter (opt-in narrowing): must match at least one pattern.
+        if !self.include.is_empty() {
+            if !self.include.iter().any(|pat| glob_matches(pat)) {
+                return false;
+            }
+        }
+
+        // 3. Exclude filter: must not match any pattern.
+        if self.exclude.iter().any(|pat| glob_matches(pat)) {
+            return false;
+        }
+
+        true
+    }
+
+    /// Add a glob pattern to the `include` list.
+    #[must_use]
+    pub fn with_include(mut self, pat: impl Into<String>) -> Self {
+        self.include.push(pat.into());
+        self
+    }
+
+    /// Add a glob pattern to the `exclude` list.
+    #[must_use]
+    pub fn with_exclude(mut self, pat: impl Into<String>) -> Self {
+        self.exclude.push(pat.into());
+        self
     }
 }
 

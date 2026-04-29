@@ -62,6 +62,8 @@ mod progress;
 use progress::{ProgressContext, ProgressMode, ProgressPolicy, ProgressReporter, SharedProgressReporter, with_progress_scope};
 
 use clap::{Parser, Subcommand};
+use serde_json;
+use serde_yaml_ng;
 use rayon::prelude::*;
 use sanitize_engine::secrets::{
     decrypt_secrets, encrypt_secrets, entries_to_patterns, parse_secrets, serialize_secrets,
@@ -70,8 +72,8 @@ use sanitize_engine::secrets::{
 use sanitize_engine::{
     atomic_write, ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress, AtomicFileWriter,
     FileReport, HmacGenerator, MappingStore, ProcessorRegistry, RandomGenerator,
-    ReplacementGenerator, ReportBuilder, ReportMetadata, ScanConfig, ScanStats, StreamScanner,
-    DEFAULT_MAX_ARCHIVE_DEPTH,
+    ReplacementGenerator, ReportBuilder, ReportMetadata, ScanConfig, ScanPattern, ScanStats,
+    StreamScanner, DEFAULT_MAX_ARCHIVE_DEPTH,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -108,6 +110,7 @@ struct ArchiveDeps<'a> {
     scanner: &'a Arc<StreamScanner>,
     registry: &'a Arc<ProcessorRegistry>,
     store: &'a Arc<MappingStore>,
+    profiles: &'a [sanitize_engine::processor::FileTypeProfile],
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +174,17 @@ struct Cli {
     #[arg(short = 's', long = "secrets-file", value_name = "FILE")]
     secrets_file: Option<PathBuf>,
 
+    /// Path to a file-type profile (JSON or YAML) defining which structured
+    /// fields to sanitize. Each profile entry names a processor, file
+    /// extensions, and field-path rules (e.g. `*.password`, `database.host`).
+    ///
+    /// When combined with --secrets-file the tool runs a structured pass
+    /// (replacing named fields) followed by a scanner pass (catching any
+    /// remaining secrets). Without --secrets-file only the structured pass
+    /// runs.
+    #[arg(long = "profile", value_name = "FILE")]
+    profile: Option<PathBuf>,
+
     /// Trigger an interactive password prompt for decrypting the secrets
     /// file (masked input, never echoed). Requires `--encrypted-secrets`.
     /// Providing this flag without `--encrypted-secrets` is an error.
@@ -228,6 +242,18 @@ struct Cli {
     /// Process entries that appear to be binary data (default: skip).
     #[arg(long)]
     include_binary: bool,
+
+    /// Bypass all structured processors (JSON, YAML, XML, TOML, etc.) and
+    /// run only the streaming scanner on every file.
+    ///
+    /// Use this when you are uncertain about your field rules or want
+    /// a guarantee that every byte in every file is pattern-scanned.
+    /// The output is the same byte length as the input but structural
+    /// formatting may differ for structured file types.
+    /// Under normal operation the structured + scan double-pass handles
+    /// this automatically; this flag disables the structured pass entirely.
+    #[arg(long)]
+    force_text: bool,
 
     /// Number of worker threads. When multiple input files are provided,
     /// files are processed in parallel up to this limit. For a single
@@ -321,6 +347,24 @@ EXAMPLES:\n  \
 EXAMPLES:\n  \
     sanitize guided")]
     Guided,
+
+    /// Generate a starter secrets-template YAML file for a given use case.
+    ///
+    /// Templates include commented-out examples and common patterns so
+    /// support engineers, sysadmins, and DevOps teams can get started
+    /// quickly before sending logs or configs to an LLM.
+    #[command(after_help = "\
+PRESETS\n  \
+  generic    Common secrets: tokens, emails, IPs, hostnames (default)\n  \
+  web        Web-app logs: JWTs, sessions, emails, URLs\n  \
+  k8s        Kubernetes configs: service-accounts, tokens, namespaces\n  \
+  database   Database configs: passwords, connection strings, usernames\n  \
+  aws        AWS: access keys, ARNs, account IDs\n\n\
+EXAMPLES:\n  \
+  sanitize template                     # generic → secrets.template.yaml\n  \
+  sanitize template --preset web        # web-app template\n  \
+  sanitize template --preset k8s -o k8s-secrets.yaml")]
+    Template(TemplateArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -396,10 +440,55 @@ fn parse_format(s: &str) -> Result<SecretsFormat, String> {
     }
 }
 
+#[derive(Parser, Debug)]
+struct TemplateArgs {
+    /// Which preset to generate.
+    ///
+    /// Choices: generic, web, k8s, database, aws.
+    #[arg(long, short = 'p', default_value = "generic", value_name = "PRESET")]
+    preset: String,
+
+    /// Output path for the generated YAML template.
+    ///
+    /// Default: secrets.template.yaml
+    #[arg(long, short = 'o', value_name = "FILE")]
+    output: Option<PathBuf>,
+
+    /// Overwrite the output file if it already exists.
+    #[arg(long)]
+    overwrite: bool,
+}
+
+fn parse_template_preset(s: &str) -> Result<TemplatePreset, String> {
+    match s {
+        "generic" => Ok(TemplatePreset::Generic),
+        "web" => Ok(TemplatePreset::Web),
+        "k8s" | "kubernetes" => Ok(TemplatePreset::K8s),
+        "database" | "db" => Ok(TemplatePreset::Database),
+        "aws" => Ok(TemplatePreset::Aws),
+        other => Err(format!(
+            "unknown preset '{}' (choices: generic, web, k8s, database, aws)",
+            other
+        )),
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TemplatePreset {
+    Generic,
+    Web,
+    K8s,
+    Database,
+    Aws,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum GuidedPreset {
     Balanced,
     Aggressive,
+    WebApp,
+    Kubernetes,
+    Database,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -559,7 +648,7 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
         make_regex_entry(r#"https?://[^\s"'<>]+"#, "url", "url"),
     ];
 
-    if matches!(opts.preset, GuidedPreset::Aggressive) {
+    if matches!(opts.preset, GuidedPreset::Aggressive | GuidedPreset::WebApp | GuidedPreset::Kubernetes | GuidedPreset::Database) {
         entries.push(make_regex_entry(
             r"(?i)\b(?:bearer|token|api[_-]?key|secret)[\s:=]+[A-Za-z0-9._~+/=-]{16,}\b",
             "auth_token",
@@ -569,6 +658,48 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
             r"\b[A-Za-z0-9_\-]{20,}\b",
             "custom:high_entropy_token",
             "high_entropy_token",
+        ));
+    }
+
+    // Web-app specific: session cookies, OAuth tokens, refresh tokens.
+    if matches!(opts.preset, GuidedPreset::WebApp) {
+        entries.push(make_regex_entry(
+            r"(?i)\bsess(?:ion)?[_-]?(?:id|token|key)[\s:=]+[A-Za-z0-9._~+/=-]{8,}\b",
+            "auth_token",
+            "session_id",
+        ));
+        entries.push(make_regex_entry(
+            r"(?i)(?:refresh|access)[_-]?token[\s:=]+[A-Za-z0-9._~+/=-]{16,}",
+            "auth_token",
+            "oauth_token",
+        ));
+    }
+
+    // Kubernetes specific: service account tokens, namespaces, pod names.
+    if matches!(opts.preset, GuidedPreset::Kubernetes) {
+        entries.push(make_regex_entry(
+            r"\bServiceAccountToken[:\s]+[A-Za-z0-9._~+/=-]{20,}\b",
+            "auth_token",
+            "k8s_service_account_token",
+        ));
+        entries.push(make_regex_entry(
+            r"\bnamespace[:\s]+[a-z][a-z0-9-]{2,62}\b",
+            "custom:k8s_namespace",
+            "k8s_namespace",
+        ));
+    }
+
+    // Database specific: connection strings with embedded credentials.
+    if matches!(opts.preset, GuidedPreset::Database) {
+        entries.push(make_regex_entry(
+            r#"(?i)(?:postgres|mysql|mongodb|redis|amqp|jdbc:[^:]+)://[^\s"'>]+"#,
+            "url",
+            "db_connection_string",
+        ));
+        entries.push(make_regex_entry(
+            r#"(?i)(?:password|passwd|pwd)[\s:=]+[^\s"']{6,}"#,
+            "custom:db_password",
+            "db_password",
         ));
     }
 
@@ -629,6 +760,346 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
     entries
 }
 
+// ---------------------------------------------------------------------------
+// Template subcommand
+// ---------------------------------------------------------------------------
+
+/// YAML comment header printed at the top of every generated template.
+const TEMPLATE_HEADER: &str = "\
+# =============================================================================
+# sanitize secrets template
+# =============================================================================
+#
+# PURPOSE
+#   This file tells sanitize which patterns to detect and replace before
+#   you send logs, configs, or other data to an LLM or external service.
+#
+# RELIABILITY FIRST
+#   Every replacement preserves the original byte length so structured
+#   formats (JSON, YAML, TOML, …) remain parseable after sanitization.
+#   Run `sanitize --force-text` to bypass structured processing entirely.
+#
+# HOW TO USE
+#   1. Edit this file to add your own patterns and literals.
+#   2. Encrypt: sanitize encrypt this-file.yaml this-file.yaml.enc
+#   3. Sanitize: sanitize input.log -s this-file.yaml.enc -o output.log
+#
+# FIELD REFERENCE
+#   pattern   string  Required. Regex or literal to match.
+#   kind      string  \"regex\" (default) or \"literal\".
+#   category  string  Controls the replacement style. See docs/categories.md.
+#   label     string  Optional. Human-readable name shown in reports.
+#
+# WARNING: REVIEW OUTPUT BEFORE SENDING TO AN LLM.
+#          No automated tool catches everything — always spot-check.
+# =============================================================================
+";
+
+fn template_body_generic() -> &'static str {
+    r#"secrets:
+  # --- Tokens & credentials ---
+  - pattern: '(?i)\b(?:bearer|token|api[_-]?key|secret)[\s:=]+[A-Za-z0-9._~+/=-]{16,}\b'
+    kind: regex
+    category: auth_token
+    label: auth_token_context
+
+  - pattern: '\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b'
+    kind: regex
+    category: jwt
+    label: jwt
+
+  # --- Network identifiers ---
+  - pattern: '\b(?:\d{1,3}\.){3}\d{1,3}\b'
+    kind: regex
+    category: ipv4
+    label: ipv4
+
+  - pattern: '\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b'
+    kind: regex
+    category: ipv6
+    label: ipv6
+
+  - pattern: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    kind: regex
+    category: email
+    label: email
+
+  - pattern: '\b(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)\.)+(?:[a-zA-Z]{2,63})\b'
+    kind: regex
+    category: hostname
+    label: hostname
+
+  - pattern: 'https?://[^\s"''<>]+'
+    kind: regex
+    category: url
+    label: url
+
+  # --- Identifiers ---
+  - pattern: '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b'
+    kind: regex
+    category: uuid
+    label: uuid
+
+  - pattern: '\b[a-f0-9]{12,64}\b'
+    kind: regex
+    category: container_id
+    label: container_id
+
+  # --- Add your own literals below ---
+  # - pattern: 'my-internal-hostname.corp.example.com'
+  #   kind: literal
+  #   category: hostname
+  #   label: corp_hostname
+"#
+}
+
+fn template_body_web() -> &'static str {
+    r#"secrets:
+  # --- JWTs and session tokens ---
+  - pattern: '\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b'
+    kind: regex
+    category: jwt
+    label: jwt
+
+  - pattern: '(?i)\bsess(?:ion)?[_-]?(?:id|token|key)[\s:=]+[A-Za-z0-9._~+/=-]{8,}\b'
+    kind: regex
+    category: auth_token
+    label: session_id
+
+  - pattern: '(?i)(?:refresh|access)[_-]?token[\s:=]+[A-Za-z0-9._~+/=-]{16,}'
+    kind: regex
+    category: auth_token
+    label: oauth_token
+
+  - pattern: '(?i)\b(?:bearer|authorization)[\s:]+[A-Za-z0-9._~+/=-]{16,}\b'
+    kind: regex
+    category: auth_token
+    label: bearer_token
+
+  # --- User identifiers ---
+  - pattern: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    kind: regex
+    category: email
+    label: email
+
+  - pattern: '\b(?:\d{1,3}\.){3}\d{1,3}\b'
+    kind: regex
+    category: ipv4
+    label: client_ip
+
+  # --- URLs (may contain query params with tokens) ---
+  - pattern: 'https?://[^\s"''<>]+'
+    kind: regex
+    category: url
+    label: url
+
+  # --- Add domain-specific literals ---
+  # - pattern: 'users.myapp.com'
+  #   kind: literal
+  #   category: hostname
+  #   label: app_domain
+"#
+}
+
+fn template_body_k8s() -> &'static str {
+    r#"secrets:
+  # --- Service account tokens (base64, JWT) ---
+  - pattern: '\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b'
+    kind: regex
+    category: jwt
+    label: k8s_service_account_jwt
+
+  - pattern: '(?i)token[\s:]+[A-Za-z0-9._~+/=-]{20,}'
+    kind: regex
+    category: auth_token
+    label: k8s_token
+
+  # --- Namespace and pod names ---
+  - pattern: '\bnamespace[\s:]+[a-z][a-z0-9-]{2,62}\b'
+    kind: regex
+    category: custom:k8s_namespace
+    label: k8s_namespace
+
+  # --- IPs assigned to pods and services ---
+  - pattern: '\b(?:\d{1,3}\.){3}\d{1,3}\b'
+    kind: regex
+    category: ipv4
+    label: pod_or_svc_ip
+
+  # --- Cluster hostnames / DNS names ---
+  - pattern: '\b(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)\.)+(?:[a-zA-Z]{2,63})\b'
+    kind: regex
+    category: hostname
+    label: k8s_dns
+
+  # --- UUIDs (pod IDs, request IDs, etc.) ---
+  - pattern: '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b'
+    kind: regex
+    category: uuid
+    label: uid
+
+  # --- Docker / container image digests ---
+  - pattern: '\b[a-f0-9]{64}\b'
+    kind: regex
+    category: container_id
+    label: image_digest
+
+  # --- Add your cluster name as a literal ---
+  # - pattern: 'prod-cluster-1'
+  #   kind: literal
+  #   category: hostname
+  #   label: cluster_name
+"#
+}
+
+fn template_body_database() -> &'static str {
+    r#"secrets:
+  # --- Connection strings (contain embedded credentials) ---
+  - pattern: '(?i)(?:postgres|mysql|mongodb|redis|amqp|jdbc:[^:]+)://[^\s"''>]+'
+    kind: regex
+    category: url
+    label: db_connection_string
+
+  # --- Inline passwords / secrets ---
+  - pattern: '(?i)(?:password|passwd|pwd)[\s:=]+[^\s"'']{6,}'
+    kind: regex
+    category: custom:db_password
+    label: db_password
+
+  - pattern: '(?i)(?:user|username|login)[\s:=]+[^\s"'']{3,}'
+    kind: regex
+    category: name
+    label: db_username
+
+  # --- Host / IP for database servers ---
+  - pattern: '\b(?:\d{1,3}\.){3}\d{1,3}\b'
+    kind: regex
+    category: ipv4
+    label: db_host_ip
+
+  - pattern: '\b(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)\.)+(?:[a-zA-Z]{2,63})\b'
+    kind: regex
+    category: hostname
+    label: db_hostname
+
+  # --- TLS certificate fingerprints / hashes ---
+  - pattern: '\b[a-f0-9]{40}\b'
+    kind: regex
+    category: container_id
+    label: cert_fingerprint
+
+  # --- Add database-specific literals ---
+  # - pattern: 'prod-db.internal.example.com'
+  #   kind: literal
+  #   category: hostname
+  #   label: prod_db_host
+"#
+}
+
+fn template_body_aws() -> &'static str {
+    r#"secrets:
+  # --- AWS access key IDs ---
+  - pattern: '\b(?:AKIA|ASIA)[A-Z0-9]{16}\b'
+    kind: regex
+    category: auth_token
+    label: aws_access_key_id
+
+  # --- ARNs (may reveal account IDs, resource names) ---
+  - pattern: '\barn:aws:[^\s]+'
+    kind: regex
+    category: aws_arn
+    label: aws_arn
+
+  # --- AWS account IDs (12-digit numbers in ARNs or standalone) ---
+  - pattern: '\b\d{12}\b'
+    kind: regex
+    category: custom:aws_account_id
+    label: aws_account_id
+
+  # --- S3 bucket names and keys in URLs ---
+  - pattern: 'https://s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com/[^\s"''<>]+'
+    kind: regex
+    category: url
+    label: s3_url
+
+  # --- EC2 / ECS instance IDs ---
+  - pattern: '\bi-[0-9a-f]{8,17}\b'
+    kind: regex
+    category: container_id
+    label: ec2_instance_id
+
+  # --- IPs for EC2 instances ---
+  - pattern: '\b(?:\d{1,3}\.){3}\d{1,3}\b'
+    kind: regex
+    category: ipv4
+    label: ec2_ip
+
+  # --- Emails in IAM roles, SES, etc. ---
+  - pattern: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    kind: regex
+    category: email
+    label: email
+
+  # --- Add your AWS account ID as a literal for exact matching ---
+  # - pattern: '123456789012'
+  #   kind: literal
+  #   category: custom:aws_account_id
+  #   label: my_account_id
+"#
+}
+
+fn run_template(args: &TemplateArgs) -> Result<(), (String, i32)> {
+    let preset = parse_template_preset(&args.preset)
+        .map_err(|e| (e, 1))?;
+
+    let output_path = args.output.clone().unwrap_or_else(|| {
+        PathBuf::from(format!(
+            "secrets.template.{}.yaml",
+            args.preset
+        ))
+    });
+
+    if output_path.exists() && !args.overwrite {
+        return Err((
+            format!(
+                "{} already exists — use --overwrite to replace it",
+                output_path.display()
+            ),
+            1,
+        ));
+    }
+
+    let body = match preset {
+        TemplatePreset::Generic => template_body_generic(),
+        TemplatePreset::Web => template_body_web(),
+        TemplatePreset::K8s => template_body_k8s(),
+        TemplatePreset::Database => template_body_database(),
+        TemplatePreset::Aws => template_body_aws(),
+    };
+
+    let mut content = String::with_capacity(TEMPLATE_HEADER.len() + body.len());
+    content.push_str(TEMPLATE_HEADER);
+    content.push('\n');
+    content.push_str(body);
+
+    atomic_write(&output_path, content.as_bytes())
+        .map_err(|e| (format!("failed to write {}: {e}", output_path.display()), 1))?;
+
+    eprintln!(
+        "Template written to {}",
+        output_path.display()
+    );
+    eprintln!();
+    eprintln!("Next steps:");
+    eprintln!("  1. Edit {} to add your own patterns and remove irrelevant ones.", output_path.display());
+    eprintln!("  2. Encrypt:  sanitize encrypt {} {}.enc", output_path.display(), output_path.display());
+    eprintln!("  3. Sanitize: sanitize <input> -s {}.enc -o <output>", output_path.display());
+    eprintln!();
+    eprintln!("WARNING: always review sanitized output before sending to an LLM.");
+
+    Ok(())
+}
+
 fn normalize_guided_output_path(path: PathBuf) -> PathBuf {
     match path
         .extension()
@@ -663,14 +1134,32 @@ fn run_guided() -> Result<(), (String, i32)> {
     eprintln!("Guided setup: logs-focused secrets template");
     eprintln!("This wizard creates a starter file you can extend later.\n");
 
-    eprintln!("Template strictness:");
-    eprintln!("  1) Balanced");
-    eprintln!("  2) Aggressive (recommended for logs)");
+    eprintln!("Workspace type (affects which patterns are included):");
+    eprintln!("  1) Generic     — tokens, emails, IPs, hostnames, UUIDs");
+    eprintln!("  2) Web app     — JWTs, session cookies, emails, URLs");
+    eprintln!("  3) Kubernetes  — service accounts, tokens, namespaces");
+    eprintln!("  4) Database    — passwords, connection strings, usernames");
+    eprintln!("  5) AWS         — access keys, ARNs, account IDs");
     let preset = loop {
+        let answer = prompt_line("Select [1-5] (default: 1): ").map_err(|e| (e, 1))?;
+        match answer.as_str() {
+            "" | "1" => break GuidedPreset::Balanced,
+            "2" => break GuidedPreset::WebApp,
+            "3" => break GuidedPreset::Kubernetes,
+            "4" => break GuidedPreset::Database,
+            "5" => break GuidedPreset::Aggressive,
+            _ => eprintln!("Please enter a number from 1 to 5."),
+        }
+    };
+
+    eprintln!("\nReplacement strictness:");
+    eprintln!("  1) Balanced    — replace clearly sensitive values only");
+    eprintln!("  2) Aggressive  — replace high-entropy tokens too (recommended for LLMs)");
+    let aggressive = loop {
         let answer = prompt_line("Select [1/2] (default: 2): ").map_err(|e| (e, 1))?;
         match answer.as_str() {
-            "" | "2" => break GuidedPreset::Aggressive,
-            "1" => break GuidedPreset::Balanced,
+            "" | "2" => break true,
+            "1" => break false,
             _ => eprintln!("Please enter 1 or 2."),
         }
     };
@@ -699,7 +1188,14 @@ fn run_guided() -> Result<(), (String, i32)> {
     }
 
     let options = GuidedOptions {
-        preset,
+        preset: if aggressive {
+            match preset {
+                GuidedPreset::Balanced => GuidedPreset::Aggressive,
+                other => other,
+            }
+        } else {
+            preset
+        },
         domains,
         providers,
         exclude_noise_ids,
@@ -798,6 +1294,7 @@ fn run_guided() -> Result<(), (String, i32)> {
         input: vec![input],
         output,
         secrets_file: Some(secrets_for_run),
+        profile: None,
         password: false,
         password_file: None,
         encrypted_secrets: !run_unencrypted,
@@ -808,6 +1305,7 @@ fn run_guided() -> Result<(), (String, i32)> {
         strict: false,
         deterministic,
         include_binary: false,
+        force_text: false,
         threads: None,
         chunk_size: 1_048_576,
         max_mappings: 10_000_000,
@@ -1007,6 +1505,58 @@ fn build_store(
     Ok(Arc::new(MappingStore::new(generator, capacity)))
 }
 
+/// Build an augmented scanner after the profile pass (Phase 1).
+///
+/// Re-parses the secrets file (if any) to get base patterns, then adds a
+/// literal `ScanPattern` for every original value recorded in `store` during
+/// Phase 1. This allows the scanner to catch those same values verbatim in
+/// plain-text files processed in Phase 2.
+///
+/// Values shorter than 4 bytes are skipped to avoid false positives.
+fn build_augmented_scanner(
+    secrets_raw_bytes: Option<&[u8]>,
+    password: Option<&str>,
+    allow_plaintext: bool,
+    store: &Arc<MappingStore>,
+    scan_config: ScanConfig,
+) -> std::result::Result<Arc<StreamScanner>, (String, i32)> {
+    // Re-compile base patterns from the secrets file (if one was provided).
+    let mut patterns: Vec<ScanPattern> = if let Some(raw) = secrets_raw_bytes {
+        let ((base, _warnings), _encrypted) =
+            sanitize_engine::secrets::load_secrets_auto(raw, password, None, allow_plaintext)
+                .map_err(|e| (format!("failed to reload secrets for augmented scanner: {e}"), 1))?;
+        base
+    } else {
+        vec![]
+    };
+
+    // Harvest original values recorded by the profile processor in Phase 1.
+    let mut discovered = 0usize;
+    for (category, original, _replacement) in store.iter() {
+        let s = original.as_str();
+        if s.len() < 4 {
+            continue; // too short — high false-positive risk
+        }
+        match ScanPattern::from_literal(s, category, format!("profile-discovered:{s}")) {
+            Ok(pat) => {
+                patterns.push(pat);
+                discovered += 1;
+            }
+            Err(e) => {
+                warn!(value = s, error = %e, "could not compile discovered literal pattern");
+            }
+        }
+    }
+
+    if discovered > 0 {
+        info!(count = discovered, "augmented scanner with profile-discovered literals");
+    }
+
+    let scanner = StreamScanner::new(patterns, Arc::clone(store), scan_config)
+        .map_err(|e| (format!("failed to create augmented scanner: {e}"), 1))?;
+    Ok(Arc::new(scanner))
+}
+
 /// Build a `ScanConfig`, validating `chunk_size`.
 fn build_scan_config(chunk_size: usize) -> Result<ScanConfig, String> {
     if chunk_size == 0 {
@@ -1113,6 +1663,10 @@ fn format_to_ext(fmt: &str) -> Option<&str> {
         "csv" => Some("csv"),
         "tsv" => Some("tsv"),
         "key-value" | "key_value" | "kv" => Some("conf"),
+        "toml" => Some("toml"),
+        "env" => Some("env"),
+        "ini" => Some("ini"),
+        "log" => Some("log"),
         _ => None,
     }
 }
@@ -1425,6 +1979,10 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
             "csv",
             "tsv",
             "key-value",
+            "toml",
+            "env",
+            "ini",
+            "log",
         ];
         if !valid.contains(&fmt.as_str()) {
             return Err(format!(
@@ -1436,10 +1994,10 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
     }
 
     if let Some(ref sf) = cli.secrets_file {
-        if !sf.exists() {
+        if !sf.exists() && !cli.deterministic {
             return Err(format!("secrets file not found: {}", sf.display()));
         }
-        if !sf.is_file() {
+        if sf.exists() && !sf.is_file() {
             return Err(format!(
                 "secrets path is not a regular file: {}",
                 sf.display()
@@ -1483,7 +2041,7 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
         || cli.password_file.is_some()
         || std::env::var("SANITIZE_PASSWORD")
             .is_ok_and(|v| !v.is_empty());
-    if has_password_source && !cli.encrypted_secrets {
+    if has_password_source && !cli.encrypted_secrets && !cli.deterministic {
         return Err(
             "password input (--password, --password-file, or SANITIZE_PASSWORD) \
              was provided but --encrypted-secrets is not set.\n\
@@ -1508,6 +2066,30 @@ fn resolve_thread_count(requested: Option<usize>) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Processing helpers
+// ---------------------------------------------------------------------------
+
+/// Build a scan progress callback that forwards updates to the shared reporter.
+///
+/// Eliminates the boilerplate of cloning the `SharedProgressReporter` and
+/// constructing an identical `move` closure at every `scan_reader_with_progress`
+/// call site.
+fn make_scan_callback(
+    progress: Option<SharedProgressReporter>,
+    label: impl Into<String>,
+) -> impl FnMut(&sanitize_engine::ScanProgress) {
+    let label = label.into();
+    move |scan_progress| {
+        if let Some(reporter) = &progress {
+            reporter
+                .lock()
+                .expect("progress reporter lock")
+                .update_scan(&label, scan_progress);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Processing
 // ---------------------------------------------------------------------------
 
@@ -1518,11 +2100,17 @@ fn process_stdin(
     scanner: &Arc<StreamScanner>,
     registry: &Arc<ProcessorRegistry>,
     store: &Arc<MappingStore>,
+    profiles: &[sanitize_engine::processor::FileTypeProfile],
     report_builder: Option<&ReportBuilder>,
     progress: Option<&SharedProgressReporter>,
 ) -> Result<bool, String> {
     // Determine whether structured processing should be attempted.
-    let structured_ext = cli.format.as_deref().and_then(format_to_ext);
+    // Skipped entirely when --force-text is set.
+    let structured_ext = if cli.force_text {
+        None
+    } else {
+        cli.format.as_deref().and_then(format_to_ext)
+    };
 
     let mut had_matches = false;
 
@@ -1558,19 +2146,23 @@ fn process_stdin(
         let label = format!("Processing structured stdin ({ext})");
         return with_progress_scope(progress, &label, |_| {
             let structured_result =
-                try_structured_processing(&input_bytes, &format!("stdin.{ext}"), registry, store);
+                try_structured_processing(&input_bytes, &format!("stdin.{ext}"), registry, store, profiles);
 
             match structured_result {
-                Some(Ok(output_bytes)) => {
-                    let method = format!("structured:{ext}");
-                    let replacements = store.len().saturating_sub(store_len_before) as u64;
-                    if replacements > 0 {
+                Some(Ok(structured_bytes)) => {
+                    // Double-pass: run the streaming scanner on the structured
+                    // output to catch anything missed by field-rule gaps.
+                    let (output_bytes, scan_stats) = scanner_fallback(scanner, &structured_bytes)?;
+                    let method = format!("structured+scan:{ext}");
+                    let structured_reps = store.len().saturating_sub(store_len_before) as u64;
+                    let total_replacements = structured_reps + scan_stats.replacements_applied;
+                    if total_replacements > 0 {
                         had_matches = true;
                     }
                     if let Some(rb) = report_builder {
                         let stats = ScanStats {
-                            matches_found: replacements,
-                            replacements_applied: replacements,
+                            matches_found: total_replacements,
+                            replacements_applied: total_replacements,
                             bytes_processed: input_bytes.len() as u64,
                             bytes_output: output_bytes.len() as u64,
                             ..Default::default()
@@ -1637,13 +2229,8 @@ fn process_stdin_streaming<R: io::Read>(
         let mut had_matches = false;
 
         if cli.dry_run {
-            let progress_for_scan = progress.clone();
             let stats = scanner
-                .scan_reader_with_progress(reader, io::sink(), None, move |scan_progress| {
-                    if let Some(reporter) = &progress_for_scan {
-                        reporter.lock().expect("progress reporter lock").update_scan(label, scan_progress);
-                    }
-                })
+                .scan_reader_with_progress(reader, io::sink(), None, make_scan_callback(progress.clone(), label))
                 .map_err(|e| format!("scanner error: {e}"))?;
             if stats.matches_found > 0 {
                 had_matches = true;
@@ -1667,13 +2254,8 @@ fn process_stdin_streaming<R: io::Read>(
             let mut atomic_writer = AtomicFileWriter::new(out_path)
                 .map_err(|e| format!("failed to create output: {e}"))?;
 
-            let progress_for_scan = progress.clone();
             let stats = scanner
-                .scan_reader_with_progress(reader, &mut atomic_writer, None, move |scan_progress| {
-                    if let Some(reporter) = &progress_for_scan {
-                        reporter.lock().expect("progress reporter lock").update_scan(label, scan_progress);
-                    }
-                })
+                .scan_reader_with_progress(reader, &mut atomic_writer, None, make_scan_callback(progress.clone(), label))
                 .map_err(|e| format!("scanner error: {e}"))?;
 
             if is_interrupted() {
@@ -1697,13 +2279,8 @@ fn process_stdin_streaming<R: io::Read>(
         } else {
             let stdout = io::stdout();
             let writer = BufWriter::new(stdout.lock());
-            let progress_for_scan = progress.clone();
             let stats = scanner
-                .scan_reader_with_progress(reader, writer, None, move |scan_progress| {
-                    if let Some(reporter) = &progress_for_scan {
-                        reporter.lock().expect("progress reporter lock").update_scan(label, scan_progress);
-                    }
-                })
+                .scan_reader_with_progress(reader, writer, None, make_scan_callback(progress.clone(), label))
                 .map_err(|e| format!("scanner error: {e}"))?;
             if stats.matches_found > 0 {
                 had_matches = true;
@@ -1730,6 +2307,7 @@ fn process_plain_file(
     scanner: &Arc<StreamScanner>,
     registry: &Arc<ProcessorRegistry>,
     store: &Arc<MappingStore>,
+    profiles: &[sanitize_engine::processor::FileTypeProfile],
     report_builder: Option<&ReportBuilder>,
     progress: Option<&SharedProgressReporter>,
 ) -> Result<bool, String> {
@@ -1742,7 +2320,12 @@ fn process_plain_file(
             .map_err(|e| format!("failed to read {}: {e}", input.display()))?
     };
     if !cli.include_binary && looks_binary(&sample[..sample_len]) {
-        info!(file = %input.display(), "skipping binary file (use --include-binary to override)");
+        let file_size = sample_len as u64;
+        warn!(
+            file = %input.display(),
+            bytes = file_size,
+            "skipping binary file — use --include-binary to process it"
+        );
         return Ok(false);
     }
 
@@ -1773,12 +2356,25 @@ fn process_plain_file(
             | "ini"
             | "env"
             | "properties"
-    );
+            | "toml"
+    ) || {
+        // Handle `.env` and `.env.local` style filenames where the file
+        // name itself starts with `.env`.
+        filename
+            .rsplit('/')
+            .next()
+            .unwrap_or(&filename)
+            .starts_with(".env")
+    };
 
     let mut had_matches = false;
 
-    // --- Structured path ---
-    if structured_ext {
+    // --- Bounded-memory scanner path for known structured extensions ---
+    // Files with structured extensions (json, yaml, toml, etc.) are read
+    // fully into memory (up to --max-structured-size) so the scanner can
+    // operate on a contiguous buffer.  The streaming scanner path below
+    // handles everything else and files that exceed the size limit.
+    if structured_ext && !cli.force_text {
         let file_meta =
             fs::metadata(input).map_err(|e| format!("failed to stat {}: {e}", input.display()))?;
         let file_size = file_meta.len();
@@ -1798,16 +2394,32 @@ fn process_plain_file(
             // without a redundant re-scan of the input.
             let store_len_before = store.len();
 
+            // Snapshot existing store keys so we can diff after structured
+            // processing to find the literals discovered by this file.
+            let store_snapshot = store.snapshot_keys();
+
             let label = format!("Processing structured {}", input.display());
             return with_progress_scope(progress, &label, |_| {
                 let structured_result =
-                    try_structured_processing(&input_bytes, &filename, registry, store);
+                    try_structured_processing(&input_bytes, &filename, registry, store, profiles);
 
-                let (output_bytes, method, was_structured, fallback_stats) = match structured_result
+                let (output_bytes, method, _was_structured, fallback_stats) = match structured_result
                 {
-                    Some(Ok(bytes)) => {
+                    Some(Ok(_structured_bytes)) => {
+                        // Format-preserving double-pass:
+                        //   1. Structured processing already populated the store with
+                        //      field-value mappings — its re-serialized output is discarded.
+                        //   2. We diff the store against the pre-pass snapshot to find the
+                        //      literals this file contributed.
+                        //   3. A per-file scanner (base patterns + new literals) scans the
+                        //      *original* bytes, preserving comments, indentation, and key order.
                         let ext = filename.rsplit('.').next().unwrap_or("unknown");
-                        (bytes, format!("structured:{ext}"), true, None)
+                        let per_file_scanner =
+                            build_format_preserving_scanner(scanner, store, &store_snapshot)
+                                .map_err(|e| format!("failed to build per-file scanner: {e}"))?;
+                        let (scanned_bytes, scan_stats) =
+                            scanner_fallback(&per_file_scanner, &input_bytes)?;
+                        (scanned_bytes, format!("structured+scan:{ext}"), true, Some(scan_stats))
                     }
                     Some(Err(e)) => {
                         if cli.strict {
@@ -1824,13 +2436,12 @@ fn process_plain_file(
                 };
 
                 if cli.dry_run || report_builder.is_some() || cli.fail_on_match {
-                    let replacements = if was_structured {
-                        store.len().saturating_sub(store_len_before) as u64
-                    } else {
-                        fallback_stats
-                            .as_ref()
-                            .map_or(0, |s| s.replacements_applied)
-                    };
+                    // In both structured and scanner paths the final output comes from
+                    // a streaming scan pass, so replacements_applied is accurate.
+                    let _ = store_len_before; // no longer used for counting
+                    let replacements = fallback_stats
+                        .as_ref()
+                        .map_or(0, |s| s.replacements_applied);
 
                     if replacements > 0 {
                         had_matches = true;
@@ -1881,14 +2492,7 @@ fn process_plain_file(
                     reader,
                     io::sink(),
                     Some(file_size(input)?),
-                    move |scan_progress| {
-                        if let Some(reporter) = &progress_for_scan {
-                            reporter
-                                .lock()
-                                .unwrap()
-                                .update_scan(&progress_label, scan_progress);
-                        }
-                    },
+                    make_scan_callback(progress_for_scan, &progress_label),
                 )
                 .map_err(|e| format!("scan error: {e}"))?;
             if stats.matches_found > 0 {
@@ -1926,14 +2530,7 @@ fn process_plain_file(
                     reader,
                     &mut atomic_writer,
                     Some(file_size(input)?),
-                    move |scan_progress| {
-                        if let Some(reporter) = &progress_for_scan {
-                            reporter
-                                .lock()
-                                .unwrap()
-                                .update_scan(&progress_label, scan_progress);
-                        }
-                    },
+                    make_scan_callback(progress_for_scan, &progress_label),
                 )
                 .map_err(|e| format!("scanner error: {e}"))?;
 
@@ -1973,14 +2570,7 @@ fn process_plain_file(
                     reader,
                     writer,
                     Some(file_size(input)?),
-                    move |scan_progress| {
-                        if let Some(reporter) = &progress_for_scan {
-                            reporter
-                                .lock()
-                                .unwrap()
-                                .update_scan(&progress_label, scan_progress);
-                        }
-                    },
+                    make_scan_callback(progress_for_scan, &progress_label),
                 )
                 .map_err(|e| format!("scanner error: {e}"))?;
             if stats.matches_found > 0 {
@@ -1998,39 +2588,163 @@ fn process_plain_file(
     }
 }
 
-/// Attempt structured processing for a file based on its extension.
+/// Persist values discovered by structured scanning into a YAML secrets file.
+///
+/// Called at the end of a deterministic run so that the literal values found
+/// by profile-based processors are available to future runs' streaming scanner.
+///
+/// - If `path` already exists: parse its entries, merge, deduplicate, rewrite.
+/// - If `path` does not exist: create it with the discovered entries.
+/// - Values shorter than 4 bytes are skipped (too short → high false-positive risk).
+/// - Entries whose `pattern` already appears in the file are skipped.
+fn save_discovered_secrets(
+    store: &Arc<MappingStore>,
+    path: &Path,
+) -> std::result::Result<usize, String> {
+    // Collect discovered (original, category) pairs from the store.
+    let mut new_entries: Vec<SecretEntry> = store
+        .iter()
+        .filter(|(_, original, _)| original.len() >= 4)
+        .map(|(category, original, _)| SecretEntry {
+            pattern: original.to_string(),
+            kind: "literal".into(),
+            category: category.to_string(),
+            label: Some("discovered".into()),
+        })
+        .collect();
+
+    if new_entries.is_empty() {
+        return Ok(0);
+    }
+
+    // Load existing entries to deduplicate against.
+    let existing: Vec<SecretEntry> = if path.exists() {
+        let raw = fs::read(path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        let text = std::str::from_utf8(&raw)
+            .map_err(|_| format!("{} is not valid UTF-8", path.display()))?;
+        serde_yaml_ng::from_str::<Vec<SecretEntry>>(text)
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    let existing_patterns: std::collections::HashSet<&str> =
+        existing.iter().map(|e| e.pattern.as_str()).collect();
+
+    new_entries.retain(|e| !existing_patterns.contains(e.pattern.as_str()));
+    let added = new_entries.len();
+
+    if added == 0 {
+        return Ok(0);
+    }
+
+    // Merge and serialize.
+    let mut all_entries: Vec<&SecretEntry> = existing.iter().collect();
+    all_entries.extend(new_entries.iter());
+
+    let yaml = serde_yaml_ng::to_string(&all_entries)
+        .map_err(|e| format!("failed to serialize discovered secrets: {e}"))?;
+
+    atomic_write(path, yaml.as_bytes())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+
+    Ok(added)
+}
+
+/// Load file-type profiles from a JSON or YAML file.
+///
+/// The file must deserialize to `Vec<FileTypeProfile>`. Format is detected
+/// from the file extension; unknown extensions are tried as JSON then YAML.
+fn load_profiles(
+    path: &Path,
+) -> Result<Vec<sanitize_engine::processor::FileTypeProfile>, String> {
+    let raw = fs::read(path)
+        .map_err(|e| format!("failed to read profile '{}': {e}", path.display()))?;
+    let text = std::str::from_utf8(&raw)
+        .map_err(|_| format!("profile '{}' is not valid UTF-8", path.display()))?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let profiles: Vec<sanitize_engine::processor::FileTypeProfile> = match ext {
+        "json" => serde_json::from_str(text)
+            .map_err(|e| format!("profile '{}': invalid JSON: {e}", path.display())),
+        "yaml" | "yml" => serde_yaml_ng::from_str(text)
+            .map_err(|e| format!("profile '{}': invalid YAML: {e}", path.display())),
+        _ => serde_json::from_str(text).or_else(|_| serde_yaml_ng::from_str(text)).map_err(
+            |e| format!("profile '{}': could not parse as JSON or YAML: {e}", path.display()),
+        ),
+    }?;
+
+    // Validate include/exclude globs eagerly so bad patterns are caught at startup.
+    for (i, p) in profiles.iter().enumerate() {
+        for pat in p.include.iter().chain(p.exclude.iter()) {
+            glob::Pattern::new(pat).map_err(|e| {
+                format!("profile '{}' entry {i}: invalid glob '{pat}': {e}", path.display())
+            })?;
+        }
+    }
+
+    Ok(profiles)
+}
+
+/// Attempt structured processing for a file using the provided profiles.
+///
+/// Finds the first profile whose extensions match `filename` and runs the
+/// corresponding structured processor. Returns `None` when no profile
+/// matches, falling through to the streaming scanner.
+///
+/// When `--profile` is not supplied `profiles` is empty and this always
+/// returns `None`, routing every file through the scanner (value-based
+/// replacement that preserves all formatting).
 fn try_structured_processing(
     content: &[u8],
     filename: &str,
     registry: &Arc<ProcessorRegistry>,
     store: &Arc<MappingStore>,
+    profiles: &[sanitize_engine::processor::FileTypeProfile],
 ) -> Option<Result<Vec<u8>, String>> {
-    use sanitize_engine::processor::profile::FileTypeProfile;
-    use sanitize_engine::processor::FieldRule;
-
-    let ext = filename.rsplit('.').next().unwrap_or("");
-    let processor_name = match ext {
-        "json" => "json",
-        "yaml" | "yml" => "yaml",
-        "xml" => "xml",
-        "csv" | "tsv" => "csv",
-        "rb" | "conf" | "cfg" | "ini" | "env" | "properties" => "key_value",
-        _ => return None,
-    };
-
-    let profile =
-        FileTypeProfile::new(processor_name, vec![FieldRule::new("*")]).with_extension(ext);
-
-    match registry.process(content, &profile, store) {
+    let profile = profiles.iter().find(|p| p.matches_filename(filename))?;
+    match registry.process(content, profile, store) {
         Ok(Some(result)) => Some(Ok(result)),
         Ok(None) => None,
         Err(e) => Some(Err(e.to_string())),
     }
 }
 
+/// Build a per-file scanner for the format-preserving structured pass.
+///
+/// Diffs the store against `before_snapshot` to find literals discovered by
+/// the most recent structured processor call, compiles each into a
+/// `ScanPattern::from_literal`, then extends `base_scanner` with those patterns.
+///
+/// Values shorter than 4 bytes are skipped to keep false-positive risk low.
+fn build_format_preserving_scanner(
+    base_scanner: &Arc<StreamScanner>,
+    store: &Arc<MappingStore>,
+    before_snapshot: &std::collections::HashSet<(sanitize_engine::category::Category, String)>,
+) -> Result<StreamScanner, sanitize_engine::error::SanitizeError> {
+    let extra: Vec<ScanPattern> = store
+        .iter()
+        .filter(|(cat, orig, _)| {
+            orig.len() >= 4 && !before_snapshot.contains(&(cat.clone(), orig.to_string()))
+        })
+        .filter_map(|(category, original, _)| {
+            let s = original.to_string();
+            match ScanPattern::from_literal(&s, category, format!("field:{s}")) {
+                Ok(pat) => Some(pat),
+                Err(e) => {
+                    warn!(value = %s, error = %e, "could not compile field literal pattern");
+                    None
+                }
+            }
+        })
+        .collect();
+
+    base_scanner.with_extra_literals(extra)
+}
+
 /// Fall back to the streaming scanner for raw bytes.
 fn scanner_fallback(
-    scanner: &Arc<StreamScanner>,
+    scanner: &StreamScanner,
     input: &[u8],
 ) -> Result<(Vec<u8>, ScanStats), String> {
     let (output, stats) = scanner
@@ -2109,9 +2823,10 @@ fn process_archive(
             Arc::clone(deps.registry),
             Arc::clone(deps.scanner),
             Arc::clone(deps.store),
-            vec![],
+            deps.profiles.to_vec(),
         )
         .with_max_depth(cli.max_archive_depth)
+        .with_force_text(cli.force_text)
         .with_filter(filter);
 
         // When the outer file-level loop is already running in parallel,
@@ -2469,6 +3184,7 @@ fn run() -> Result<(), (String, i32)> {
         Some(SubCommand::Encrypt(args)) => return run_encrypt(args),
         Some(SubCommand::Decrypt(args)) => return run_decrypt(args),
         Some(SubCommand::Guided) => return run_guided(),
+        Some(SubCommand::Template(args)) => return run_template(args),
         None => {} // fall through to default sanitize mode
     }
 
@@ -2518,7 +3234,7 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
         "starting sanitization"
     );
 
-    let effective_password: Option<Zeroizing<String>> = if cli.encrypted_secrets {
+    let effective_password: Option<Zeroizing<String>> = if cli.encrypted_secrets || cli.deterministic {
         if let Some(pw) = pre_resolved_password {
             Some(pw)
         } else {
@@ -2535,30 +3251,59 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
         .map_err(|e| (e, 1))?;
     let registry = Arc::new(ProcessorRegistry::with_builtins());
 
-    // --- load secrets and build scanner -------------------------------------
-    let scanner = if let Some(ref secrets_path) = cli.secrets_file {
-        let raw_bytes = fs::read(secrets_path).map_err(|e| {
-            (
-                format!(
-                    "failed to read secrets file {}: {e}",
-                    secrets_path.display()
-                ),
-                1,
-            )
-        })?;
+    // --- load field-path profiles (--profile) --------------------------------
+    let profiles: Vec<sanitize_engine::processor::FileTypeProfile> =
+        if let Some(ref profile_path) = cli.profile {
+            load_profiles(profile_path).map_err(|e| (e, 1))?
+        } else {
+            vec![]
+        };
 
+    if !profiles.is_empty() {
+        info!(count = profiles.len(), "loaded field-path profiles");
+    }
+
+    // --- load secrets and build scanner -------------------------------------
+    // Keep raw_bytes in scope so Phase 2 can re-parse and build an augmented
+    // scanner that includes literals discovered during the profile pass (Phase 1).
+    let secrets_raw_bytes: Option<Vec<u8>> = if let Some(ref secrets_path) = cli.secrets_file {
+        if secrets_path.exists() {
+            Some(fs::read(secrets_path).map_err(|e| {
+                (
+                    format!(
+                        "failed to read secrets file {}: {e}",
+                        secrets_path.display()
+                    ),
+                    1,
+                )
+            })?)
+        } else if cli.deterministic {
+            // File doesn't exist yet — will be created after processing.
+            None
+        } else {
+            return Err((
+                format!("secrets file not found: {}", secrets_path.display()),
+                1,
+            ));
+        }
+    } else {
+        None
+    };
+
+    let scanner = if let Some(ref raw_bytes) = secrets_raw_bytes {
         let ((patterns, warnings), was_encrypted) = sanitize_engine::secrets::load_secrets_auto(
-            &raw_bytes,
+            raw_bytes,
             effective_password.as_ref().map(|s| s.as_str()),
             None,
             !cli.encrypted_secrets,
         )
         .map_err(|e| (format!("failed to load secrets: {e}"), 1))?;
 
+        let secrets_display = cli.secrets_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
         if was_encrypted {
-            info!(secrets_file = %secrets_path.display(), "loaded encrypted secrets");
+            info!(secrets_file = %secrets_display, "loaded encrypted secrets");
         } else {
-            info!(secrets_file = %secrets_path.display(), "loaded plaintext secrets (unencrypted)");
+            info!(secrets_file = %secrets_display, "loaded plaintext secrets (unencrypted)");
         }
 
         if !warnings.is_empty() {
@@ -2576,19 +3321,20 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
             }
         }
 
-        let scanner = StreamScanner::new(patterns, Arc::clone(&store), scan_config)
+        let scanner = StreamScanner::new(patterns, Arc::clone(&store), scan_config.clone())
             .map_err(|e| (format!("failed to create scanner: {e}"), 1))?;
 
+        let secrets_display = cli.secrets_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
         info!(
             patterns = scanner.pattern_count(),
-            secrets_file = %secrets_path.display(),
+            secrets_file = %secrets_display,
             "patterns loaded"
         );
         Arc::new(scanner)
     } else {
         warn!("no --secrets-file provided; only structured processing will apply");
         Arc::new(
-            StreamScanner::new(vec![], Arc::clone(&store), scan_config)
+            StreamScanner::new(vec![], Arc::clone(&store), scan_config.clone())
                 .map_err(|e| (format!("failed to create scanner: {e}"), 1))?,
         )
     };
@@ -2643,6 +3389,7 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
             &scanner,
             &registry,
             &store,
+            &profiles,
             report_builder.as_ref(),
             progress_reporter.as_ref(),
         )
@@ -2650,11 +3397,94 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
         had_matches |= result;
     }
 
-    // Process file targets in parallel when multiple are present.
+    // --- two-phase file processing ------------------------------------------
+    //
+    // Phase 1: process profile-matched plain files serially so that every
+    //   value replaced via field-path rules is recorded in `store`.
+    //
+    // Phase 2: build an augmented scanner that includes those discovered
+    //   literals (on top of any secrets-file patterns), then process all
+    //   remaining files (archives + non-profile plain files) with it.
+    //   Archives are always Phase 2 because we can't pre-partition their
+    //   entries before reading them.
+    let (phase1_targets, phase2_targets): (Vec<_>, Vec<_>) = if profiles.is_empty() {
+        // No profiles → skip Phase 1 entirely.
+        (vec![], file_targets)
+    } else {
+        file_targets.into_iter().partition(|t| {
+            let InputTarget::File { ref input, .. } = t else { return false; };
+            let name = input.to_string_lossy();
+            ArchiveFormat::from_path(&name).is_none()
+                && profiles.iter().any(|p| p.matches_filename(&name))
+        })
+    };
+
+    // Phase 1 — serial, profile-matched plain files.
+    for target in phase1_targets {
+        if is_interrupted() {
+            break;
+        }
+        let InputTarget::File { input, output } = target else { unreachable!() };
+        let result = process_plain_file(
+            &input,
+            &cli,
+            Some(output.as_path()),
+            &scanner,
+            &registry,
+            &store,
+            &profiles,
+            report_builder.as_ref(),
+            progress_reporter.as_ref(),
+        )
+        .map_err(|e| (e, 1))?;
+        had_matches |= result;
+    }
+
+    // Archive discovery pre-pass: for any archive in Phase 2 that has
+    // profile-matched entries, run the structured processor on those entries
+    // (discarding output) so their replaced values are recorded in the store.
+    // This is a second read of the archive file — correctness over speed.
+    if !profiles.is_empty() {
+        let discovery = ArchiveProcessor::new(
+            Arc::clone(&registry),
+            Arc::clone(&scanner), // scanner unused in discovery — just satisfies the API
+            Arc::clone(&store),
+            profiles.to_vec(),
+        );
+        for target in &phase2_targets {
+            if is_interrupted() {
+                break;
+            }
+            let InputTarget::File { ref input, .. } = target else { continue };
+            let input_str = input.to_string_lossy();
+            let Some(fmt) = ArchiveFormat::from_path(&input_str) else { continue };
+            let file = fs::File::open(input).map_err(|e| {
+                (format!("failed to open {} for profile discovery: {e}", input.display()), 1)
+            })?;
+            match fmt {
+                ArchiveFormat::Tar => discovery.discover_profiles_tar(file),
+                ArchiveFormat::TarGz => discovery.discover_profiles_tar_gz(file),
+                ArchiveFormat::Zip => discovery.discover_profiles_zip(file),
+            }
+            .map_err(|e| (format!("profile discovery failed for {}: {e}", input.display()), 1))?;
+        }
+    }
+
+    // Build augmented scanner: base secrets patterns + literals discovered in
+    // Phase 1 (plain files) and the archive discovery pre-pass above.
+    let augmented_scanner = build_augmented_scanner(
+        secrets_raw_bytes.as_deref(),
+        effective_password.as_ref().map(|s| s.as_str()),
+        !cli.encrypted_secrets,
+        &store,
+        scan_config,
+    )?;
+
+    // Phase 2 — parallel when multiple targets, serial otherwise.
     // Each worker gets Arc clones — all inner state is Send + Sync.
     // Results are collected and folded after all workers finish.
-    let file_results: Vec<Result<bool, (String, i32)>> = if file_targets.len() > 1 {
-        file_targets
+    let file_results: Vec<Result<bool, (String, i32)>> = if phase2_targets.len() > 1 {
+        phase2_targets
             .into_par_iter()
             .map(|target| {
                 if is_interrupted() {
@@ -2671,9 +3501,10 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
                         &cli,
                         &output,
                         ArchiveDeps {
-                            scanner: &scanner,
+                            scanner: &augmented_scanner,
                             registry: &registry,
                             store: &store,
+                            profiles: &profiles,
                         },
                         fmt,
                         filter,
@@ -2689,9 +3520,10 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
                         &input,
                         &cli,
                         Some(output.as_path()),
-                        &scanner,
+                        &augmented_scanner,
                         &registry,
                         &store,
+                        &profiles,
                         report_builder.as_ref(),
                         progress_reporter.as_ref(),
                     )
@@ -2700,8 +3532,8 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
             })
             .collect()
     } else {
-        // Single file target — run on the current thread (no rayon overhead).
-        file_targets
+        // Single Phase 2 target — run on the current thread (no rayon overhead).
+        phase2_targets
             .into_iter()
             .map(|target| {
                 let InputTarget::File { input, output } = target else {
@@ -2715,9 +3547,10 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
                         &cli,
                         &output,
                         ArchiveDeps {
-                            scanner: &scanner,
+                            scanner: &augmented_scanner,
                             registry: &registry,
                             store: &store,
+                            profiles: &profiles,
                         },
                         fmt,
                         filter,
@@ -2732,9 +3565,10 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
                         &input,
                         &cli,
                         Some(output.as_path()),
-                        &scanner,
+                        &augmented_scanner,
                         &registry,
                         &store,
+                        &profiles,
                         report_builder.as_ref(),
                         progress_reporter.as_ref(),
                     )
@@ -2752,6 +3586,24 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
     // --- check for interruption ---------------------------------------------
     if is_interrupted() {
         return Err(("interrupted by signal".into(), 130));
+    }
+
+    // --- persist discovered secrets (deterministic mode + profile) ----------
+    // When running deterministically with a profile, save the literal values
+    // found by structured scanning so future runs' scanner can match them.
+    if cli.deterministic && !profiles.is_empty() {
+        let save_path = cli.secrets_file.clone().unwrap_or_else(|| {
+            PathBuf::from("sanitize-discovered.yaml")
+        });
+        match save_discovered_secrets(&store, &save_path) {
+            Ok(0) => {}
+            Ok(n) => info!(
+                path = %save_path.display(),
+                added = n,
+                "saved discovered literals to secrets file"
+            ),
+            Err(e) => warn!("could not save discovered secrets: {e}"),
+        }
     }
 
     // --- write report -------------------------------------------------------

@@ -1,43 +1,191 @@
 # Structured Processing
 
-Structured processors parse a file's format (JSON, YAML, XML, CSV, key-value), walk its data structure, and replace only the values at field paths you specify — leaving keys, comments, formatting, and unmatched values untouched. This contrasts with the streaming scanner, which treats the file as raw bytes and replaces pattern matches wherever they appear.
+Structured processors parse a file's format (JSON, YAML, XML, CSV, key-value), walk its data structure, and replace only the values at field paths you specify — leaving keys, comments, formatting, and unmatched values untouched.
 
-## How the CLI Uses Structured Processing
+The streaming scanner treats files as raw bytes and replaces pattern matches wherever they appear. Structured processing is complementary: it targets *specific fields by name*, which reduces false positives and avoids touching unrelated values.
 
-The CLI **automatically detects** structured files by extension (`.json`, `.yaml`, `.yml`, `.xml`) and applies a **wildcard profile** that matches all fields (`*`). This means every string value in a detected structured file is routed through the replacement engine.
+---
 
-> **Note:** CSV/TSV and key-value formats are **not** auto-detected by file extension like JSON, YAML, and XML. However, they **are** supported through the CLI via the `--format` / `-f` flag (e.g. `-f csv`, `-f key-value`). For programmatic use, create a `FileTypeProfile` with `processor` set to `"csv"` or `"key_value"`.
+## Quick Start with `--profile`
 
-There is currently no `--profile` CLI flag to supply a custom profile with targeted field rules. To use field-specific profiles (e.g. replace only `password` fields), use the library API directly.
+Write a profile file describing which fields to sanitize, then pass it with `--profile`:
 
-## File-Type Profiles
+```yaml
+# profile.yaml
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  fields:
+    - pattern: "*.password"
+      category: "custom:password"
+    - pattern: "*.username"
+      category: email
 
-A `FileTypeProfile` tells the engine which processor to use, which file extensions to match, and which fields to sanitize.
+- processor: json
+  extensions: [".json"]
+  fields:
+    - pattern: "*.password"
+      category: "custom:password"
+    - pattern: "*.email"
+      category: email
+```
+
+```bash
+sanitize config.yaml -s secrets.yaml --profile profile.yaml
+```
+
+Input:
+```yaml
+# Production database config
+database:
+  host: db.corp.com        # primary host
+  username: alice@corp.com
+  password: hunter2        # rotated monthly
+  port: 5432
+```
+
+Output:
+```yaml
+# Production database config
+database:
+  host: db.corp.com        # primary host
+  username: ab12@corp.com
+  password: f3c9a1b8       # rotated monthly
+  port: 5432
+```
+
+Comments, indentation, blank lines, and unmatched fields are preserved exactly. Only the values at matched field paths change.
+
+---
+
+## How the Two-Pass Pipeline Works
+
+When `--profile` is supplied, every input goes through two passes:
+
+```
+Phase 1 — structured files (serial)
+  ┌─────────────────────────────────────────────────────────────┐
+  │  For each file matched by a profile:                         │
+  │    1. Run structured processor → populate MappingStore       │
+  │    2. Build a per-file scanner: base patterns + discovered   │
+  │       literals from this file                                │
+  │    3. Scan the ORIGINAL bytes with the per-file scanner      │
+  │       (format is preserved exactly)                          │
+  └─────────────────────────────────────────────────────────────┘
+                          ↓
+  Build augmented scanner: base patterns + ALL discovered literals
+
+Phase 2 — everything else (parallel)
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Plain text files, archives, and any file not matched by a  │
+  │  profile are scanned with the augmented scanner.            │
+  │  Values discovered in Phase 1 are found verbatim here too.  │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+**Cross-file propagation:** if Phase 1 finds `hunter2` as a password in `config.yaml`, the augmented scanner used in Phase 2 automatically replaces that same string in `app.log`, `backup.tar.gz`, or any other file — with the same replacement value.
+
+```bash
+# config.yaml has password: hunter2
+# app.log contains "auth failed for hunter2"
+sanitize config.yaml app.log --profile profile.yaml -s secrets.yaml
+
+# Both files get the same replacement for "hunter2"
+```
+
+---
+
+## Format Preservation
+
+The structured pass operates on the **original bytes** of the file, not a re-serialized copy. This means:
+
+- Comments are preserved
+- Indentation style is preserved
+- Key ordering is preserved
+- Quoting style is preserved
+- Blank lines are preserved
+
+```yaml
+# Before
+server:
+  host: "prod.example.com"  # primary
+  port: 8080
+  api_key: "sk-abc123"      # rotated weekly
+
+# After (profile targets *.api_key)
+server:
+  host: "prod.example.com"  # primary
+  port: 8080
+  api_key: "sk-xyz789"      # rotated weekly
+```
+
+The streaming scanner then runs on that output to catch any remaining patterns from the secrets file — also byte-level, so formatting is maintained end-to-end.
+
+---
+
+## Profile File Format
+
+A profile file is a YAML or JSON array of profile entries. Each entry selects a processor, one or more file extensions, optional include/exclude globs, and a list of field rules.
+
+```yaml
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  include: []       # optional: restrict to filenames matching these globs
+  exclude: []       # optional: skip filenames matching these globs
+  fields:
+    - pattern: "*.password"
+      category: "custom:password"
+    - pattern: "database.host"
+      category: hostname
+  options: {}       # processor-specific options
+```
+
+### Profile Fields
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `processor` | Yes | — | Processor name: `"key_value"`, `"json"`, `"yaml"`, `"xml"`, or `"csv"`. |
-| `extensions` | No | `[]` | File extensions this profile applies to (e.g. `[".rb", ".conf"]`). Used for filename-based matching. |
+| `processor` | Yes | — | Processor name: `"json"`, `"yaml"`, `"xml"`, `"csv"`, `"key_value"`, `"toml"`, `"env"`, `"ini"`, `"log"`. |
+| `extensions` | Yes | `[]` | File extensions this profile applies to (e.g. `[".json"]`). An empty list matches nothing. |
+| `include` | No | `[]` | If non-empty, only files whose name matches at least one glob are processed. |
+| `exclude` | No | `[]` | Files whose name matches any glob are excluded from structured processing. |
 | `fields` | Yes | — | Array of field rules specifying which keys/paths to sanitize. |
-| `options` | No | `{}` | Free-form key-value map of processor-specific options. |
+| `options` | No | `{}` | Processor-specific options (e.g. delimiter, comment characters). |
 
-Example profile (JSON):
+### Include / Exclude Globs
 
-```json
-{
-  "processor": "key_value",
-  "extensions": [".rb", ".conf"],
-  "fields": [
-    { "pattern": "*.password", "category": "custom:password" },
-    { "pattern": "*.secret",   "category": "custom:secret" },
-    { "pattern": "smtp_address", "category": "hostname" }
-  ],
-  "options": {
-    "delimiter": "=",
-    "comment_prefix": "#"
-  }
-}
+Use `include` and `exclude` when you have multiple files with the same extension that need different treatment — for example, JSON config files and JSON log files:
+
+```yaml
+- processor: json
+  extensions: [".json"]
+  include: ["config*.json", "settings*.json"]   # only these
+  fields:
+    - pattern: "*.password"
+      category: "custom:password"
+
+- processor: json
+  extensions: [".json"]
+  exclude: ["config*.json", "settings*.json"]   # everything else
+  fields:
+    - pattern: "*"
+      category: "custom:field"
 ```
+
+**Pattern matching rules:**
+
+- Patterns without a path separator are matched against both the filename and the full path.
+- `*` matches any characters within a single path component.
+- `**` matches across path separators.
+- A file must match at least one `include` pattern (if any are set), and must not match any `exclude` pattern.
+
+```yaml
+# Only process files named config.json or config-prod.json:
+include: ["config*.json"]
+
+# Skip log-formatted JSON regardless of name:
+exclude: ["*.log.json", "logs/**"]
+```
+
+---
 
 ## Field Rules
 
@@ -46,102 +194,216 @@ Each field rule specifies a key pattern to match and an optional category and la
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `pattern` | Yes | — | Key pattern to match (see pattern syntax below). |
-| `category` | No | `"custom:field"` | Category for replacement generation. Accepts any built-in category (`email`, `hostname`, `ipv4`, etc.) or `custom:<tag>`. |
+| `category` | No | `"custom:field"` | Category for replacement generation. Accepts any built-in category or `custom:<tag>`. |
 | `label` | No | — | Human-readable label for reporting. |
 
 ### Pattern Syntax
 
-| Pattern | Matches | Example |
-|---------|---------|---------|
-| `"password"` | Exact key `password` | `password = "s3cret"` |
-| `"database.password"` | Exact dotted path `database.password` | `{"database": {"password": "..."}}` |
-| `"*.password"` | Any key ending in `.password`, or the key `password` itself | `db.password`, `smtp.password`, `password` |
-| `"db.*"` | Any key starting with `db.` | `db.host`, `db.password`, `db.port` |
-| `"*"` | Every field | Matches all keys |
+| Pattern | Matches |
+|---------|---------|
+| `"password"` | Exact key `password` at any depth |
+| `"database.password"` | Exact dotted path `database.password` |
+| `"*.password"` | Any key ending in `.password`, or `password` itself |
+| `"db.*"` | Any key starting with `db.` |
+| `"*"` | Every field |
 
-Patterns are matched against the full key path. For nested structures, the path is built by joining keys with `.` (JSON/YAML), `/` (XML), or the literal key string (key-value files).
+Patterns are matched against the full dot-separated key path (JSON/YAML), slash-separated path (XML), or literal key string (key-value files).
 
-## Processor-Specific Options
+---
 
-Each processor accepts options via the profile's `options` map.
+## Processor Reference
 
-### Key-Value Processor (`"key_value"`)
+### YAML (`"yaml"`)
 
-Handles line-oriented `key = value` configuration files. Preserves blank lines, comments, indentation, and quoting style (single, double, or unquoted).
+Parses YAML, walks the value tree with dot-separated paths. Arrays are traversed transparently — a rule for `users.email` matches `email` inside every object in the `users` array.
+
+```yaml
+# profile entry
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  fields:
+    - pattern: "*.password"
+      category: "custom:password"
+    - pattern: "*.email"
+      category: email
+    - pattern: "server.host"
+      category: hostname
+```
+
+```yaml
+# input
+server:
+  host: db.corp.com
+  port: 5432
+  credentials:
+    password: hunter2
+
+users:
+  - email: alice@corp.com
+  - email: bob@corp.com
+```
+
+```yaml
+# output (original formatting preserved)
+server:
+  host: ab12345678  # hostname replacement
+  port: 5432
+  credentials:
+    password: f3c9a1b8
+
+users:
+  - email: cd34@corp.com
+  - email: ef56@corp.com
+```
+
+### JSON (`"json"`)
+
+Same dot-separated path convention and array traversal as YAML.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `compact` | `"false"` | Set to `"true"` for compact (single-line) output. |
+
+```yaml
+- processor: json
+  extensions: [".json"]
+  fields:
+    - pattern: "*.password"
+      category: "custom:password"
+    - pattern: "*.email"
+      category: email
+  options:
+    compact: "true"
+```
+
+### Key-Value (`"key_value"`)
+
+Handles line-oriented `key = value` configuration files. Preserves blank lines, comments, indentation, and quoting style.
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `delimiter` | `"="` | The key-value separator string. |
-| `comment_prefix` | `"#"` | Lines starting with this prefix (after whitespace) are treated as comments and preserved as-is. |
+| `comment_prefix` | `"#"` | Lines starting with this prefix are preserved as-is. |
 
-**Key path convention:** The key is the literal text to the left of the delimiter (trimmed). For files like `gitlab_rails['smtp_password'] = "value"`, the field rule pattern is the full key string: `gitlab_rails['smtp_password']`.
+```yaml
+- processor: key_value
+  extensions: [".conf", ".env"]
+  fields:
+    - pattern: "DB_PASSWORD"
+      category: "custom:password"
+    - pattern: "SMTP_USER"
+      category: email
+  options:
+    delimiter: "="
+    comment_prefix: "#"
+```
 
-### JSON Processor (`"json"`)
+```
+# database settings
+DB_HOST=db.corp.com
+DB_PASSWORD=hunter2   →   DB_PASSWORD=f3c9a1b8
+SMTP_USER=ops@corp.com →  SMTP_USER=ab12@corp.com
+```
 
-Parses JSON, walks the value tree, and replaces matched string values. Arrays are traversed transparently — a rule for `users.email` matches `email` inside every object in the `users` array.
+**Key path convention:** the full text to the left of the delimiter (trimmed). For files like `gitlab_rails['smtp_password'] = "value"`, the pattern is the full key string: `gitlab_rails['smtp_password']`.
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `compact` | `"false"` | Set to `"true"` for compact (single-line) JSON output. Otherwise outputs pretty-printed JSON. |
+### XML (`"xml"`)
 
-**Key path convention:** Dot-separated paths: `database.password`, `smtp.credentials.user`. Numbers and booleans matched by a field rule are converted to strings after replacement.
+Streaming XML parser. Preserves document structure, attributes, and non-matched content.
 
-### YAML Processor (`"yaml"`)
+**Path convention:** slash-separated element paths (`database/password`). Attributes use `element/@attr` syntax.
 
-Parses YAML, walks the value tree with the same dot-separated key paths and array traversal as JSON. Minor formatting differences from the original are possible (serde_yaml normalizes some whitespace).
+```yaml
+- processor: xml
+  extensions: [".xml"]
+  fields:
+    - pattern: "config/database/password"
+      category: "custom:password"
+    - pattern: "config/smtp/@host"
+      category: hostname
+```
 
-No processor-specific options.
+### CSV (`"csv"`)
 
-**Key path convention:** Same as JSON — dot-separated paths: `database.password`.
-
-### XML Processor (`"xml"`)
-
-Uses streaming XML parsing to rewrite documents. Preserves document structure, attributes, and non-matched content.
-
-No processor-specific options.
-
-**Key path convention:** Slash-separated element paths: `database/password`. Attributes use the `element/@attr` syntax: `connection/@host`.
-
-### CSV Processor (`"csv"`)
-
-Parses CSV/TSV, replaces values in specified columns by header name, and writes back preserving the delimiter.
+Replaces values in specified columns by header name. Preserves the delimiter and row structure.
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `delimiter` | `","` | Field delimiter (single ASCII character). Use `"\t"` for TSV. |
-| `has_header` | `"true"` | Whether the first row is a header row. When `"true"`, field rules match by header column name. When `"false"`, field rules match by column index as a string (`"0"`, `"1"`, etc.). |
+| `has_header` | `"true"` | When `"true"`, match by header name. When `"false"`, match by column index string (`"0"`, `"1"`, …). |
 
-**Key path convention:** Header column names (e.g. `email`, `name`). Without headers, use column index strings (`"0"`, `"1"`).
+```yaml
+- processor: csv
+  extensions: [".csv"]
+  fields:
+    - pattern: "email"
+      category: email
+    - pattern: "ip_address"
+      category: ipv4
+```
 
-## Structured Processing vs Literal Secrets
+---
 
-Both approaches produce **length-preserving, one-way replacements** through the same `MappingStore` — the same input value always gets the same replacement within a run.
+## Deterministic Mode + Profile: Saving Discovered Values
 
-| | Literal Secret (StreamScanner) | Structured Processor |
+When `--deterministic` is set alongside `--profile`, values found by the structured pass are saved to the secrets file after the run. On the next run those values are loaded as patterns so the streaming scanner finds them in unstructured files too.
+
+```bash
+# First run: config.yaml is processed structurally.
+# Discovered values (e.g. "hunter2") are appended to secrets.yaml.
+SANITIZE_PASSWORD=secret sanitize config.yaml \
+  --profile profile.yaml \
+  --deterministic \
+  --secrets-file secrets.yaml
+
+# Second run against a log file: "hunter2" is now in secrets.yaml
+# so the streaming scanner replaces it in app.log with the same value.
+SANITIZE_PASSWORD=secret sanitize app.log \
+  --deterministic \
+  --secrets-file secrets.yaml
+```
+
+If `--secrets-file` points to a path that doesn't exist yet, `--deterministic` creates it automatically on the first run.
+
+The replacement value for any given input is determined solely by the password and the original string — not by the secrets file contents. This means:
+
+- Same password + same original value = same replacement, always
+- Adding new entries to the secrets file never changes existing replacements
+- Running two separate files with the same password produces consistent replacements even if they're processed in separate invocations
+
+```bash
+# Separate runs, same password → consistent replacements across both outputs
+SANITIZE_PASSWORD=secret sanitize log-one.txt --deterministic -s secrets.yaml
+SANITIZE_PASSWORD=secret sanitize log-two.txt --deterministic -s secrets.yaml
+# "hunter2" maps to the same replacement in both outputs
+```
+
+**Treat your secrets file like a schema:** version-control it and only ever append. Removing a pattern breaks coverage for that value in future runs.
+
+---
+
+## Structured vs Streaming: When to Use Which
+
+| | Structured (`--profile`) | Streaming (`--secrets-file` only) |
 |---|---|---|
-| **Targeting** | Replaces the pattern **everywhere** it appears — in values, keys, comments, logs, any byte position | Replaces only **matched field values** — keys, comments, and unmatched fields are preserved |
-| **Setup** | Add an entry to the secrets file | Define a `FileTypeProfile` with field rules (library API) |
-| **Format awareness** | None — treats input as raw bytes | Full — preserves JSON/YAML/XML/CSV/key-value structure |
-| **Performance** | Faster — O(n) streaming with no parsing overhead | Slower — requires parsing, tree walking, and serialization |
-| **Memory** | Constant — bounded by chunk size (~1 MiB) | Proportional to file size (full file loaded for parsing) |
-| **File size limit** | None (streaming) | 256 MiB default (`--max-structured-size`); larger files fall back to streaming |
-| **Best for** | Known secret values you want scrubbed everywhere (hostnames, tokens, emails) | Config files where you want to sanitize specific fields while leaving structure intact |
+| **Targeting** | Replaces only matched field values by key path | Replaces pattern matches anywhere in the file |
+| **Format** | Original formatting preserved exactly | Byte-level replacement, format preserved |
+| **Setup** | Write a profile YAML with field rules | Add entries to secrets file |
+| **False positives** | Lower — only targeted fields | Higher — any match anywhere |
+| **Discovery** | Finds values in known fields even if not in secrets file | Only finds what's in the secrets file |
+| **Best for** | Config files with known field names | Logs, arbitrary text, known secret values |
 
-**When to use which:**
+**Use both for defence in depth:**
 
-- **Use literal secrets** when you know the exact sensitive values (e.g. `test.test.co`, `sk-proj-abc123`) and want them replaced anywhere they appear, regardless of file format.
-- **Use structured processing** when you have config files with known field names (e.g. `password`, `smtp_address`) and want to sanitize those fields across many files without listing every possible value.
-- **Use both** for defence in depth: structured processing for known config formats + literal secrets to catch values that leak into unstructured files like logs.
+```bash
+# Structured pass targets known config fields.
+# Streaming scanner catches those same values in logs.
+sanitize config.yaml app.log --profile profile.yaml -s secrets.yaml
+```
 
-## Nested Archives
+---
 
-The archive processor **recursively** processes nested archives (e.g. a `.tar.gz` inside a `.zip`). All supported format combinations are handled: zip-in-tar, tar-in-zip, tar.gz-in-zip, and so on.
-
-Recursion is bounded by a configurable **maximum nesting depth** (default: 3, maximum: 10). If an archive entry at or beyond the depth limit is itself an archive, processing stops with a `RecursionDepthExceeded` error. Use the `--max-archive-depth` CLI flag to adjust this limit.
-
-Each nesting level buffers the inner archive in memory (up to 256 MiB per level). At the default depth of 3, worst-case peak memory for nested archive buffers is ~768 MiB. The shared `MappingStore` ensures dedup consistency across all nesting levels — the same secret produces the same replacement regardless of where it appears in the hierarchy.
-
-## Library API Example
+## Library API
 
 ```rust
 use sanitize_engine::category::Category;
@@ -152,11 +414,9 @@ use sanitize_engine::processor::Processor;
 use sanitize_engine::store::MappingStore;
 use std::sync::Arc;
 
-// Create the replacement store.
 let generator = Arc::new(HmacGenerator::new([42u8; 32]));
 let store = MappingStore::new(generator, None);
 
-// Define which fields to sanitize.
 let profile = FileTypeProfile::new(
     "key_value",
     vec![
@@ -166,20 +426,33 @@ let profile = FileTypeProfile::new(
             .with_category(Category::Custom("password".into())),
     ],
 )
+.with_extension(".conf")
 .with_option("delimiter", "=")
 .with_option("comment_prefix", "#");
 
-// Process a config file.
-let input = br#"# Server settings
-server_config = "test.test.co"
-server_port = 8080
-db_password = "s3cret"
-"#;
-
+let input = b"# Server settings\nserver_config = db.corp.com\nserver_port = 8080\ndb_password = hunter2\n";
 let processor = KeyValueProcessor;
 let output = processor.process(input, &profile, &store).unwrap();
-let result = String::from_utf8(output).unwrap();
-
-// server_config and db_password values are replaced;
-// server_port and comments are preserved.
+// server_config and db_password replaced; server_port and comment preserved
 ```
+
+### `FileTypeProfile` builder
+
+```rust
+let profile = FileTypeProfile::new("json", vec![
+    FieldRule::new("*.password").with_category(Category::Custom("password".into())),
+    FieldRule::new("*.email").with_category(Category::Email),
+])
+.with_extension(".json")
+.with_include("config*.json")     // only files named config*.json
+.with_exclude("*.log.json")       // skip log-formatted JSON
+.with_option("compact", "false");
+```
+
+---
+
+## Nested Archives
+
+When processing archives with `--profile`, structured matching applies to individual entries inside the archive. A YAML config file inside a `.tar.gz` is processed structurally, and values it discovers are propagated to other entries in the same archive and to other files in the same run.
+
+Recursion is bounded by `--max-archive-depth` (default: 3, max: 10).
