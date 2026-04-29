@@ -169,6 +169,8 @@ pub struct ArchiveProgress {
     pub current_entry: String,
 }
 
+type ArchiveProgressCallback = Arc<dyn Fn(&ArchiveProgress) + Send + Sync>;
+
 impl ArchiveStats {
     /// Merge statistics from a nested archive into this parent.
     fn merge(&mut self, child: &ArchiveStats) {
@@ -230,7 +232,7 @@ pub struct ArchiveProcessor {
     /// Maximum nesting depth for recursive archive processing.
     max_depth: u32,
     /// Optional callback for per-entry progress updates.
-    progress_callback: Option<Arc<dyn Fn(&ArchiveProgress) + Send + Sync>>,
+    progress_callback: Option<ArchiveProgressCallback>,
 }
 
 impl ArchiveProcessor {
@@ -271,10 +273,7 @@ impl ArchiveProcessor {
 
     /// Register a per-entry archive progress callback.
     #[must_use]
-    pub fn with_progress_callback(
-        mut self,
-        callback: Arc<dyn Fn(&ArchiveProgress) + Send + Sync>,
-    ) -> Self {
+    pub fn with_progress_callback(mut self, callback: ArchiveProgressCallback) -> Self {
         self.progress_callback = Some(callback);
         self
     }
@@ -1140,10 +1139,7 @@ mod tests {
                 updates.lock().unwrap().push(progress.clone());
             })
         });
-        let input = build_test_tar(&[
-            ("a.txt", b"alice@corp.com"),
-            ("b.txt", b"SUPERSECRET"),
-        ]);
+        let input = build_test_tar(&[("a.txt", b"alice@corp.com"), ("b.txt", b"SUPERSECRET")]);
 
         let mut output = Vec::new();
         let stats = proc.process_tar(&input[..], &mut output).unwrap();
@@ -1151,7 +1147,10 @@ mod tests {
 
         assert_eq!(updates.len(), 2);
         assert_eq!(updates.last().unwrap().entries_seen, 2);
-        assert_eq!(updates.last().unwrap().files_processed, stats.files_processed);
+        assert_eq!(
+            updates.last().unwrap().files_processed,
+            stats.files_processed
+        );
         assert_eq!(updates.last().unwrap().total_entries, None);
     }
 
@@ -1175,7 +1174,10 @@ mod tests {
         let updates = updates.lock().unwrap();
 
         assert_eq!(updates.len(), 2);
-        assert_eq!(updates.last().unwrap().files_processed, stats.files_processed);
+        assert_eq!(
+            updates.last().unwrap().files_processed,
+            stats.files_processed
+        );
         assert_eq!(updates.last().unwrap().total_entries, Some(2));
         assert_eq!(updates.last().unwrap().current_entry, "file2.log");
     }

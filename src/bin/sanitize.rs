@@ -62,13 +62,13 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use sanitize_engine::secrets::{decrypt_secrets, encrypt_secrets, parse_secrets, SecretsFormat};
 use sanitize_engine::{
-    atomic_write, ArchiveFormat, ArchiveProcessor, ArchiveProgress, AtomicFileWriter,
-    FileReport, HmacGenerator, MappingStore, ProcessorRegistry, RandomGenerator,
-    ReplacementGenerator, ReportBuilder, ReportMetadata, ScanConfig, ScanProgress, ScanStats,
-    StreamScanner, DEFAULT_MAX_ARCHIVE_DEPTH,
+    atomic_write, ArchiveFormat, ArchiveProcessor, ArchiveProgress, AtomicFileWriter, FileReport,
+    HmacGenerator, MappingStore, ProcessorRegistry, RandomGenerator, ReplacementGenerator,
+    ReportBuilder, ReportMetadata, ScanConfig, ScanProgress, ScanStats, StreamScanner,
+    DEFAULT_MAX_ARCHIVE_DEPTH,
 };
-use std::fs;
 use std::env;
+use std::fs;
 use std::io::{self, BufReader, BufWriter, Cursor, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -109,6 +109,13 @@ struct ProgressPolicy {
 }
 
 type SharedProgressReporter = Arc<Mutex<ProgressReporter>>;
+
+#[derive(Copy, Clone)]
+struct ArchiveDeps<'a> {
+    scanner: &'a Arc<StreamScanner>,
+    registry: &'a Arc<ProcessorRegistry>,
+    store: &'a Arc<MappingStore>,
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct ProgressContext {
@@ -224,7 +231,10 @@ impl ProgressReporter {
                 "entry {}/{} ({})",
                 progress.entries_seen, total, progress.current_entry
             ),
-            None => format!("entry {} ({})", progress.entries_seen, progress.current_entry),
+            None => format!(
+                "entry {} ({})",
+                progress.entries_seen, progress.current_entry
+            ),
         };
 
         if self.policy.live_updates {
@@ -253,9 +263,9 @@ impl ProgressReporter {
 
     fn should_emit(&mut self, units: u64, min_delta: u64) -> bool {
         let now = Instant::now();
-        let elapsed_ready = self
-            .last_emit
-            .map_or(true, |last_emit| now.duration_since(last_emit) >= self.interval);
+        let elapsed_ready = self.last_emit.map_or(true, |last_emit| {
+            now.duration_since(last_emit) >= self.interval
+        });
         let delta_ready = units >= self.last_units.saturating_add(min_delta);
 
         if elapsed_ready || delta_ready {
@@ -293,7 +303,11 @@ impl ProgressReporter {
 
     fn render_live_line(&mut self, line: String) {
         let padded_line = if line.len() < self.rendered_line_len {
-            format!("{}{}", line, " ".repeat(self.rendered_line_len - line.len()))
+            format!(
+                "{}{}",
+                line,
+                " ".repeat(self.rendered_line_len - line.len())
+            )
         } else {
             line
         };
@@ -1316,7 +1330,8 @@ fn process_plain_file(
                 let structured_result =
                     try_structured_processing(&input_bytes, &filename, registry, store);
 
-                let (output_bytes, method, was_structured, fallback_stats) = match structured_result {
+                let (output_bytes, method, was_structured, fallback_stats) = match structured_result
+                {
                     Some(Ok(bytes)) => {
                         let ext = filename.rsplit('.').next().unwrap_or("unknown");
                         (bytes, format!("structured:{ext}"), true, None)
@@ -1382,18 +1397,26 @@ fn process_plain_file(
     if cli.dry_run {
         let label = format!("Scanning {} (dry-run)", input.display());
         let progress_label = label.clone();
-        return with_progress_scope(progress, &label, move |progress| {
+        with_progress_scope(progress, &label, move |progress| {
             let reader = BufReader::new(
                 fs::File::open(input)
                     .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
             );
             let progress_for_scan = progress.clone();
             let stats = scanner
-                .scan_reader_with_progress(reader, io::sink(), Some(file_size(input)?), move |scan_progress| {
-                    if let Some(reporter) = &progress_for_scan {
-                        reporter.lock().unwrap().update_scan(&progress_label, scan_progress);
-                    }
-                })
+                .scan_reader_with_progress(
+                    reader,
+                    io::sink(),
+                    Some(file_size(input)?),
+                    move |scan_progress| {
+                        if let Some(reporter) = &progress_for_scan {
+                            reporter
+                                .lock()
+                                .unwrap()
+                                .update_scan(&progress_label, scan_progress);
+                        }
+                    },
+                )
                 .map_err(|e| format!("scan error: {e}"))?;
             if stats.matches_found > 0 {
                 had_matches = true;
@@ -1411,14 +1434,12 @@ fn process_plain_file(
                 "dry-run complete"
             );
             Ok(had_matches)
-        });
-    }
-
-    // Real streaming output.
-    if let Some(ref out_path) = cli.output {
+        })
+    } else if let Some(ref out_path) = cli.output {
+        // Real streaming output.
         let label = format!("Scanning {}", input.display());
         let progress_label = label.clone();
-        return with_progress_scope(progress, &label, move |progress| {
+        with_progress_scope(progress, &label, move |progress| {
             let reader = BufReader::new(
                 fs::File::open(input)
                     .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
@@ -1428,11 +1449,19 @@ fn process_plain_file(
 
             let progress_for_scan = progress.clone();
             let stats = scanner
-                .scan_reader_with_progress(reader, &mut atomic_writer, Some(file_size(input)?), move |scan_progress| {
-                    if let Some(reporter) = &progress_for_scan {
-                        reporter.lock().unwrap().update_scan(&progress_label, scan_progress);
-                    }
-                })
+                .scan_reader_with_progress(
+                    reader,
+                    &mut atomic_writer,
+                    Some(file_size(input)?),
+                    move |scan_progress| {
+                        if let Some(reporter) = &progress_for_scan {
+                            reporter
+                                .lock()
+                                .unwrap()
+                                .update_scan(&progress_label, scan_progress);
+                        }
+                    },
+                )
                 .map_err(|e| format!("scanner error: {e}"))?;
 
             if is_interrupted() {
@@ -1454,11 +1483,11 @@ fn process_plain_file(
                 ));
             }
             Ok(had_matches)
-        });
+        })
     } else {
         let label = format!("Scanning {}", input.display());
         let progress_label = label.clone();
-        return with_progress_scope(progress, &label, move |progress| {
+        with_progress_scope(progress, &label, move |progress| {
             let reader = BufReader::new(
                 fs::File::open(input)
                     .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
@@ -1467,11 +1496,19 @@ fn process_plain_file(
             let writer = BufWriter::new(stdout.lock());
             let progress_for_scan = progress.clone();
             let stats = scanner
-                .scan_reader_with_progress(reader, writer, Some(file_size(input)?), move |scan_progress| {
-                    if let Some(reporter) = &progress_for_scan {
-                        reporter.lock().unwrap().update_scan(&progress_label, scan_progress);
-                    }
-                })
+                .scan_reader_with_progress(
+                    reader,
+                    writer,
+                    Some(file_size(input)?),
+                    move |scan_progress| {
+                        if let Some(reporter) = &progress_for_scan {
+                            reporter
+                                .lock()
+                                .unwrap()
+                                .update_scan(&progress_label, scan_progress);
+                        }
+                    },
+                )
                 .map_err(|e| format!("scanner error: {e}"))?;
             if stats.matches_found > 0 {
                 had_matches = true;
@@ -1484,7 +1521,7 @@ fn process_plain_file(
                 ));
             }
             Ok(had_matches)
-        });
+        })
     }
 }
 
@@ -1533,9 +1570,7 @@ fn scanner_fallback(
 fn process_archive(
     input: &Path,
     cli: &Cli,
-    scanner: &Arc<StreamScanner>,
-    registry: &Arc<ProcessorRegistry>,
-    store: &Arc<MappingStore>,
+    deps: ArchiveDeps<'_>,
     format: ArchiveFormat,
     report_builder: Option<&ReportBuilder>,
     progress: Option<&SharedProgressReporter>,
@@ -1551,20 +1586,25 @@ fn process_archive(
             let label = label.clone();
             let progress = Arc::clone(progress);
             ArchiveProcessor::new(
-                Arc::clone(registry),
-                Arc::clone(scanner),
-                Arc::clone(store),
+                Arc::clone(deps.registry),
+                Arc::clone(deps.scanner),
+                Arc::clone(deps.store),
                 vec![],
             )
             .with_max_depth(cli.max_archive_depth)
-            .with_progress_callback(Arc::new(move |archive_progress: &ArchiveProgress| {
-                progress.lock().unwrap().update_archive(&label, archive_progress);
-            }))
+            .with_progress_callback(Arc::new(
+                move |archive_progress: &ArchiveProgress| {
+                    progress
+                        .lock()
+                        .unwrap()
+                        .update_archive(&label, archive_progress);
+                },
+            ))
         } else {
             ArchiveProcessor::new(
-                Arc::clone(registry),
-                Arc::clone(scanner),
-                Arc::clone(store),
+                Arc::clone(deps.registry),
+                Arc::clone(deps.scanner),
+                Arc::clone(deps.store),
                 vec![],
             )
             .with_max_depth(cli.max_archive_depth)
@@ -1574,7 +1614,8 @@ fn process_archive(
             let stats = match format {
                 ArchiveFormat::Tar => {
                     let reader = BufReader::new(
-                        fs::File::open(input).map_err(|e| format!("failed to open archive: {e}"))?,
+                        fs::File::open(input)
+                            .map_err(|e| format!("failed to open archive: {e}"))?,
                     );
                     let mut sink = Vec::new();
                     archive_proc
@@ -1583,7 +1624,8 @@ fn process_archive(
                 }
                 ArchiveFormat::TarGz => {
                     let reader = BufReader::new(
-                        fs::File::open(input).map_err(|e| format!("failed to open archive: {e}"))?,
+                        fs::File::open(input)
+                            .map_err(|e| format!("failed to open archive: {e}"))?,
                     );
                     let mut sink = Vec::new();
                     archive_proc
@@ -1592,7 +1634,8 @@ fn process_archive(
                 }
                 ArchiveFormat::Zip => {
                     let mut reader = BufReader::new(
-                        fs::File::open(input).map_err(|e| format!("failed to open archive: {e}"))?,
+                        fs::File::open(input)
+                            .map_err(|e| format!("failed to open archive: {e}"))?,
                     );
                     let mut cursor_out = Cursor::new(Vec::new());
                     archive_proc
@@ -2026,7 +2069,7 @@ fn run() -> Result<(), (String, i32)> {
             report_builder.as_ref(),
             progress_reporter.as_ref(),
         )
-            .map_err(|e| (e, 1))?
+        .map_err(|e| (e, 1))?
     } else {
         let input = cli.input.as_ref().unwrap();
         let input_str = input.to_string_lossy();
@@ -2034,9 +2077,11 @@ fn run() -> Result<(), (String, i32)> {
             process_archive(
                 input,
                 &cli,
-                &scanner,
-                &registry,
-                &store,
+                ArchiveDeps {
+                    scanner: &scanner,
+                    registry: &registry,
+                    store: &store,
+                },
                 fmt,
                 report_builder.as_ref(),
                 progress_reporter.as_ref(),
@@ -2226,9 +2271,8 @@ mod tests {
 
     #[test]
     fn cli_parses_progress_interval() {
-        let cli =
-            Cli::try_parse_from(["sanitize", "input.txt", "--progress-interval-ms", "500"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["sanitize", "input.txt", "--progress-interval-ms", "500"])
+            .unwrap();
         assert_eq!(cli.progress_interval_ms, 500);
     }
 
