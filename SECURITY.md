@@ -57,10 +57,10 @@ a priority chain designed to balance convenience with security:
 
 | Priority | Source | Security Notes |
 |----------|--------|----------------|
-| 1 | `--password <PW>` flag | **Least secure** — visible in process listings and shell history. A warning is emitted when used. |
+| 1 | `--password` flag | Triggers a secure **interactive prompt** — masked terminal input via `rpassword`. No trace in process listings, shell history, or environment. Requires a TTY; fails fast with a clear error in non-interactive contexts. |
 | 2 | `--password-file <PATH>` | Reads from a file. The file **must** have Unix permissions `0600` or `0400` (owner read/write or owner read-only). Other permissions are rejected with an error. |
 | 3 | `SANITIZE_PASSWORD` env var | Avoids process listings but visible in `/proc/<pid>/environ` on Linux. |
-| 4 | Interactive prompt | **Most secure** — masked terminal input via `rpassword`. No trace in history, env, or process listing. |
+| 4 | Automatic interactive prompt | Falls through to a masked terminal prompt when no password source is explicitly specified and a password is required. |
 
 ---
 

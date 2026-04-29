@@ -618,7 +618,7 @@ pub fn load_secrets_auto(
         let pw = password.ok_or_else(|| {
             SanitizeError::SecretsError(
                 "secrets file appears encrypted but no password was provided; \
-                 use --unencrypted-secrets if the file is plaintext"
+                 add --encrypted-secrets to enable decryption mode"
                     .into(),
             )
         })?;

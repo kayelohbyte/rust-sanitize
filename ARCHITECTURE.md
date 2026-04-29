@@ -83,9 +83,10 @@ involve the scanning/replacement pipeline:
   atomically.
 
 Both subcommands resolve the password through a unified chain:
-`--password` flag → `--password-file` (with Unix permission enforcement)
-→ `SANITIZE_PASSWORD` env var → interactive terminal prompt (masked
-input via `rpassword`).
+`--password` flag (triggers interactive masked prompt; requires TTY) →
+`--password-file` (with Unix permission enforcement) →
+`SANITIZE_PASSWORD` env var → automatic interactive terminal prompt
+(masked input via `rpassword`).
 
 ---
 
@@ -279,10 +280,10 @@ Logging uses the `tracing` / `tracing-subscriber` stack:
 cargo test
 
 # Run with structured logging
-SANITIZE_LOG=debug cargo run -- foo.txt -s secrets.enc -p pw -o foo.sanitized.txt
+SANITIZE_LOG=debug cargo run -- foo.txt -s secrets.enc --password -o foo.sanitized.txt
 
-# Pipe from stdin
-echo "sensitive data" | SANITIZE_LOG=debug cargo run -- -s secrets.enc -p pw
+# Pipe from stdin (no TTY — use env var instead of --password)
+echo "sensitive data" | SANITIZE_LOG=debug cargo run -- -s secrets.enc
 
 # Run benchmarks
 cargo bench

@@ -213,10 +213,10 @@ Notes:
 |-----------------|-------|-------------|
 | `[INPUT]` | | Path to the file or archive to sanitize. Omit or use `-` to read from stdin. |
 | `-o, --output <FILE>` | `-o` | Output path. Plain files default to stdout; archives default to `<input>.sanitized.<ext>`. |
-| `-s, --secrets-file <FILE>` | `-s` | Path to a secrets file — encrypted (`.enc`) or plaintext (`.json`, `.yaml`, `.toml`). Format is auto-detected. |
-| `-p, --password <PW>` | `-p` | Password for decrypting the secrets file. Falls back to `--password-file`, then `SANITIZE_PASSWORD` env var, then interactive prompt. Not required for plaintext secrets. |
-| `-P, --password-file <FILE>` | `-P` | Read the password from a file. The file must have permissions `0600` or `0400` (owner-only). Trailing newline is stripped. |
-| `--unencrypted-secrets` | | Treat the secrets file as plaintext (skip decryption). When omitted, the engine auto-detects whether the file is encrypted or plaintext. |
+| `-s, --secrets-file <FILE>` | `-s` | Path to a secrets file. Plaintext (`.json`, `.yaml`, `.toml`) is loaded directly by default. Use `--encrypted-secrets` to decrypt an AES-256-GCM encrypted file. |
+| `-p, --password` | `-p` | Trigger an interactive password prompt (masked input, never echoed). Requires `--encrypted-secrets`. Providing this flag without `--encrypted-secrets` is an error. For non-interactive automation use `--password-file` or `SANITIZE_PASSWORD` instead. |
+| `-P, --password-file <FILE>` | `-P` | Read the decryption password from a file. Requires `--encrypted-secrets`. The file must have permissions `0600` or `0400` (owner-only). Trailing newline is stripped. |
+| `--encrypted-secrets` | | Treat the secrets file as AES-256-GCM encrypted and decrypt it before loading. Requires a password via `-p`, `--password-file`, or `SANITIZE_PASSWORD`. Without this flag the file is loaded as plaintext. Providing any password input without this flag is an error. |
 | `-f, --format <FMT>` | `-f` | Force input format, overriding file-extension detection. Values: `text`, `json`, `yaml`, `xml`, `csv`, `key-value`. Required for structured processing when reading from stdin. |
 | `-n, --dry-run` | `-n` | Scan and report matches without writing output. |
 | `--fail-on-match` | | Exit with code 2 if any matches are found. |
@@ -252,19 +252,19 @@ Examples:
 
 ```bash
 # Default behavior: spinner in interactive terminals, silent in CI/non-TTY.
-sanitize large.log -s secrets.enc -p hunter2
+sanitize large.log -s secrets.enc --encrypted-secrets --password
 
 # Force progress messages even in non-interactive environments.
-sanitize large.log -s secrets.enc -p hunter2 --progress on
+sanitize large.log -s secrets.enc --encrypted-secrets --password --progress on
 
 # Disable progress completely.
-sanitize large.log -s secrets.enc -p hunter2 --no-progress
+sanitize large.log -s secrets.enc --encrypted-secrets --password --no-progress
 
 # Redirect sanitized payload and progress separately.
-sanitize large.log -s secrets.enc -p hunter2 --progress on > clean.log 2> progress.log
+sanitize large.log -s secrets.enc --encrypted-secrets --password --progress on > clean.log 2> progress.log
 
 # Keep machine-readable JSON logs clean (no spinner frames).
-sanitize large.log -s secrets.enc -p hunter2 --log-format json --progress on > clean.log 2> events.jsonl
+sanitize large.log -s secrets.enc --encrypted-secrets --password --log-format json --progress on > clean.log 2> events.jsonl
 ```
 
 #### Stdin Support
@@ -272,11 +272,15 @@ sanitize large.log -s secrets.enc -p hunter2 --log-format json --progress on > c
 When no input file is given (or input is `-`), `sanitize` reads from stdin:
 
 ```bash
-# Pipe from another command:
-grep "error" app.log | sanitize -s secrets.enc -p hunter2
+# Pipe from grep with a plaintext secrets file:
+grep "error" app.log | sanitize -s secrets.yaml
 
-# Read from stdin, write to a file:
-cat data.csv | sanitize -s secrets.enc -p pw -f csv -o clean.csv
+# Pipe from grep with an encrypted secrets file (use env var since stdin is a pipe):
+export SANITIZE_PASSWORD="my-password"
+grep "error" app.log | sanitize -s secrets.enc --encrypted-secrets
+
+# Read from stdin, write to a file (plaintext secrets):
+cat data.csv | sanitize -s secrets.yaml -f csv -o clean.csv
 
 # Use with heredoc:
 sanitize -s secrets.json <<< "my secret api-key-12345"
@@ -287,35 +291,40 @@ Stdin mode supports plain text streaming by default. Use `--format` / `-f` to en
 #### Examples
 
 ```bash
-# Sanitize a log file (output to stdout):
-sanitize data.log -s secrets.enc -p hunter2
+# Sanitize a log file using a plaintext secrets file (default):
+sanitize data.log -s secrets.yaml
 
-# Write output to a file:
-sanitize data.log -s secrets.enc -p hunter2 -o clean.log
+# Write output to a file (plaintext secrets):
+sanitize data.log -s secrets.yaml -o clean.log
 
-# Pipe from grep:
-grep "error" app.log | sanitize -s secrets.enc -p hunter2
+# Pipe from grep (plaintext secrets):
+grep "error" app.log | sanitize -s secrets.yaml
 
 # Force progress to stderr while keeping stdout pipe-safe:
-grep "error" app.log | sanitize -s secrets.enc -p hunter2 --progress on > clean.log 2> progress.log
+grep "error" app.log | sanitize -s secrets.yaml --progress on > clean.log 2> progress.log
 
 # Structured stdin processing:
-cat config.yaml | sanitize -s secrets.enc -p pw -f yaml -o clean.yaml
+cat config.yaml | sanitize -s secrets.yaml -f yaml -o clean.yaml
 
-# Use a plaintext secrets file (auto-detected):
-sanitize data.log -s secrets.json
+# Encrypted secrets file — requires --encrypted-secrets:
+sanitize data.log -s secrets.enc --encrypted-secrets --password
+sanitize data.log -s secrets.enc --encrypted-secrets --password -o clean.log
 
-# Deterministic mode (reproducible replacements):
-sanitize data.csv -s s.enc -p pw -d
+# Non-interactive pipeline with encrypted secrets (env var):
+export SANITIZE_PASSWORD="my-password"
+grep "error" app.log | sanitize -s secrets.enc --encrypted-secrets
+
+# Deterministic mode (reproducible replacements) with encrypted secrets:
+sanitize data.csv -s s.enc --encrypted-secrets --password -d
 
 # Dry-run (scan only):
-sanitize config.yaml -s s.enc -p pw -n
+sanitize config.yaml -s s.enc --encrypted-secrets --password -n
 
 # Fail CI if matches found:
-sanitize config.yaml -s s.enc -p pw --fail-on-match
+sanitize config.yaml -s s.enc --encrypted-secrets -P /run/secrets/pw --fail-on-match
 
 # Read password from a file:
-sanitize data.log -s s.enc -P /run/secrets/pw
+sanitize data.log -s s.enc --encrypted-secrets -P /run/secrets/pw
 ```
 
 ### `sanitize encrypt`
@@ -330,7 +339,7 @@ sanitize encrypt [OPTIONS] <INPUT> <OUTPUT>
 |-----------------|-------------|
 | `<INPUT>` | Path to plaintext secrets file (`.json`, `.yaml`, `.yml`, `.toml`). |
 | `<OUTPUT>` | Path for encrypted output file (`.enc`). |
-| `--password <PW>` | Encryption password. Falls back to `--password-file`, then `SANITIZE_PASSWORD` env var, then interactive prompt. |
+| `--password` | Prompt interactively for the encryption password. The password is never echoed. For non-interactive automation use `--password-file` or `SANITIZE_PASSWORD` instead. |
 | `--password-file <FILE>` | Read the password from a file (must have `0600` or `0400` permissions). |
 | `--format <FMT>` | Force input format: `json`, `yaml`, or `toml` (default: auto-detect from extension). |
 | `--validate` | Parse plaintext before encrypting and report errors (default). |
@@ -349,7 +358,7 @@ sanitize decrypt [OPTIONS] <INPUT> <OUTPUT>
 |-----------------|-------------|
 | `<INPUT>` | Path to encrypted secrets file (`.enc`). |
 | `<OUTPUT>` | Path for decrypted plaintext output. |
-| `--password <PW>` | Decryption password. Falls back to `--password-file`, then `SANITIZE_PASSWORD` env var, then interactive prompt. |
+| `--password` | Prompt interactively for the decryption password. The password is never echoed. For non-interactive automation use `--password-file` or `SANITIZE_PASSWORD` instead. |
 | `--password-file <FILE>` | Read the password from a file (must have `0600` or `0400` permissions). |
 | `--format <FMT>` | Validate decrypted content as this format (`json`, `yaml`, `toml`). If omitted, raw bytes are written. |
 | `-h, --help` | Print help. |
@@ -430,68 +439,79 @@ All patterns from the secrets file are compiled into a single `RegexSet` for eff
 
 ## Examples
 
-**Sanitize a single file (output to stdout):**
+**Sanitize a single file (interactive password prompt):**
 
 ```bash
-sanitize data.log -s secrets.enc -p hunter2
+sanitize data.log -s secrets.enc --encrypted-secrets --password
 ```
 
 **Deterministic mode (same seed → same replacements every run):**
 
 ```bash
-sanitize data.csv -s s.enc -p pw -d
+sanitize data.csv -s s.enc --encrypted-secrets --password -d
 ```
 
 **Process a tar.gz archive with strict error handling:**
 
 ```bash
-sanitize backup.tar.gz -s s.enc -p pw -o backup.sanitized.tar.gz --strict
+sanitize backup.tar.gz -s s.enc --encrypted-secrets --password -o backup.sanitized.tar.gz --strict
 ```
 
 **Dry-run — see what would be replaced without writing output:**
 
 ```bash
-sanitize config.yaml -s s.enc -p pw -n
+sanitize config.yaml -s s.enc --encrypted-secrets --password -n
 ```
 
 **Fail CI if secrets are detected:**
 
 ```bash
-sanitize config.yaml -s s.enc -p pw --fail-on-match
+sanitize config.yaml -s s.enc --encrypted-secrets -P /run/secrets/pw --fail-on-match
 ```
 
 **Read password from a file (avoids shell history and /proc exposure):**
 
 ```bash
-sanitize data.log -s s.enc -P /run/secrets/pw
+sanitize data.log -s s.enc --encrypted-secrets -P /run/secrets/pw
 ```
 
 **Custom chunk size for memory-constrained environments:**
 
 ```bash
-sanitize huge.log -s s.enc -p pw --chunk-size 262144
+sanitize huge.log -s s.enc --encrypted-secrets --password --chunk-size 262144
 ```
 
 **JSON-structured logs for SIEM ingestion:**
 
 ```bash
-sanitize data.log -s s.enc -p pw --log-format json
+sanitize data.log -s s.enc --encrypted-secrets --password --log-format json
 ```
 
-**Use a plaintext (unencrypted) secrets file:**
+**Use a plaintext secrets file (default — no password needed):**
 
 ```bash
-# Auto-detect — plaintext YAML/JSON/TOML is recognised automatically:
+# Plaintext YAML/JSON/TOML is the default — just point at the file:
 sanitize data.log -s secrets.yaml
-
-# Explicit flag:
-sanitize data.log -s secrets.yaml --unencrypted-secrets
+sanitize data.log -s secrets.json
 
 # Deterministic mode with plaintext secrets:
 sanitize data.csv -s secrets.yaml -d
 
 # Fail CI with plaintext secrets:
 sanitize config.yaml -s secrets.yaml --fail-on-match
+```
+
+**Use an encrypted secrets file (opt-in with `--encrypted-secrets`):**
+
+```bash
+# Interactive password prompt:
+sanitize data.log -s secrets.enc --encrypted-secrets --password
+
+# Password from file (CI-friendly):
+sanitize data.log -s secrets.enc --encrypted-secrets -P /run/secrets/pw
+
+# Password from environment variable:
+SANITIZE_PASSWORD=hunter2 sanitize data.log -s secrets.enc --encrypted-secrets
 ```
 
 **Encrypted secrets file workflow:**
@@ -506,16 +526,16 @@ cat > secrets.json <<'EOF'
 EOF
 
 # 2. Encrypt it:
-sanitize encrypt secrets.json secrets.json.enc --password "my-password"
+sanitize encrypt secrets.json secrets.json.enc --password
 
 # 3. Remove the plaintext:
 rm secrets.json
 
-# 4. Use the encrypted file:
-sanitize data.log -s secrets.json.enc -p "my-password"
+# 4. Use the encrypted file (interactive prompt):
+sanitize data.log -s secrets.json.enc --encrypted-secrets --password
 
 # 5. Decrypt to edit later:
-sanitize decrypt secrets.json.enc secrets.json --password "my-password"
+sanitize decrypt secrets.json.enc secrets.json --password
 ```
 
-> **Security note:** Prefer `-P` / `--password-file` or the `SANITIZE_PASSWORD` environment variable over `-p` / `--password` to avoid exposing the password in process listings and shell history.
+> **Security note:** `-p` / `--password` triggers a secure interactive prompt (masked input, no shell history). All password inputs (`-p`, `-P`, `SANITIZE_PASSWORD`) require `--encrypted-secrets`. For non-interactive automation use `-P` / `--password-file` or the `SANITIZE_PASSWORD` environment variable.

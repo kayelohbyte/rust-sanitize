@@ -7,8 +7,8 @@
 //! sanitize encrypt [OPTIONS] <INPUT> <OUTPUT>
 //! sanitize decrypt [OPTIONS] <INPUT> <OUTPUT>
 //!
-//! # Read from stdin:
-//! cat data.log | sanitize -s secrets.enc -p hunter2
+//! # Read from stdin (plaintext secrets file — default):
+//! cat data.log | sanitize -s secrets.yaml
 //! grep "error" log.txt | sanitize -s secrets.json -o clean.log
 //! ```
 //!
@@ -22,35 +22,34 @@
 //!
 //! ```text
 //! # Encrypt a plaintext secrets file:
-//! sanitize encrypt secrets.json secrets.json.enc --password "my-password"
+//! sanitize encrypt secrets.json secrets.json.enc --password
 //!
 //! # Decrypt it back (for editing):
-//! sanitize decrypt secrets.json.enc secrets.json --password "my-password"
+//! sanitize decrypt secrets.json.enc secrets.json --password
 //!
-//! # Sanitize a log file:
-//! sanitize data.log -s secrets.enc -p hunter2
-//!
-//! # Use a plaintext secrets file directly (auto-detected):
-//! sanitize data.log -s secrets.json
+//! # Sanitize a log file (plaintext secrets — default):
+//! sanitize data.log -s secrets.yaml
 //!
 //! # Write output to a file:
-//! sanitize data.log -s secrets.enc -p hunter2 -o clean.log
+//! sanitize data.log -s secrets.yaml -o clean.log
 //!
-//! # Read from stdin (pipe-friendly):
-//! grep "error" log.txt | sanitize -s secrets.enc -p hunter2
-//! cat data.csv | sanitize -s secrets.enc -p pw -f csv -o clean.csv
+//! # Use an encrypted secrets file (requires --encrypted-secrets):
+//! sanitize data.log -s secrets.enc --encrypted-secrets -p
 //!
-//! # Deterministic mode:
-//! sanitize data.csv -s s.enc -p pw -d
+//! # Read from stdin with encrypted secrets:
+//! grep "error" log.txt | sanitize -s secrets.enc --encrypted-secrets -P /run/secrets/pw
+//!
+//! # Deterministic mode with encrypted secrets:
+//! sanitize data.csv -s s.enc --encrypted-secrets -p -d
 //!
 //! # Read password from a file (avoids process listing / env exposure):
-//! sanitize data.log -s s.enc -P /run/secrets/pw
+//! sanitize data.log -s s.enc --encrypted-secrets -P /run/secrets/pw
 //!
 //! # Dry-run:
-//! sanitize config.yaml -s s.enc -p pw -n
+//! sanitize config.yaml -s s.enc --encrypted-secrets -p -n
 //!
 //! # Fail CI if matches found:
-//! sanitize config.yaml -s s.enc -p pw --fail-on-match
+//! sanitize config.yaml -s s.enc --encrypted-secrets -P /run/secrets/pw --fail-on-match
 //! ```
 //!
 //! # One-Way Replacements
@@ -417,29 +416,26 @@ where
     version,
     about = "One-way data sanitization tool",
     long_about = "Deterministic one-way data sanitization tool.\n\n\
-        Scans files and archives for sensitive data described in an encrypted \
-        secrets file and replaces every match with a category-aware substitute.\n\
+        Scans files and archives for sensitive data described in a secrets file \
+        (plaintext by default) and replaces every match with a category-aware substitute.\n\
         Replacements are ONE-WAY — no mapping file is stored and there is no \
         restore mode.\n\n\
         Use `sanitize encrypt` / `sanitize decrypt` to manage encrypted secrets files.",
     after_help = "\
 EXAMPLES:\n  \
-  # Sanitize a log file, writing to stdout:\n  \
-  sanitize data.log -s secrets.enc -p hunter2\n\n  \
-  # Write sanitized output to a file:\n  \
-  sanitize data.log -s secrets.enc -p hunter2 -o clean.log\n\n  \
-  # Read from stdin (pipe-friendly):\n  \
-  grep \"error\" log.txt | sanitize -s secrets.enc -p hunter2\n  \
-  cat data.csv | sanitize -s secrets.enc -p pw -f csv -o clean.csv\n\n  \
-  # Use a plaintext secrets file (auto-detected):\n  \
-  sanitize data.log -s secrets.json\n\n  \
+  # Plaintext secrets file (default — no password needed):\n  \
+  sanitize data.log -s secrets.yaml\n  \
+  sanitize data.log -s secrets.yaml -o clean.log\n  \
+  grep \"error\" log.txt | sanitize -s secrets.yaml\n\n  \
+  # Encrypted secrets file (requires --encrypted-secrets):\n  \
+  sanitize data.log -s s.enc --encrypted-secrets -p\n  \
+  sanitize data.log -s s.enc --encrypted-secrets -P /run/secrets/pw\n  \
+  SANITIZE_PASSWORD=hunter2 sanitize data.log -s s.enc --encrypted-secrets\n\n  \
   # Encrypt / decrypt secrets files:\n  \
-  sanitize encrypt secrets.json secrets.json.enc --password hunter2\n  \
-  sanitize decrypt secrets.json.enc secrets.json --password hunter2\n\n  \
-  # Deterministic replacements (reproducible across runs):\n  \
-  sanitize data.csv -s s.enc -p pw -d\n\n  \
-  # Read password from a file (avoids env / process listing exposure):\n  \
-  sanitize data.log -s s.enc -P /run/secrets/pw"
+  sanitize encrypt secrets.json secrets.json.enc --password\n  \
+  sanitize decrypt secrets.json.enc secrets.json --password\n\n  \
+  # Deterministic replacements with encrypted secrets:\n  \
+  sanitize data.csv -s s.enc --encrypted-secrets -p -d"
 )]
 struct Cli {
     /// Subcommand: encrypt, decrypt, or omit for default sanitize mode.
@@ -457,30 +453,33 @@ struct Cli {
     #[arg(short = 'o', long, value_name = "FILE")]
     output: Option<PathBuf>,
 
-    /// Path to a secrets file. By default expects an AES-256-GCM
-    /// encrypted file (.enc). Use `--unencrypted-secrets` to load a
-    /// plaintext JSON / YAML / TOML file directly, or omit the flag
-    /// to auto-detect.
+    /// Path to a secrets file. Plaintext JSON / YAML / TOML files are
+    /// loaded directly by default. Use `--encrypted-secrets` to decrypt
+    /// an AES-256-GCM encrypted file.
     #[arg(short = 's', long = "secrets-file", value_name = "FILE")]
     secrets_file: Option<PathBuf>,
 
-    /// Password for decrypting the secrets file. Falls back to
-    /// --password-file, then SANITIZE_PASSWORD env var, then interactive
-    /// prompt. Not required for plaintext secrets.
+    /// Trigger an interactive password prompt for decrypting the secrets
+    /// file (masked input, never echoed). Requires `--encrypted-secrets`.
+    /// Providing this flag without `--encrypted-secrets` is an error.
+    /// For non-interactive automation use `--password-file` or the
+    /// `SANITIZE_PASSWORD` environment variable instead.
     #[arg(short = 'p', long)]
-    password: Option<String>,
+    password: bool,
 
-    /// Read the password from a file. The file must have permissions
-    /// 0600 or 0400 (owner-only). Trailing newline is stripped.
+    /// Read the decryption password from a file. Requires `--encrypted-secrets`.
+    /// The file must have permissions 0600 or 0400 (owner-only).
+    /// Trailing newline is stripped.
     #[arg(short = 'P', long = "password-file", value_name = "FILE")]
     password_file: Option<PathBuf>,
 
-    /// Treat the secrets file as plaintext (JSON / YAML / TOML) instead
-    /// of expecting AES-256-GCM encryption. Skips decryption and password
-    /// prompts entirely. When omitted, the engine auto-detects whether
-    /// the file is encrypted or plaintext.
+    /// Treat the secrets file as AES-256-GCM encrypted and decrypt it
+    /// before loading. Requires a password via `-p`, `--password-file`,
+    /// or the `SANITIZE_PASSWORD` environment variable. Without this
+    /// flag the file is loaded as plaintext (JSON / YAML / TOML);
+    /// providing any password input without this flag is an error.
     #[arg(long)]
-    unencrypted_secrets: bool,
+    encrypted_secrets: bool,
 
     /// Force input format, overriding file-extension detection.
     /// Required when reading from stdin with structured data.
@@ -620,10 +619,11 @@ struct EncryptArgs {
     #[arg(value_name = "OUTPUT")]
     output: PathBuf,
 
-    /// Encryption password. Falls back to --password-file, then
-    /// SANITIZE_PASSWORD env var, then interactive prompt.
+    /// Prompt interactively for the encryption password. The password is
+    /// never echoed. For non-interactive automation use --password-file or
+    /// the SANITIZE_PASSWORD environment variable instead.
     #[arg(long)]
-    password: Option<String>,
+    password: bool,
 
     /// Read the password from a file (must have 0600 or 0400 permissions).
     #[arg(long = "password-file", value_name = "FILE")]
@@ -654,10 +654,11 @@ struct DecryptArgs {
     #[arg(value_name = "OUTPUT")]
     output: PathBuf,
 
-    /// Decryption password. Falls back to --password-file, then
-    /// SANITIZE_PASSWORD env var, then interactive prompt.
+    /// Prompt interactively for the decryption password. The password is
+    /// never echoed. For non-interactive automation use --password-file or
+    /// the SANITIZE_PASSWORD environment variable instead.
     #[arg(long)]
-    password: Option<String>,
+    password: bool,
 
     /// Read the password from a file (must have 0600 or 0400 permissions).
     #[arg(long = "password-file", value_name = "FILE")]
@@ -1082,9 +1083,9 @@ fn run_guided() -> Result<(), (String, i32)> {
         input: Some(input),
         output,
         secrets_file: Some(secrets_for_run),
-        password: deterministic_password.or(run_password),
+        password: false,
         password_file: None,
-        unencrypted_secrets: run_unencrypted,
+        encrypted_secrets: !run_unencrypted,
         format: None,
         dry_run,
         fail_on_match: false,
@@ -1103,7 +1104,7 @@ fn run_guided() -> Result<(), (String, i32)> {
         progress_interval_ms: DEFAULT_PROGRESS_INTERVAL_MS,
     };
 
-    run_sanitize(cli)
+    run_sanitize(cli, deterministic_password.or(run_password))
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,22 +1119,21 @@ fn run_guided() -> Result<(), (String, i32)> {
 ///
 /// Returns an error only when all sources are exhausted or invalid.
 fn resolve_password(
-    cli_password: &Option<String>,
+    password_flag: bool,
     cli_password_file: &Option<PathBuf>,
     interactive_label: &str,
 ) -> Result<String, String> {
-    // 1. Explicit --password flag.
-    if let Some(pw) = cli_password {
-        if pw.is_empty() {
-            return Err("--password must not be empty".into());
+    // 1. Explicit --password flag → interactive prompt.
+    if password_flag {
+        if !io::stdin().is_terminal() {
+            return Err(
+                "--password requires an interactive terminal. \
+                 For non-interactive use, supply the password via \
+                 --password-file or the SANITIZE_PASSWORD environment variable."
+                    .into(),
+            );
         }
-        eprintln!(
-            "warning: --password was provided on the command line. \
-             Prefer --password-file, the SANITIZE_PASSWORD environment variable, \
-             or the interactive prompt to avoid exposing the password in \
-             process listings and shell history."
-        );
-        return Ok(pw.clone());
+        return prompt_password(interactive_label);
     }
 
     // 2. --password-file.
@@ -1224,7 +1224,7 @@ fn prompt_password(label: &str) -> Result<String, String> {
 
 /// Resolve password for the default sanitize mode.
 fn resolve_sanitize_password(cli: &Cli) -> Result<String, String> {
-    resolve_password(&cli.password, &cli.password_file, "secrets decryption")
+    resolve_password(cli.password, &cli.password_file, "secrets decryption")
 }
 
 /// Return `true` if the first 512 bytes look like binary (contain NUL
@@ -1388,7 +1388,7 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
             return Err("no input file given and stdin is a terminal.\n\
                  Provide a file path or pipe data into sanitize.\n\n\
                  Usage: sanitize [OPTIONS] [INPUT]\n       \
-                 command | sanitize -s secrets.enc -p password"
+                 command | sanitize -s secrets.yaml"
                 .into());
         }
     } else {
@@ -1464,6 +1464,22 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
 
     if cli.progress_interval_ms == 0 {
         return Err("--progress-interval-ms must be greater than 0".into());
+    }
+
+    // Password inputs require --encrypted-secrets; reject early to avoid
+    // confusing "failed to load secrets" errors later.
+    let has_password_source = cli.password
+        || cli.password_file.is_some()
+        || std::env::var("SANITIZE_PASSWORD")
+            .map_or(false, |v| !v.is_empty());
+    if has_password_source && !cli.encrypted_secrets {
+        return Err(
+            "password input (--password, --password-file, or SANITIZE_PASSWORD) \
+             was provided but --encrypted-secrets is not set.\n\
+             Add --encrypted-secrets to decrypt the secrets file, or remove \
+             password inputs to use a plaintext file."
+                .into(),
+        );
     }
 
     Ok(())
@@ -2235,7 +2251,7 @@ fn run_encrypt(args: &EncryptArgs) -> Result<(), (String, i32)> {
 
     // Resolve password.
     let password =
-        resolve_password(&args.password, &args.password_file, "encryption").map_err(|e| (e, 1))?;
+        resolve_password(args.password, &args.password_file, "encryption").map_err(|e| (e, 1))?;
 
     // Read plaintext file.
     let plaintext = fs::read(&args.input)
@@ -2280,7 +2296,7 @@ fn run_encrypt(args: &EncryptArgs) -> Result<(), (String, i32)> {
     eprintln!();
     eprintln!("To use with the sanitizer:");
     eprintln!(
-        "  sanitize data.log -s {} -p <password>",
+        "  sanitize data.log -s {} --password",
         args.output.display()
     );
 
@@ -2294,7 +2310,7 @@ fn run_encrypt(args: &EncryptArgs) -> Result<(), (String, i32)> {
 fn run_decrypt(args: &DecryptArgs) -> Result<(), (String, i32)> {
     // Resolve password.
     let password =
-        resolve_password(&args.password, &args.password_file, "decryption").map_err(|e| (e, 1))?;
+        resolve_password(args.password, &args.password_file, "decryption").map_err(|e| (e, 1))?;
 
     // Read encrypted file.
     let encrypted = fs::read(&args.input)
@@ -2360,10 +2376,10 @@ fn run() -> Result<(), (String, i32)> {
         None => {} // fall through to default sanitize mode
     }
 
-    run_sanitize(cli)
+    run_sanitize(cli, None)
 }
 
-fn run_sanitize(cli: Cli) -> Result<(), (String, i32)> {
+fn run_sanitize(cli: Cli, pre_resolved_password: Option<String>) -> Result<(), (String, i32)> {
     // --- install signal handler (graceful shutdown) --------------------------
     if let Err(e) = ctrlc::set_handler(move || {
         INTERRUPTED.store(true, Ordering::SeqCst);
@@ -2399,7 +2415,15 @@ fn run_sanitize(cli: Cli) -> Result<(), (String, i32)> {
         "starting sanitization"
     );
 
-    let effective_password = cli.password.clone();
+    let effective_password: Option<String> = if cli.encrypted_secrets {
+        if let Some(pw) = pre_resolved_password {
+            Some(pw)
+        } else {
+            Some(resolve_sanitize_password(&cli).map_err(|e| (e, 1))?)
+        }
+    } else {
+        None
+    };
 
     // --- build core components ----------------------------------------------
     let scan_config = build_scan_config(cli.chunk_size).map_err(|e| (e, 1))?;
@@ -2420,17 +2444,13 @@ fn run_sanitize(cli: Cli) -> Result<(), (String, i32)> {
         })?;
 
         // Resolve password (may be None for plaintext mode).
-        let password = if cli.unencrypted_secrets {
-            None
-        } else {
-            resolve_sanitize_password(&cli).ok()
-        };
+        let password = effective_password.clone();
 
         let ((patterns, warnings), was_encrypted) = sanitize_engine::secrets::load_secrets_auto(
             &raw_bytes,
             password.as_deref(),
             None,
-            cli.unencrypted_secrets,
+            !cli.encrypted_secrets,
         )
         .map_err(|e| (format!("failed to load secrets: {e}"), 1))?;
 
@@ -2659,7 +2679,6 @@ mod tests {
             "-s",
             "secrets.json",
             "-p",
-            "hunter2",
             "-P",
             "/run/secrets/pw",
             "-o",
@@ -2671,7 +2690,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.secrets_file.unwrap(), PathBuf::from("secrets.json"));
-        assert_eq!(cli.password.unwrap(), "hunter2");
+        assert!(cli.password);
         assert_eq!(cli.password_file.unwrap(), PathBuf::from("/run/secrets/pw"));
         assert_eq!(cli.output.unwrap(), PathBuf::from("out.txt"));
         assert!(cli.dry_run);
@@ -2773,7 +2792,6 @@ mod tests {
             "secrets.json",
             "secrets.enc",
             "--password",
-            "hunter2",
         ])
         .unwrap();
         assert!(cli.command.is_some());
@@ -2788,7 +2806,6 @@ mod tests {
             "secrets.enc",
             "secrets.json",
             "--password",
-            "hunter2",
         ])
         .unwrap();
         assert!(cli.command.is_some());
@@ -2820,13 +2837,12 @@ mod tests {
             "--secrets-file",
             "s.enc",
             "--password",
-            "pw",
             "--dry-run",
             "--fail-on-match",
             "--deterministic",
             "--strict",
             "--include-binary",
-            "--unencrypted-secrets",
+            "--encrypted-secrets",
             "--chunk-size",
             "4096",
             "--threads",
@@ -2844,7 +2860,7 @@ mod tests {
         assert!(cli.deterministic);
         assert!(cli.strict);
         assert!(cli.include_binary);
-        assert!(cli.unencrypted_secrets);
+        assert!(cli.encrypted_secrets);
         assert_eq!(cli.chunk_size, 4096);
         assert_eq!(cli.threads, Some(4));
         assert_eq!(cli.max_mappings, 500);
