@@ -229,6 +229,19 @@ impl MappingStore {
         self.len.store(0, Ordering::Release);
     }
 
+    // ---------------- Snapshot / diff (for format-preserving pass) ----------------
+
+    /// Snapshot the set of `(category, original)` keys currently in the store.
+    ///
+    /// Call this before structured processing; diff against `iter()` afterwards
+    /// to find which mappings were added by the processor.
+    pub fn snapshot_keys(&self) -> std::collections::HashSet<(Category, String)> {
+        self.forward
+            .iter()
+            .map(|e| (e.key().category.clone(), e.key().original.clone()))
+            .collect()
+    }
+
     // ---------------- Iteration (for external use) ----------------
 
     /// Iterate over all mappings. Yields `(category, original, sanitized)`.

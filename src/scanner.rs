@@ -160,6 +160,16 @@ impl ScanConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Convert any compile-time pattern error into [`SanitizeError::PatternCompileError`].
+#[inline]
+fn compile_err(e: impl std::fmt::Display) -> SanitizeError {
+    SanitizeError::PatternCompileError(e.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Scan pattern
 // ---------------------------------------------------------------------------
 
@@ -197,6 +207,17 @@ impl std::fmt::Debug for ScanPattern {
     }
 }
 
+impl Clone for ScanPattern {
+    fn clone(&self) -> Self {
+        Self {
+            regex: self.regex.clone(),
+            category: self.category.clone(),
+            label: self.label.clone(),
+            literal: self.literal.clone(),
+        }
+    }
+}
+
 impl ScanPattern {
     /// Create a pattern from a regex string.
     ///
@@ -221,7 +242,7 @@ impl ScanPattern {
             .size_limit(REGEX_SIZE_LIMIT)
             .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
             .build()
-            .map_err(|e| SanitizeError::PatternCompileError(e.to_string()))?;
+            .map_err(compile_err)?;
         Ok(Self {
             regex,
             category,
@@ -261,7 +282,7 @@ impl ScanPattern {
             .size_limit(REGEX_SIZE_LIMIT)
             .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
             .build()
-            .map_err(|e| SanitizeError::PatternCompileError(e.to_string()))?;
+            .map_err(compile_err)?;
         Ok(Self {
             regex,
             category,
@@ -523,7 +544,7 @@ impl StreamScanner {
         } else {
             Some(
                 AhoCorasick::new(&literal_bytes)
-                    .map_err(|e| SanitizeError::PatternCompileError(e.to_string()))?,
+                    .map_err(compile_err)?,
             )
         };
 
@@ -533,13 +554,13 @@ impl StreamScanner {
                 .size_limit(REGEX_SIZE_LIMIT)
                 .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
                 .build()
-                .map_err(|e| SanitizeError::PatternCompileError(e.to_string()))?
+                .map_err(compile_err)?
         } else {
             RegexSetBuilder::new(&regex_strs)
                 .size_limit(REGEX_SIZE_LIMIT * regex_strs.len().max(1))
                 .dfa_size_limit(REGEX_DFA_SIZE_LIMIT * regex_strs.len().max(1))
                 .build()
-                .map_err(|e| SanitizeError::PatternCompileError(e.to_string()))?
+                .map_err(compile_err)?
         };
 
         Ok(Self {
@@ -551,6 +572,23 @@ impl StreamScanner {
             store,
             config,
         })
+    }
+
+    /// Create a copy of this scanner extended with additional literal patterns.
+    ///
+    /// Clones the existing pattern set and appends `extra`, then rebuilds
+    /// the internal Aho-Corasick and RegexSet automata. Used by the
+    /// format-preserving structured pass to scan original bytes with
+    /// discovered field-value literals added to the base pattern set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SanitizeError`] if automaton construction fails or the
+    /// combined pattern count exceeds the default limit.
+    pub fn with_extra_literals(&self, extra: Vec<ScanPattern>) -> Result<Self> {
+        let mut patterns = self.patterns.clone();
+        patterns.extend(extra);
+        Self::new(patterns, Arc::clone(&self.store), self.config.clone())
     }
 
     /// Scan a reader and write sanitized output to a writer.

@@ -21,7 +21,7 @@ Deterministic, one-way data sanitization engine and CLI tool.
 - **One-way only.** No mapping file, no restore mode. Forward map lives in process memory and is zeroized on drop.
 - **Deterministic or random.** HMAC-SHA256 seeded mode produces identical replacements across runs; CSPRNG mode produces fresh replacements each run (still consistent within a single run via dedup cache).
 - **Streaming architecture.** Processes 20–100 GB+ files in bounded memory via configurable chunk + overlap scanning.
-- **Format-aware processing.** Structured processors for JSON, YAML, XML, CSV, and key-value files replace only matched field values while preserving document structure.
+- **Format-aware processing.** Structured processors for JSON, YAML, XML, CSV, and key-value files replace only matched field values while preserving document structure exactly — comments, indentation, key ordering, and quoting style are all retained.
 - **Archive support.** Tar, tar.gz, and zip archives are processed entry-by-entry with automatic format detection and metadata preservation.
 - **Zero `unsafe` code.** The entire crate contains no `unsafe` blocks.
 
@@ -39,6 +39,29 @@ Deterministic, one-way data sanitization engine and CLI tool.
 ---
 
 ## Quick Start
+
+```bash
+# 1. Create a profile to target specific fields in structured files:
+cat > profile.yaml <<'EOF'
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  fields:
+    - pattern: "*.password"
+      category: "custom:password"
+    - pattern: "*.username"
+      category: email
+EOF
+
+# 2. Sanitize a config file — only matched fields are replaced:
+sanitize config.yaml --profile profile.yaml
+# Comments, indentation, and unmatched values are preserved exactly.
+
+# 3. Combine with a secrets file to also catch those values in logs:
+sanitize config.yaml app.log --profile profile.yaml -s secrets.yaml
+# Values found in config.yaml are replaced in app.log with the same substitutes.
+```
+
+### Quick Start — Secrets File (streaming scanner)
 
 ```bash
 # 1. Create a plaintext secrets file (YAML is the canonical authoring format):
@@ -245,7 +268,7 @@ assert_eq!(sanitized, again);
 | Document | Description |
 |----------|-------------|
 | [CLI Reference](docs/cli-reference.md) | Full `sanitize` command reference (including `encrypt` and `decrypt` subcommands), secrets file format, and usage examples. |
-| [Structured Processing](docs/structured-processing.md) | File-type profiles, field rules, processor-specific options, and structured vs literal comparison. |
+| [Structured Processing](docs/structured-processing.md) | `--profile` usage, file-type profiles, field rules, include/exclude globs, two-phase pipeline, format preservation, deterministic discovery, and processor-specific options. |
 | [Supported Categories](docs/categories.md) | All 18 built-in replacement categories with strategies and examples, plus custom categories. |
 | [Pluggable Strategies](docs/strategies.md) | The `Strategy` trait, 5 built-in strategies, and guide to writing custom strategies. |
 | [Library API Reference](docs/api-reference.md) | Module-by-module public API tables (scanner, store, generator, strategy, processor, archive, report, atomic, secrets, error, category). |
@@ -346,7 +369,7 @@ See [docs/cli-reference.md](docs/cli-reference.md) for the complete set of examp
 - **No restore.** Replacements are one-way by design. There is no undo, decrypt-output, or reverse-mapping capability.
 - **Deterministic mode caveats.** Deterministic replacements require the same secrets key and the same secret values to produce identical output. Changing the secrets file or key produces entirely different replacements.
 - **Structured fallback.** Files exceeding structured processor size limits silently fall back to the streaming scanner. The streaming scanner performs byte-level regex replacement and does not understand document structure — it may match inside JSON keys, XML tags, or other structural elements.
-- **YAML formatting.** `serde_yaml` normalizes some whitespace during serialization. Minor formatting differences from the original are possible.
+- **Structured file size limit.** Files exceeding `--max-structured-size` (default 256 MiB) fall back to the streaming scanner, which does not understand document structure.
 - **Zeroization scope.** Zeroization covers secrets, HMAC keys, and mapping store keys. It does not cover incidental copies the Rust compiler may create (e.g. during optimization passes). This is an inherent limitation of safe Rust zeroization.
 - **Sequential archive processing.** Archive entries are processed sequentially (not in parallel) to preserve deterministic ordering.
 - **Binary detection.** Entries detected as binary are skipped by default. Use `--include-binary` to override.
