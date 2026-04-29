@@ -166,9 +166,9 @@ impl SecretsFormat {
         let ext = std::path::Path::new(base).extension();
         if ext.is_some_and(|e| e.eq_ignore_ascii_case("json")) {
             Some(Self::Json)
-        } else if ext.is_some_and(|e| {
-            e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml")
-        }) {
+        } else if ext
+            .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"))
+        {
             Some(Self::Yaml)
         } else if ext.is_some_and(|e| e.eq_ignore_ascii_case("toml")) {
             Some(Self::Toml)
