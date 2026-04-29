@@ -542,10 +542,7 @@ impl StreamScanner {
         let aho_corasick = if literal_bytes.is_empty() {
             None
         } else {
-            Some(
-                AhoCorasick::new(&literal_bytes)
-                    .map_err(compile_err)?,
-            )
+            Some(AhoCorasick::new(&literal_bytes).map_err(compile_err)?)
         };
 
         // Build RegexSet from non-literal patterns only (R-3 pre-filter).

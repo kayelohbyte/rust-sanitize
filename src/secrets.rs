@@ -311,9 +311,9 @@ pub fn decrypt_secrets(encrypted: &[u8], password: &str) -> Result<Zeroizing<Vec
     let cipher = Aes256Gcm::new_from_slice(key.as_ref())
         .map_err(|e| SanitizeError::SecretsCipherError(format!("cipher init: {}", e)))?;
 
-    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
-        SanitizeError::SecretsDecryptFailed
-    })?;
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| SanitizeError::SecretsDecryptFailed)?;
 
     Ok(Zeroizing::new(plaintext))
 }
@@ -337,25 +337,24 @@ pub fn parse_secrets(plaintext: &[u8], format: Option<SecretsFormat>) -> Result<
         .map_err(|e| SanitizeError::SecretsInvalidUtf8(e.to_string()))?;
 
     match fmt {
-        SecretsFormat::Json => serde_json::from_str(text).map_err(|e| {
-            SanitizeError::SecretsFormatError {
+        SecretsFormat::Json => {
+            serde_json::from_str(text).map_err(|e| SanitizeError::SecretsFormatError {
                 format: "JSON".into(),
                 message: e.to_string(),
-            }
-        }),
-        SecretsFormat::Yaml => serde_yaml_ng::from_str(text).map_err(|e| {
-            SanitizeError::SecretsFormatError {
+            })
+        }
+        SecretsFormat::Yaml => {
+            serde_yaml_ng::from_str(text).map_err(|e| SanitizeError::SecretsFormatError {
                 format: "YAML".into(),
                 message: e.to_string(),
-            }
-        }),
+            })
+        }
         SecretsFormat::Toml => {
-            let wrapper: TomlSecrets = toml::from_str(text).map_err(|e| {
-                SanitizeError::SecretsFormatError {
+            let wrapper: TomlSecrets =
+                toml::from_str(text).map_err(|e| SanitizeError::SecretsFormatError {
                     format: "TOML".into(),
                     message: e.to_string(),
-                }
-            })?;
+                })?;
             Ok(wrapper.secrets)
         }
     }
@@ -370,12 +369,12 @@ pub fn parse_secrets(plaintext: &[u8], format: Option<SecretsFormat>) -> Result<
 /// Returns [`SanitizeError::SecretsError`] if serialization fails.
 pub fn serialize_secrets(entries: &[SecretEntry], format: SecretsFormat) -> Result<Vec<u8>> {
     match format {
-        SecretsFormat::Json => serde_json::to_vec_pretty(entries).map_err(|e| {
-            SanitizeError::SecretsFormatError {
+        SecretsFormat::Json => {
+            serde_json::to_vec_pretty(entries).map_err(|e| SanitizeError::SecretsFormatError {
                 format: "JSON-serialize".into(),
                 message: e.to_string(),
-            }
-        }),
+            })
+        }
         SecretsFormat::Yaml => serde_yaml_ng::to_string(entries)
             .map(|s| s.into_bytes())
             .map_err(|e| SanitizeError::SecretsFormatError {

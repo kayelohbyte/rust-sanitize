@@ -151,8 +151,7 @@ fn multi_input_writes_per_file_outputs_with_matching_extensions() {
     {
         let f = fs::File::create(&zip).unwrap();
         let mut zipw = zip::ZipWriter::new(f);
-        zipw
-            .start_file("nested.txt", zip::write::FileOptions::default())
+        zipw.start_file("nested.txt", zip::write::FileOptions::default())
             .unwrap();
         zipw.write_all(b"SUPERSECRET\n").unwrap();
         zipw.finish().unwrap();

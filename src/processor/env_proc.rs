@@ -236,8 +236,7 @@ mod tests {
         let store = make_store();
         let proc = EnvProcessor;
         let content = b"SECRET=abc123\nPUBLIC_URL=https://example.com\n";
-        let profile =
-            FileTypeProfile::new("env", vec![FieldRule::new("SECRET")]);
+        let profile = FileTypeProfile::new("env", vec![FieldRule::new("SECRET")]);
         let output = proc.process(content, &profile, &store).unwrap();
         let text = String::from_utf8(output).unwrap();
         // SECRET replaced, PUBLIC_URL unchanged.

@@ -242,7 +242,9 @@ impl Strategy for RandomString {
         let mut state = 0u64;
         for chunk in entropy.chunks_exact(8) {
             // chunks_exact(8) on a [u8; 32] always yields exactly 8-byte slices.
-            let arr: [u8; 8] = chunk.try_into().expect("chunks_exact(8) yields 8-byte slices");
+            let arr: [u8; 8] = chunk
+                .try_into()
+                .expect("chunks_exact(8) yields 8-byte slices");
             state = state.wrapping_add(u64::from_le_bytes(arr));
         }
         if state == 0 {
@@ -389,7 +391,9 @@ impl Strategy for PreserveLength {
         let mut state = 0u64;
         for chunk in entropy.chunks_exact(8) {
             // chunks_exact(8) on a [u8; 32] always yields exactly 8-byte slices.
-            let arr: [u8; 8] = chunk.try_into().expect("chunks_exact(8) yields 8-byte slices");
+            let arr: [u8; 8] = chunk
+                .try_into()
+                .expect("chunks_exact(8) yields 8-byte slices");
             state = state.wrapping_add(u64::from_le_bytes(arr));
         }
         if state == 0 {

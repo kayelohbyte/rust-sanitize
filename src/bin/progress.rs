@@ -305,7 +305,10 @@ where
     let progress = progress.cloned();
 
     if let Some(reporter) = &progress {
-        reporter.lock().expect("progress reporter lock").start_task(label);
+        reporter
+            .lock()
+            .expect("progress reporter lock")
+            .start_task(label);
     }
 
     let result = action(progress.clone());

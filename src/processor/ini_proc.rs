@@ -160,8 +160,10 @@ fn extract_delimiter(line: &str, key: &str, after_delim: &str) -> String {
         // The delimiter ends where after_delim (unstripped) begins.
         // after_delim already includes everything after the `=`/`:` character.
         // We need: after_key[..pos_of_value_start].
-        let delimiter_end =
-            after_key.len().saturating_sub(after_delim.len()).saturating_add(1);
+        let delimiter_end = after_key
+            .len()
+            .saturating_sub(after_delim.len())
+            .saturating_add(1);
         if delimiter_end <= after_key.len() {
             return after_key[..delimiter_end].to_string();
         }
@@ -200,7 +202,8 @@ mod tests {
     fn basic_ini_replacement() {
         let store = make_store();
         let proc = IniProcessor;
-        let content = b"[database]\nhost = db.corp.com\npassword = s3cret\n\n[smtp]\nuser = admin\n";
+        let content =
+            b"[database]\nhost = db.corp.com\npassword = s3cret\n\n[smtp]\nuser = admin\n";
         let output = proc.process(content, &wildcard_profile(), &store).unwrap();
         let text = String::from_utf8(output).unwrap();
         // Values replaced.
@@ -219,8 +222,7 @@ mod tests {
         let store = make_store();
         let proc = IniProcessor;
         let content = b"[database]\npassword = secret\n[app]\nname = myapp\n";
-        let profile =
-            FileTypeProfile::new("ini", vec![FieldRule::new("database.password")]);
+        let profile = FileTypeProfile::new("ini", vec![FieldRule::new("database.password")]);
         let output = proc.process(content, &profile, &store).unwrap();
         let text = String::from_utf8(output).unwrap();
         // password replaced, app.name untouched.
@@ -246,8 +248,7 @@ mod tests {
         let store = make_store();
         let proc = IniProcessor;
         let content = b"[section]\napi_key: abc123\n";
-        let profile =
-            FileTypeProfile::new("ini", vec![FieldRule::new("section.api_key")]);
+        let profile = FileTypeProfile::new("ini", vec![FieldRule::new("section.api_key")]);
         let output = proc.process(content, &profile, &store).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(!text.contains("abc123"));

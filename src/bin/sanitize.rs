@@ -59,19 +59,20 @@
 //! same secrets will produce identical replacements.
 
 mod progress;
-use progress::{ProgressContext, ProgressMode, ProgressPolicy, ProgressReporter, SharedProgressReporter, with_progress_scope};
+use progress::{
+    with_progress_scope, ProgressContext, ProgressMode, ProgressPolicy, ProgressReporter,
+    SharedProgressReporter,
+};
 
 use clap::{Parser, Subcommand};
-use serde_json;
-use serde_yaml_ng;
 use rayon::prelude::*;
 use sanitize_engine::secrets::{
     decrypt_secrets, encrypt_secrets, entries_to_patterns, parse_secrets, serialize_secrets,
     SecretEntry, SecretsFormat,
 };
 use sanitize_engine::{
-    atomic_write, ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress, AtomicFileWriter,
-    FileReport, HmacGenerator, MappingStore, ProcessorRegistry, RandomGenerator,
+    atomic_write, ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress,
+    AtomicFileWriter, FileReport, HmacGenerator, MappingStore, ProcessorRegistry, RandomGenerator,
     ReplacementGenerator, ReportBuilder, ReportMetadata, ScanConfig, ScanPattern, ScanStats,
     StreamScanner, DEFAULT_MAX_ARCHIVE_DEPTH,
 };
@@ -648,7 +649,13 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
         make_regex_entry(r#"https?://[^\s"'<>]+"#, "url", "url"),
     ];
 
-    if matches!(opts.preset, GuidedPreset::Aggressive | GuidedPreset::WebApp | GuidedPreset::Kubernetes | GuidedPreset::Database) {
+    if matches!(
+        opts.preset,
+        GuidedPreset::Aggressive
+            | GuidedPreset::WebApp
+            | GuidedPreset::Kubernetes
+            | GuidedPreset::Database
+    ) {
         entries.push(make_regex_entry(
             r"(?i)\b(?:bearer|token|api[_-]?key|secret)[\s:=]+[A-Za-z0-9._~+/=-]{16,}\b",
             "auth_token",
@@ -1049,15 +1056,12 @@ fn template_body_aws() -> &'static str {
 }
 
 fn run_template(args: &TemplateArgs) -> Result<(), (String, i32)> {
-    let preset = parse_template_preset(&args.preset)
-        .map_err(|e| (e, 1))?;
+    let preset = parse_template_preset(&args.preset).map_err(|e| (e, 1))?;
 
-    let output_path = args.output.clone().unwrap_or_else(|| {
-        PathBuf::from(format!(
-            "secrets.template.{}.yaml",
-            args.preset
-        ))
-    });
+    let output_path = args
+        .output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("secrets.template.{}.yaml", args.preset)));
 
     if output_path.exists() && !args.overwrite {
         return Err((
@@ -1085,15 +1089,22 @@ fn run_template(args: &TemplateArgs) -> Result<(), (String, i32)> {
     atomic_write(&output_path, content.as_bytes())
         .map_err(|e| (format!("failed to write {}: {e}", output_path.display()), 1))?;
 
-    eprintln!(
-        "Template written to {}",
-        output_path.display()
-    );
+    eprintln!("Template written to {}", output_path.display());
     eprintln!();
     eprintln!("Next steps:");
-    eprintln!("  1. Edit {} to add your own patterns and remove irrelevant ones.", output_path.display());
-    eprintln!("  2. Encrypt:  sanitize encrypt {} {}.enc", output_path.display(), output_path.display());
-    eprintln!("  3. Sanitize: sanitize <input> -s {}.enc -o <output>", output_path.display());
+    eprintln!(
+        "  1. Edit {} to add your own patterns and remove irrelevant ones.",
+        output_path.display()
+    );
+    eprintln!(
+        "  2. Encrypt:  sanitize encrypt {} {}.enc",
+        output_path.display(),
+        output_path.display()
+    );
+    eprintln!(
+        "  3. Sanitize: sanitize <input> -s {}.enc -o <output>",
+        output_path.display()
+    );
     eprintln!();
     eprintln!("WARNING: always review sanitized output before sending to an LLM.");
 
@@ -1339,12 +1350,10 @@ fn resolve_password(
     // 1. Explicit --password flag → interactive prompt.
     if password_flag {
         if !io::stdin().is_terminal() {
-            return Err(
-                "--password requires an interactive terminal. \
+            return Err("--password requires an interactive terminal. \
                  For non-interactive use, supply the password via \
                  --password-file or the SANITIZE_PASSWORD environment variable."
-                    .into(),
-            );
+                .into());
         }
         return prompt_password(interactive_label);
     }
@@ -1524,7 +1533,12 @@ fn build_augmented_scanner(
     let mut patterns: Vec<ScanPattern> = if let Some(raw) = secrets_raw_bytes {
         let ((base, _warnings), _encrypted) =
             sanitize_engine::secrets::load_secrets_auto(raw, password, None, allow_plaintext)
-                .map_err(|e| (format!("failed to reload secrets for augmented scanner: {e}"), 1))?;
+                .map_err(|e| {
+                    (
+                        format!("failed to reload secrets for augmented scanner: {e}"),
+                        1,
+                    )
+                })?;
         base
     } else {
         vec![]
@@ -1549,7 +1563,10 @@ fn build_augmented_scanner(
     }
 
     if discovered > 0 {
-        info!(count = discovered, "augmented scanner with profile-discovered literals");
+        info!(
+            count = discovered,
+            "augmented scanner with profile-discovered literals"
+        );
     }
 
     let scanner = StreamScanner::new(patterns, Arc::clone(store), scan_config)
@@ -1647,10 +1664,7 @@ fn has_stdin_input(cli: &Cli) -> bool {
 
 /// Returns file-path inputs, excluding explicit stdin markers ("-").
 fn file_inputs(cli: &Cli) -> Vec<&PathBuf> {
-    cli.input
-        .iter()
-        .filter(|p| p.as_os_str() != "-")
-        .collect()
+    cli.input.iter().filter(|p| p.as_os_str() != "-").collect()
 }
 
 /// Map the `--format` value to extension-like string for structured processor
@@ -1769,7 +1783,11 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
 
     for input in &cli.input {
         if input.as_os_str() == "-" {
-            let stdin_output = if multi_input { None } else { cli.output.clone() };
+            let stdin_output = if multi_input {
+                None
+            } else {
+                cli.output.clone()
+            };
             units.push(InputTarget::Stdin {
                 output: stdin_output,
             });
@@ -1809,7 +1827,6 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
     Ok(units)
 }
 
-/// Validate CLI arguments for the default sanitize mode.
 // ---------------------------------------------------------------------------
 // Archive filter pre-parser
 // ---------------------------------------------------------------------------
@@ -1838,6 +1855,7 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
 /// Returns `(filter_map, cleaned_args)` where `filter_map` maps each
 /// archive path (as it appeared on the command line) to its
 /// `(only_patterns, exclude_patterns)` pair.
+#[allow(clippy::type_complexity)]
 fn parse_archive_filters(
     args: &[OsString],
 ) -> Result<(HashMap<PathBuf, (Vec<String>, Vec<String>)>, Vec<OsString>), String> {
@@ -1858,8 +1876,7 @@ fn parse_archive_filters(
     // prefixes and require no glob validation).
     let validate_pattern = |p: &str| -> Result<(), String> {
         if !p.ends_with('/') {
-            glob::Pattern::new(p)
-                .map_err(|e| format!("invalid glob pattern '{p}': {e}"))?;
+            glob::Pattern::new(p).map_err(|e| format!("invalid glob pattern '{p}': {e}"))?;
         }
         Ok(())
     };
@@ -1965,7 +1982,10 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
             return Err(format!("input file not found: {}", input.display()));
         }
         if !input.is_file() {
-            return Err(format!("input path is not a regular file: {}", input.display()));
+            return Err(format!(
+                "input path is not a regular file: {}",
+                input.display()
+            ));
         }
     }
 
@@ -2039,8 +2059,7 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
     // confusing "failed to load secrets" errors later.
     let has_password_source = cli.password
         || cli.password_file.is_some()
-        || std::env::var("SANITIZE_PASSWORD")
-            .is_ok_and(|v| !v.is_empty());
+        || std::env::var("SANITIZE_PASSWORD").is_ok_and(|v| !v.is_empty());
     if has_password_source && !cli.encrypted_secrets && !cli.deterministic {
         return Err(
             "password input (--password, --password-file, or SANITIZE_PASSWORD) \
@@ -2094,6 +2113,7 @@ fn make_scan_callback(
 // ---------------------------------------------------------------------------
 
 /// Process input from stdin. Returns `true` if matches were found.
+#[allow(clippy::too_many_arguments)]
 fn process_stdin(
     cli: &Cli,
     output_path: Option<&Path>,
@@ -2145,8 +2165,13 @@ fn process_stdin(
         let store_len_before = store.len();
         let label = format!("Processing structured stdin ({ext})");
         return with_progress_scope(progress, &label, |_| {
-            let structured_result =
-                try_structured_processing(&input_bytes, &format!("stdin.{ext}"), registry, store, profiles);
+            let structured_result = try_structured_processing(
+                &input_bytes,
+                &format!("stdin.{ext}"),
+                registry,
+                store,
+                profiles,
+            );
 
             match structured_result {
                 Some(Ok(structured_bytes)) => {
@@ -2230,7 +2255,12 @@ fn process_stdin_streaming<R: io::Read>(
 
         if cli.dry_run {
             let stats = scanner
-                .scan_reader_with_progress(reader, io::sink(), None, make_scan_callback(progress.clone(), label))
+                .scan_reader_with_progress(
+                    reader,
+                    io::sink(),
+                    None,
+                    make_scan_callback(progress.clone(), label),
+                )
                 .map_err(|e| format!("scanner error: {e}"))?;
             if stats.matches_found > 0 {
                 had_matches = true;
@@ -2255,7 +2285,12 @@ fn process_stdin_streaming<R: io::Read>(
                 .map_err(|e| format!("failed to create output: {e}"))?;
 
             let stats = scanner
-                .scan_reader_with_progress(reader, &mut atomic_writer, None, make_scan_callback(progress.clone(), label))
+                .scan_reader_with_progress(
+                    reader,
+                    &mut atomic_writer,
+                    None,
+                    make_scan_callback(progress.clone(), label),
+                )
                 .map_err(|e| format!("scanner error: {e}"))?;
 
             if is_interrupted() {
@@ -2280,7 +2315,12 @@ fn process_stdin_streaming<R: io::Read>(
             let stdout = io::stdout();
             let writer = BufWriter::new(stdout.lock());
             let stats = scanner
-                .scan_reader_with_progress(reader, writer, None, make_scan_callback(progress.clone(), label))
+                .scan_reader_with_progress(
+                    reader,
+                    writer,
+                    None,
+                    make_scan_callback(progress.clone(), label),
+                )
                 .map_err(|e| format!("scanner error: {e}"))?;
             if stats.matches_found > 0 {
                 had_matches = true;
@@ -2403,37 +2443,44 @@ fn process_plain_file(
                 let structured_result =
                     try_structured_processing(&input_bytes, &filename, registry, store, profiles);
 
-                let (output_bytes, method, _was_structured, fallback_stats) = match structured_result
-                {
-                    Some(Ok(_structured_bytes)) => {
-                        // Format-preserving double-pass:
-                        //   1. Structured processing already populated the store with
-                        //      field-value mappings — its re-serialized output is discarded.
-                        //   2. We diff the store against the pre-pass snapshot to find the
-                        //      literals this file contributed.
-                        //   3. A per-file scanner (base patterns + new literals) scans the
-                        //      *original* bytes, preserving comments, indentation, and key order.
-                        let ext = filename.rsplit('.').next().unwrap_or("unknown");
-                        let per_file_scanner =
-                            build_format_preserving_scanner(scanner, store, &store_snapshot)
-                                .map_err(|e| format!("failed to build per-file scanner: {e}"))?;
-                        let (scanned_bytes, scan_stats) =
-                            scanner_fallback(&per_file_scanner, &input_bytes)?;
-                        (scanned_bytes, format!("structured+scan:{ext}"), true, Some(scan_stats))
-                    }
-                    Some(Err(e)) => {
-                        if cli.strict {
-                            return Err(format!("structured processing failed: {e}"));
+                let (output_bytes, method, _was_structured, fallback_stats) =
+                    match structured_result {
+                        Some(Ok(_structured_bytes)) => {
+                            // Format-preserving double-pass:
+                            //   1. Structured processing already populated the store with
+                            //      field-value mappings — its re-serialized output is discarded.
+                            //   2. We diff the store against the pre-pass snapshot to find the
+                            //      literals this file contributed.
+                            //   3. A per-file scanner (base patterns + new literals) scans the
+                            //      *original* bytes, preserving comments, indentation, and key order.
+                            let ext = filename.rsplit('.').next().unwrap_or("unknown");
+                            let per_file_scanner =
+                                build_format_preserving_scanner(scanner, store, &store_snapshot)
+                                    .map_err(|e| {
+                                        format!("failed to build per-file scanner: {e}")
+                                    })?;
+                            let (scanned_bytes, scan_stats) =
+                                scanner_fallback(&per_file_scanner, &input_bytes)?;
+                            (
+                                scanned_bytes,
+                                format!("structured+scan:{ext}"),
+                                true,
+                                Some(scan_stats),
+                            )
                         }
-                        warn!(error = %e, "structured processing failed, falling back to scanner");
-                        let (out, stats) = scanner_fallback(scanner, &input_bytes)?;
-                        (out, "scanner".into(), false, Some(stats))
-                    }
-                    None => {
-                        let (out, stats) = scanner_fallback(scanner, &input_bytes)?;
-                        (out, "scanner".into(), false, Some(stats))
-                    }
-                };
+                        Some(Err(e)) => {
+                            if cli.strict {
+                                return Err(format!("structured processing failed: {e}"));
+                            }
+                            warn!(error = %e, "structured processing failed, falling back to scanner");
+                            let (out, stats) = scanner_fallback(scanner, &input_bytes)?;
+                            (out, "scanner".into(), false, Some(stats))
+                        }
+                        None => {
+                            let (out, stats) = scanner_fallback(scanner, &input_bytes)?;
+                            (out, "scanner".into(), false, Some(stats))
+                        }
+                    };
 
                 if cli.dry_run || report_builder.is_some() || cli.fail_on_match {
                     // In both structured and scanner paths the final output comes from
@@ -2619,12 +2666,10 @@ fn save_discovered_secrets(
 
     // Load existing entries to deduplicate against.
     let existing: Vec<SecretEntry> = if path.exists() {
-        let raw = fs::read(path)
-            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        let raw = fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
         let text = std::str::from_utf8(&raw)
             .map_err(|_| format!("{} is not valid UTF-8", path.display()))?;
-        serde_yaml_ng::from_str::<Vec<SecretEntry>>(text)
-            .unwrap_or_default()
+        serde_yaml_ng::from_str::<Vec<SecretEntry>>(text).unwrap_or_default()
     } else {
         vec![]
     };
@@ -2656,11 +2701,9 @@ fn save_discovered_secrets(
 ///
 /// The file must deserialize to `Vec<FileTypeProfile>`. Format is detected
 /// from the file extension; unknown extensions are tried as JSON then YAML.
-fn load_profiles(
-    path: &Path,
-) -> Result<Vec<sanitize_engine::processor::FileTypeProfile>, String> {
-    let raw = fs::read(path)
-        .map_err(|e| format!("failed to read profile '{}': {e}", path.display()))?;
+fn load_profiles(path: &Path) -> Result<Vec<sanitize_engine::processor::FileTypeProfile>, String> {
+    let raw =
+        fs::read(path).map_err(|e| format!("failed to read profile '{}': {e}", path.display()))?;
     let text = std::str::from_utf8(&raw)
         .map_err(|_| format!("profile '{}' is not valid UTF-8", path.display()))?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -2669,16 +2712,24 @@ fn load_profiles(
             .map_err(|e| format!("profile '{}': invalid JSON: {e}", path.display())),
         "yaml" | "yml" => serde_yaml_ng::from_str(text)
             .map_err(|e| format!("profile '{}': invalid YAML: {e}", path.display())),
-        _ => serde_json::from_str(text).or_else(|_| serde_yaml_ng::from_str(text)).map_err(
-            |e| format!("profile '{}': could not parse as JSON or YAML: {e}", path.display()),
-        ),
+        _ => serde_json::from_str(text)
+            .or_else(|_| serde_yaml_ng::from_str(text))
+            .map_err(|e| {
+                format!(
+                    "profile '{}': could not parse as JSON or YAML: {e}",
+                    path.display()
+                )
+            }),
     }?;
 
     // Validate include/exclude globs eagerly so bad patterns are caught at startup.
     for (i, p) in profiles.iter().enumerate() {
         for pat in p.include.iter().chain(p.exclude.iter()) {
             glob::Pattern::new(pat).map_err(|e| {
-                format!("profile '{}' entry {i}: invalid glob '{pat}': {e}", path.display())
+                format!(
+                    "profile '{}' entry {i}: invalid glob '{pat}': {e}",
+                    path.display()
+                )
             })?;
         }
     }
@@ -2743,10 +2794,7 @@ fn build_format_preserving_scanner(
 }
 
 /// Fall back to the streaming scanner for raw bytes.
-fn scanner_fallback(
-    scanner: &StreamScanner,
-    input: &[u8],
-) -> Result<(Vec<u8>, ScanStats), String> {
+fn scanner_fallback(scanner: &StreamScanner, input: &[u8]) -> Result<(Vec<u8>, ScanStats), String> {
     let (output, stats) = scanner
         .scan_bytes(input)
         .map_err(|e| format!("scanner error: {e}"))?;
@@ -2841,14 +2889,12 @@ fn process_archive(
         let archive_proc = if let Some(progress) = &progress {
             let label = label.clone();
             let progress = Arc::clone(progress);
-            base_proc.with_progress_callback(Arc::new(
-                move |archive_progress: &ArchiveProgress| {
-                    progress
-                        .lock()
-                        .unwrap()
-                        .update_archive(&label, archive_progress);
-                },
-            ))
+            base_proc.with_progress_callback(Arc::new(move |archive_progress: &ArchiveProgress| {
+                progress
+                    .lock()
+                    .unwrap()
+                    .update_archive(&label, archive_progress);
+            }))
         } else {
             base_proc
         };
@@ -3158,8 +3204,7 @@ fn run() -> Result<(), (String, i32)> {
     // Pre-parse --only / --exclude flags that are interleaved with archive
     // paths before handing the cleaned arg list to clap.
     let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let (raw_filter_map, cleaned_args) =
-        parse_archive_filters(&raw_args).map_err(|e| (e, 1))?;
+    let (raw_filter_map, cleaned_args) = parse_archive_filters(&raw_args).map_err(|e| (e, 1))?;
 
     // Compile ArchiveFilter objects eagerly so errors are reported before any
     // file I/O starts.
@@ -3172,9 +3217,7 @@ fn run() -> Result<(), (String, i32)> {
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
 
-    let cli = Cli::parse_from(
-        std::iter::once(OsString::from("sanitize")).chain(cleaned_args),
-    );
+    let cli = Cli::parse_from(std::iter::once(OsString::from("sanitize")).chain(cleaned_args));
 
     // --- initialise logging -------------------------------------------------
     init_logging(&cli.log_format);
@@ -3191,7 +3234,11 @@ fn run() -> Result<(), (String, i32)> {
     run_sanitize(cli, None, filter_map)
 }
 
-fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filter_map: HashMap<PathBuf, ArchiveFilter>) -> Result<(), (String, i32)> {
+fn run_sanitize(
+    cli: Cli,
+    pre_resolved_password: Option<Zeroizing<String>>,
+    filter_map: HashMap<PathBuf, ArchiveFilter>,
+) -> Result<(), (String, i32)> {
     // --- install signal handler (graceful shutdown) --------------------------
     if let Err(e) = ctrlc::set_handler(move || {
         INTERRUPTED.store(true, Ordering::SeqCst);
@@ -3234,21 +3281,26 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
         "starting sanitization"
     );
 
-    let effective_password: Option<Zeroizing<String>> = if cli.encrypted_secrets || cli.deterministic {
-        if let Some(pw) = pre_resolved_password {
-            Some(pw)
+    let effective_password: Option<Zeroizing<String>> =
+        if cli.encrypted_secrets || cli.deterministic {
+            if let Some(pw) = pre_resolved_password {
+                Some(pw)
+            } else {
+                Some(resolve_sanitize_password(&cli).map_err(|e| (e, 1))?)
+            }
         } else {
-            Some(resolve_sanitize_password(&cli).map_err(|e| (e, 1))?)
-        }
-    } else {
-        None
-    };
+            None
+        };
     // effective_password is Zeroizing<String> — scrubbed automatically on drop.
 
     // --- build core components ----------------------------------------------
     let scan_config = build_scan_config(cli.chunk_size).map_err(|e| (e, 1))?;
-    let store = build_store(cli.deterministic, effective_password.as_ref().map(|s| s.as_str()), cli.max_mappings)
-        .map_err(|e| (e, 1))?;
+    let store = build_store(
+        cli.deterministic,
+        effective_password.as_ref().map(|s| s.as_str()),
+        cli.max_mappings,
+    )
+    .map_err(|e| (e, 1))?;
     let registry = Arc::new(ProcessorRegistry::with_builtins());
 
     // --- load field-path profiles (--profile) --------------------------------
@@ -3299,7 +3351,11 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
         )
         .map_err(|e| (format!("failed to load secrets: {e}"), 1))?;
 
-        let secrets_display = cli.secrets_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        let secrets_display = cli
+            .secrets_file
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         if was_encrypted {
             info!(secrets_file = %secrets_display, "loaded encrypted secrets");
         } else {
@@ -3324,7 +3380,11 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
         let scanner = StreamScanner::new(patterns, Arc::clone(&store), scan_config.clone())
             .map_err(|e| (format!("failed to create scanner: {e}"), 1))?;
 
-        let secrets_display = cli.secrets_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        let secrets_display = cli
+            .secrets_file
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         info!(
             patterns = scanner.pattern_count(),
             secrets_file = %secrets_display,
@@ -3412,7 +3472,9 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
         (vec![], file_targets)
     } else {
         file_targets.into_iter().partition(|t| {
-            let InputTarget::File { ref input, .. } = t else { return false; };
+            let InputTarget::File { ref input, .. } = t else {
+                return false;
+            };
             let name = input.to_string_lossy();
             ArchiveFormat::from_path(&name).is_none()
                 && profiles.iter().any(|p| p.matches_filename(&name))
@@ -3424,7 +3486,9 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
         if is_interrupted() {
             break;
         }
-        let InputTarget::File { input, output } = target else { unreachable!() };
+        let InputTarget::File { input, output } = target else {
+            unreachable!()
+        };
         let result = process_plain_file(
             &input,
             &cli,
@@ -3455,18 +3519,33 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
             if is_interrupted() {
                 break;
             }
-            let InputTarget::File { ref input, .. } = target else { continue };
+            let InputTarget::File { ref input, .. } = target else {
+                continue;
+            };
             let input_str = input.to_string_lossy();
-            let Some(fmt) = ArchiveFormat::from_path(&input_str) else { continue };
+            let Some(fmt) = ArchiveFormat::from_path(&input_str) else {
+                continue;
+            };
             let file = fs::File::open(input).map_err(|e| {
-                (format!("failed to open {} for profile discovery: {e}", input.display()), 1)
+                (
+                    format!(
+                        "failed to open {} for profile discovery: {e}",
+                        input.display()
+                    ),
+                    1,
+                )
             })?;
             match fmt {
                 ArchiveFormat::Tar => discovery.discover_profiles_tar(file),
                 ArchiveFormat::TarGz => discovery.discover_profiles_tar_gz(file),
                 ArchiveFormat::Zip => discovery.discover_profiles_zip(file),
             }
-            .map_err(|e| (format!("profile discovery failed for {}: {e}", input.display()), 1))?;
+            .map_err(|e| {
+                (
+                    format!("profile discovery failed for {}: {e}", input.display()),
+                    1,
+                )
+            })?;
         }
     }
 
@@ -3592,9 +3671,10 @@ fn run_sanitize(cli: Cli, pre_resolved_password: Option<Zeroizing<String>>, filt
     // When running deterministically with a profile, save the literal values
     // found by structured scanning so future runs' scanner can match them.
     if cli.deterministic && !profiles.is_empty() {
-        let save_path = cli.secrets_file.clone().unwrap_or_else(|| {
-            PathBuf::from("sanitize-discovered.yaml")
-        });
+        let save_path = cli
+            .secrets_file
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("sanitize-discovered.yaml"));
         match save_discovered_secrets(&store, &save_path) {
             Ok(0) => {}
             Ok(n) => info!(

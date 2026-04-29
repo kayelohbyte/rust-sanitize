@@ -195,7 +195,11 @@ impl FileTypeProfile {
         if self.extensions.is_empty() {
             return false;
         }
-        if !self.extensions.iter().any(|ext| filename.ends_with(ext.as_str())) {
+        if !self
+            .extensions
+            .iter()
+            .any(|ext| filename.ends_with(ext.as_str()))
+        {
             return false;
         }
 
@@ -207,17 +211,12 @@ impl FileTypeProfile {
             .and_then(|n| n.to_str())
             .unwrap_or(filename);
 
-        let glob_matches = |pat: &str| {
-            Pattern::new(pat).map_or(false, |p| {
-                p.matches(filename) || p.matches(basename)
-            })
-        };
+        let glob_matches =
+            |pat: &str| Pattern::new(pat).is_ok_and(|p| p.matches(filename) || p.matches(basename));
 
         // 2. Include filter (opt-in narrowing): must match at least one pattern.
-        if !self.include.is_empty() {
-            if !self.include.iter().any(|pat| glob_matches(pat)) {
-                return false;
-            }
+        if !self.include.is_empty() && !self.include.iter().any(|pat| glob_matches(pat)) {
+            return false;
         }
 
         // 3. Exclude filter: must not match any pattern.

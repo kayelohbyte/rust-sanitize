@@ -176,18 +176,17 @@ impl CompiledPattern {
 impl ArchiveFilter {
     /// Compile `only` and `exclude` pattern lists into an `ArchiveFilter`.
     ///
+    /// # Errors
+    ///
     /// Returns an error if any pattern contains invalid glob syntax.
-    pub fn new(
-        only: Vec<String>,
-        exclude: Vec<String>,
-    ) -> std::result::Result<Self, String> {
+    pub fn new(only: Vec<String>, exclude: Vec<String>) -> std::result::Result<Self, String> {
         let only = only
-            .iter()
-            .map(|p| CompiledPattern::compile(p))
+            .into_iter()
+            .map(|p| CompiledPattern::compile(&p))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let exclude = exclude
-            .iter()
-            .map(|p| CompiledPattern::compile(p))
+            .into_iter()
+            .map(|p| CompiledPattern::compile(&p))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self { only, exclude })
     }
@@ -311,10 +310,18 @@ impl ArchiveStats {
         self.total_input_bytes += child.total_input_bytes;
         self.total_output_bytes += child.total_output_bytes;
         self.entries_filtered += child.entries_filtered;
-        self.file_methods
-            .extend(child.file_methods.iter().map(|(k, v)| (k.clone(), v.clone())));
-        self.file_scan_stats
-            .extend(child.file_scan_stats.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.file_methods.extend(
+            child
+                .file_methods
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        self.file_scan_stats.extend(
+            child
+                .file_scan_stats
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
     }
 }
 
@@ -549,27 +556,26 @@ impl ArchiveProcessor {
                 // A parse error (e.g. binary content with a .yaml extension, like
                 // macOS resource-fork ._* files) falls through to the scanner
                 // rather than failing the whole archive.
-                match self.registry.process(&content, profile, &self.store) {
-                    Ok(Some(structured_out)) => {
-                        // Double-pass: run the streaming scanner on the structured
-                        // output to catch anything the field rules missed.
-                        let (output, scan_stats) = self.scanner.scan_bytes(&structured_out)?;
-                        stats.structured_hits += 1;
-                        stats.total_output_bytes += output.len() as u64;
-                        stats.file_methods.insert(
-                            filename.to_string(),
-                            format!("structured+scan:{}", profile.processor),
-                        );
-                        stats
-                            .file_scan_stats
-                            .insert(filename.to_string(), scan_stats);
-                        writer.write_all(&output).map_err(|e| {
-                            SanitizeError::ArchiveError(format!("write entry '{filename}': {e}"))
-                        })?;
-                        return Ok(());
-                    }
-                    Ok(None) => {} // heuristic rejected — fall through to scanner below
-                    Err(_) => {}  // parse failed — fall through to scanner below
+                // A parse error or heuristic rejection falls through to the scanner below.
+                if let Ok(Some(structured_out)) =
+                    self.registry.process(&content, profile, &self.store)
+                {
+                    // Double-pass: run the streaming scanner on the structured
+                    // output to catch anything the field rules missed.
+                    let (output, scan_stats) = self.scanner.scan_bytes(&structured_out)?;
+                    stats.structured_hits += 1;
+                    stats.total_output_bytes += output.len() as u64;
+                    stats.file_methods.insert(
+                        filename.to_string(),
+                        format!("structured+scan:{}", profile.processor),
+                    );
+                    stats
+                        .file_scan_stats
+                        .insert(filename.to_string(), scan_stats);
+                    writer.write_all(&output).map_err(|e| {
+                        SanitizeError::ArchiveError(format!("write entry '{filename}': {e}"))
+                    })?;
+                    return Ok(());
                 }
 
                 // Processor didn't match or failed — fall back to
@@ -696,6 +702,10 @@ impl ArchiveProcessor {
     /// Run the structured processor on every profile-matched entry in a
     /// `.tar` archive, recording replacements into the store.  Output is
     /// discarded; the archive is not modified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the archive cannot be read or an entry cannot be processed.
     pub fn discover_profiles_tar<R: Read>(&self, reader: R) -> Result<()> {
         if self.profiles.is_empty() {
             return Ok(());
@@ -730,6 +740,10 @@ impl ArchiveProcessor {
     /// Run the structured processor on every profile-matched entry in a
     /// `.tar.gz` archive, recording replacements into the store.  Output is
     /// discarded; the archive is not modified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the archive cannot be read or an entry cannot be processed.
     pub fn discover_profiles_tar_gz<R: Read>(&self, reader: R) -> Result<()> {
         let gz = flate2::read::GzDecoder::new(reader);
         self.discover_profiles_tar(gz)
@@ -738,6 +752,10 @@ impl ArchiveProcessor {
     /// Run the structured processor on every profile-matched entry in a
     /// `.zip` archive, recording replacements into the store.  Output is
     /// discarded; the archive is not modified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the archive cannot be read or an entry cannot be processed.
     pub fn discover_profiles_zip<R: Read + Seek>(&self, reader: R) -> Result<()> {
         if self.profiles.is_empty() {
             return Ok(());
@@ -822,10 +840,7 @@ impl ArchiveProcessor {
                 })?;
                 drop(entry);
                 builder.append(&header, &*data).map_err(|e| {
-                    SanitizeError::ArchiveError(format!(
-                        "append non-file entry '{}': {}",
-                        path, e
-                    ))
+                    SanitizeError::ArchiveError(format!("append non-file entry '{}': {}", path, e))
                 })?;
                 stats.entries_skipped += 1;
                 self.emit_progress(&stats, None, &path);
@@ -1031,9 +1046,9 @@ impl ArchiveProcessor {
                 if !self.filter.passes(&meta.name) {
                     continue;
                 }
-                let mut entry = zip_in.by_index(i).map_err(|e| {
-                    SanitizeError::ArchiveError(format!("zip entry {}: {}", i, e))
-                })?;
+                let mut entry = zip_in
+                    .by_index(i)
+                    .map_err(|e| SanitizeError::ArchiveError(format!("zip entry {}: {}", i, e)))?;
                 let mut data = Vec::new();
                 entry.read_to_end(&mut data).map_err(|e| {
                     SanitizeError::ArchiveError(format!("read zip entry '{}': {}", meta.name, e))
@@ -1580,7 +1595,10 @@ mod tests {
         let proc = make_archive_processor().with_progress_callback({
             let updates = Arc::clone(&updates);
             Arc::new(move |progress| {
-                updates.lock().expect("archive progress lock").push(progress.clone());
+                updates
+                    .lock()
+                    .expect("archive progress lock")
+                    .push(progress.clone());
             })
         });
         let input = build_test_tar(&[("a.txt", b"alice@corp.com"), ("b.txt", b"SUPERSECRET")]);
@@ -1604,7 +1622,10 @@ mod tests {
         let proc = make_archive_processor().with_progress_callback({
             let updates = Arc::clone(&updates);
             Arc::new(move |progress| {
-                updates.lock().expect("archive progress lock").push(progress.clone());
+                updates
+                    .lock()
+                    .expect("archive progress lock")
+                    .push(progress.clone());
             })
         });
         let zip_data = build_test_zip(&[

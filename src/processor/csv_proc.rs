@@ -17,7 +17,9 @@
 //! | `has_header` | `"true"`| Whether the first row is a header row. |
 
 use crate::error::{Result, SanitizeError};
-use crate::processor::{find_matching_rule, pattern_matches, replace_value, FileTypeProfile, Processor};
+use crate::processor::{
+    find_matching_rule, pattern_matches, replace_value, FileTypeProfile, Processor,
+};
 use crate::store::MappingStore;
 
 /// Maximum allowed input size (bytes) for CSV processing (F-04 fix).

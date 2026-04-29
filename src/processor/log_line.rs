@@ -20,8 +20,8 @@
 //!
 //! # Format Detection
 //!
-//! This processor is **not** auto-detected from `.log` extension.  
-//! It must be requested explicitly with `--format log`.  
+//! This processor is **not** auto-detected from `.log` extension.
+//! It must be requested explicitly with `--format log`.
 //! This avoids misprocessing plain-text log files that happen to contain
 //! individual `{` characters.
 //!
@@ -31,8 +31,8 @@
 //! or specific dot-separated paths (e.g. `"user.token"`) to be selective.
 
 use crate::error::Result;
-use crate::processor::{FileTypeProfile, Processor};
 use crate::processor::json_proc::JsonProcessor;
+use crate::processor::{FileTypeProfile, Processor};
 use crate::store::MappingStore;
 
 /// Maximum allowed input size (bytes) for log-line processing.
@@ -86,7 +86,7 @@ impl Processor for LogLineProcessor {
         // Split on '\n'. `split('\n')` on a '\n'-terminated string produces a
         // trailing empty element — skip it so we don't emit an extra blank line.
         let raw_lines: Vec<&str> = text.split('\n').collect();
-        let lines = if raw_lines.last().map_or(false, |l| l.is_empty()) {
+        let lines = if raw_lines.last().is_some_and(|l| l.is_empty()) {
             &raw_lines[..raw_lines.len() - 1]
         } else {
             &raw_lines[..]
@@ -131,11 +131,8 @@ fn process_log_line(
     let suffix = &line[json_end + 1..];
 
     // Build a compact-JSON profile so the output stays on one line.
-    let compact_profile = FileTypeProfile::new(
-        "json",
-        profile.fields.clone(),
-    )
-    .with_option("compact", "true");
+    let compact_profile =
+        FileTypeProfile::new("json", profile.fields.clone()).with_option("compact", "true");
 
     // Try to sanitise the JSON span.
     match json_proc.process(json_span.as_bytes(), &compact_profile, store) {
