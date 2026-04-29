@@ -13,3 +13,6 @@
 test.json
 test.zip
 test.sanitized.zip
+profile.yaml
+secrets.yaml
+test.yaml
