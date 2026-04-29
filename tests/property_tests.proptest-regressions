@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc aebd9a963e5233cc1aca370d548197a889024dffda54733f0f9d8ea6bc805fd2 # shrinks to seed = [199, 33, 27, 227, 153, 189, 139, 104, 233, 255, 102, 206, 200, 162, 128, 91, 196, 99, 184, 160, 184, 201, 1, 138, 226, 213, 109, 208, 118, 91, 132, 50], cat = Name, a = "Ѩ\u{b}~'?@\u{6}_\u{129f5}?\\.'\u{3f146}\u{4}\u{b}\u{13488}c·/𣹹🕴Ѩ\t\r\\\u{b}\u{bdc41}a\u{88367}\u{202e}Ⱥ¥I\0𧠟Ѩ\u{66c49}*𨍽\u{11dfe}s$MѨ`¥%P9\u{ab063}\u{3}Hö\u{bc64f}T&K𤑣|*{$d**k\r&\u{ad52f}\u{42143}¶'\u{1b}\u{1}%·\u{202e}g\0", b = ":\u{5be25}\u{c8bd5}\t?T\0𣰲`\u{b9ac0}\u{7f}\u{6}\\\u{b6002}\u{96bbd}{�\u{3}&\u{ae878}\\\u{2}ë𢻌¥\"�A🕴]\u{202e}.@k\u{df39b}\u{feff}?=\u{7685e}&\0\u{8aaef}¥<\t:|\u{b7934}%\u{f0450}\u{8ed23}\\'\u{50f59}{?�🕴Ѩ\u{bb419};\u{3}Ⱥ\u{1b}\u{fbf78}MÚ\u{fcdbe}G\u{f7ad6}:狇\u{feff}\u{e9934}7.iq=]$¥\u{6}'\u{1e5c3}6)�\u{5198e}🕴\0"
+cc 80d19182dfa909c35d356a5a9d5e7d0af3fe9e252afbdbbc2f414fce4ea54fca # shrinks to seed = [47, 145, 8, 160, 63, 13, 181, 8, 63, 217, 144, 245, 176, 161, 130, 161, 233, 66, 146, 161, 250, 248, 27, 121, 46, 199, 2, 48, 214, 233, 26, 169], input = "h"
+cc 9044e976340a010df662068d6355a670b0835da2b6ba1bcf4a54823e5da6e4ac # shrinks to seed = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], cat = Url, input = "¡"

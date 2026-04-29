@@ -1,0 +1,32 @@
+[package]
+name = "sanitize-engine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sanitize-engine = { path = ".." }
+
+[[bin]]
+name = "fuzz_regex"
+path = "fuzz_targets/fuzz_regex.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_json"
+path = "fuzz_targets/fuzz_json.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_yaml"
+path = "fuzz_targets/fuzz_yaml.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_archive"
+path = "fuzz_targets/fuzz_archive.rs"
+doc = false
