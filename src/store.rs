@@ -38,15 +38,35 @@ use zeroize::Zeroize;
 // Composite key for the forward map
 // ---------------------------------------------------------------------------
 
+/// A `String` that zeroizes its heap buffer on drop.
+///
+/// `Zeroizing<String>` from the `zeroize` crate does not implement `Hash`,
+/// so it cannot be used as a `HashMap` key. This newtype adds `Hash` while
+/// keeping the zeroize-on-drop guarantee via an explicit `Drop` impl.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ZeroizingString(String);
+
+impl std::hash::Hash for ZeroizingString {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl Drop for ZeroizingString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 /// Composite key: `(Category, original_value)`.
 ///
-/// Uses `String` for `original` (rather than `CompactString`) so that
-/// the Drop impl can zeroize sensitive plaintext via the `Zeroize`
-/// trait without unsafe code (F-09 fix).
+/// `original` is `ZeroizingString` so that every copy of the sensitive
+/// plaintext — both the short-lived temporary key on the fast-path lookup
+/// and the long-lived stored key — is overwritten when dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ForwardKey {
     category: Category,
-    original: String,
+    original: ZeroizingString,
 }
 
 // ---------------------------------------------------------------------------
@@ -61,8 +81,12 @@ struct ForwardKey {
 ///
 /// See the [module-level documentation](self) for concurrency and memory details.
 pub struct MappingStore {
-    /// `(category, original) → sanitized`
-    forward: DashMap<ForwardKey, CompactString>,
+    /// `(category, original) → (sanitized, insertion_index)`
+    ///
+    /// The `usize` is the monotonic insertion index (equal to `len` at the
+    /// time of insert). This allows `iter_since(snapshot)` to return only
+    /// entries added after a snapshot point without building a full HashSet.
+    forward: DashMap<ForwardKey, (CompactString, usize)>,
     /// Replacement generator (HMAC deterministic or CSPRNG random).
     generator: Arc<dyn ReplacementGenerator>,
     /// Current number of mappings (atomic for lock-free reads).
@@ -111,12 +135,13 @@ impl MappingStore {
     /// reached its configured capacity limit.
     pub fn get_or_insert(&self, category: &Category, original: &str) -> Result<CompactString> {
         // Fast path: already mapped (lock-free read).
+        // Zeroizing<String> ensures this temporary key is overwritten on drop.
         let key = ForwardKey {
             category: category.clone(),
-            original: original.to_owned(),
+            original: ZeroizingString(original.to_owned()),
         };
         if let Some(existing) = self.forward.get(&key) {
-            return Ok(existing.value().clone());
+            return Ok(existing.value().0.clone());
         }
 
         // Slow path: need to insert.
@@ -130,7 +155,7 @@ impl MappingStore {
                     // One more chance: key may have been inserted by
                     // another thread while we were checking.
                     if let Some(existing) = self.forward.get(&key) {
-                        return Ok(existing.value().clone());
+                        return Ok(existing.value().0.clone());
                     }
                     return Err(SanitizeError::CapacityExceeded { current, limit });
                 }
@@ -153,15 +178,17 @@ impl MappingStore {
             // Slot reserved — generate and insert.
             // Use entry() for first-writer-wins semantics.
             let mut was_inserted = false;
+            let insertion_index = self.len.load(Ordering::Acquire).saturating_sub(1);
             let result = self
                 .forward
                 .entry(key)
                 .or_insert_with(|| {
                     was_inserted = true;
                     let val = self.generator.generate(category, original);
-                    CompactString::new(val)
+                    (CompactString::new(val), insertion_index)
                 })
                 .value()
+                .0
                 .clone();
 
             if !was_inserted {
@@ -173,21 +200,17 @@ impl MappingStore {
         } else {
             // No capacity limit — generate inside the entry lock to
             // avoid wasted work (C-2 fix: only the first writer generates).
-            let mut was_inserted = false;
             let result = self
                 .forward
                 .entry(key)
                 .or_insert_with(|| {
-                    was_inserted = true;
+                    let insertion_index = self.len.fetch_add(1, Ordering::AcqRel);
                     let val = self.generator.generate(category, original);
-                    CompactString::new(val)
+                    (CompactString::new(val), insertion_index)
                 })
                 .value()
+                .0
                 .clone();
-
-            if was_inserted {
-                self.len.fetch_add(1, Ordering::Release);
-            }
 
             Ok(result)
         }
@@ -198,9 +221,9 @@ impl MappingStore {
     pub fn forward_lookup(&self, category: &Category, original: &str) -> Option<CompactString> {
         let key = ForwardKey {
             category: category.clone(),
-            original: original.to_owned(),
+            original: ZeroizingString(original.to_owned()),
         };
-        self.forward.get(&key).map(|r| r.value().clone())
+        self.forward.get(&key).map(|r| r.value().0.clone())
     }
 
     // ---------------- Metrics ----------------
@@ -222,24 +245,48 @@ impl MappingStore {
     /// This is useful for resetting the store between runs without
     /// dropping and recreating it.
     pub fn clear(&mut self) {
-        let old_map = std::mem::take(&mut self.forward);
-        for (mut key, _value) in old_map {
-            key.original.zeroize();
-        }
+        // Dropping the map entries triggers Zeroizing<String>::drop on each key.
+        drop(std::mem::take(&mut self.forward));
         self.len.store(0, Ordering::Release);
     }
 
     // ---------------- Snapshot / diff (for format-preserving pass) ----------------
 
-    /// Snapshot the set of `(category, original)` keys currently in the store.
+    /// Snapshot the current insertion count.
     ///
-    /// Call this before structured processing; diff against `iter()` afterwards
-    /// to find which mappings were added by the processor.
-    pub fn snapshot_keys(&self) -> std::collections::HashSet<(Category, String)> {
-        self.forward
-            .iter()
-            .map(|e| (e.key().category.clone(), e.key().original.clone()))
-            .collect()
+    /// Returns an opaque `usize` that can be passed to [`iter_since`] to
+    /// iterate only the entries added *after* this point — useful for
+    /// finding which mappings a structured processor pass discovered without
+    /// building a full `HashSet` of all existing keys.
+    ///
+    /// O(1), no allocation.
+    #[must_use]
+    pub fn snapshot(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+
+    /// Iterate over entries added at or after the given snapshot.
+    ///
+    /// `snapshot` is the value returned by a previous call to [`snapshot`].
+    /// Entries whose insertion index is ≥ `snapshot` are yielded; older
+    /// entries are skipped.  Still O(n) in total store size, but avoids
+    /// allocating a `HashSet` of all prior keys.
+    pub fn iter_since(
+        &self,
+        snapshot: usize,
+    ) -> impl Iterator<Item = (Category, CompactString, CompactString)> + '_ {
+        self.forward.iter().filter_map(move |entry| {
+            let (sanitized, idx) = entry.value();
+            if *idx >= snapshot {
+                Some((
+                    entry.key().category.clone(),
+                    CompactString::new(entry.key().original.0.as_str()),
+                    sanitized.clone(),
+                ))
+            } else {
+                None
+            }
+        })
     }
 
     // ---------------- Iteration (for external use) ----------------
@@ -252,31 +299,20 @@ impl MappingStore {
         self.forward.iter().map(|entry| {
             (
                 entry.key().category.clone(),
-                CompactString::new(&entry.key().original),
-                entry.value().clone(),
+                CompactString::new(entry.key().original.0.as_str()),
+                entry.value().0.clone(),
             )
         })
     }
 }
 
 /// F-09 fix: zeroize original keys stored in the forward map on drop.
-/// This prevents sensitive plaintext values from lingering on the heap
-/// after the store is no longer needed. Uses safe Zeroize on Strings.
+/// `Zeroizing<String>` already zeroizes its buffer when dropped; we take
+/// ownership of the map so that every key's destructor runs before the
+/// backing allocation is freed.
 impl Drop for MappingStore {
     fn drop(&mut self) {
-        // DashMap::retain() visits each entry. We use it to overwrite
-        // the original plaintext before the entry is dropped.
-        // retain() gives us (&K, &mut V); the key is behind a shared
-        // reference.  We extract the original, create a zeroizing copy,
-        // then clear the map. This ensures the String backing buffer
-        // is zeroed before being freed.
-        //
-        // Approach: swap the map contents with an empty map, consuming
-        // ownership of all entries via IntoIter.
-        let old_map = std::mem::take(&mut self.forward);
-        for (mut key, _value) in old_map {
-            key.original.zeroize();
-        }
+        drop(std::mem::take(&mut self.forward));
     }
 }
 

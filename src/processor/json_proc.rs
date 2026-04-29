@@ -18,7 +18,7 @@ use serde_json::Value;
 
 /// Maximum recursion depth for walking JSON value trees.
 /// Prevents stack overflow from deeply nested or malicious inputs (R-4 fix).
-const MAX_JSON_DEPTH: usize = 128;
+pub(crate) const MAX_JSON_DEPTH: usize = 128;
 
 /// Maximum allowed input size (bytes) for JSON processing (F-04 fix).
 /// Inputs exceeding this are rejected before parsing.
@@ -85,7 +85,7 @@ impl Processor for JsonProcessor {
 ///
 /// `depth` tracks the current recursion level; exceeding `MAX_JSON_DEPTH`
 /// returns an error instead of risking a stack overflow.
-fn walk_json(
+pub(crate) fn walk_json(
     value: &mut Value,
     prefix: &str,
     profile: &FileTypeProfile,

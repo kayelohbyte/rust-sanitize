@@ -21,7 +21,7 @@ Deterministic, one-way data sanitization engine and CLI tool.
 - **One-way only.** No mapping file, no restore mode. Forward map lives in process memory and is zeroized on drop.
 - **Deterministic or random.** HMAC-SHA256 seeded mode produces identical replacements across runs; CSPRNG mode produces fresh replacements each run (still consistent within a single run via dedup cache).
 - **Streaming architecture.** Processes 20–100 GB+ files in bounded memory via configurable chunk + overlap scanning.
-- **Format-aware processing.** Structured processors for JSON, YAML, XML, CSV, and key-value files replace only matched field values while preserving document structure exactly — comments, indentation, key ordering, and quoting style are all retained.
+- **Format-aware processing.** Structured processors for JSON, NDJSON/JSON Lines, YAML, TOML, XML, CSV, `.env`, INI, and key-value files replace only matched field values while preserving document structure exactly — comments, indentation, key ordering, and quoting style are all retained.
 - **Archive support.** Tar, tar.gz, and zip archives are processed entry-by-entry with automatic format detection and metadata preservation.
 - **Zero `unsafe` code.** The entire crate contains no `unsafe` blocks.
 
@@ -50,11 +50,24 @@ cat > profile.yaml <<'EOF'
       category: "custom:password"
     - pattern: "*.username"
       category: email
+
+- processor: jsonl
+  extensions: [".jsonl", ".ndjson", ".log"]
+  options:
+    skip_invalid: "true"   # pass non-JSON lines through unchanged
+  fields:
+    - pattern: "*.email"
+      category: email
+    - pattern: "*.user"
+      category: name
+    - pattern: "*.ip"
+      category: ipv4
 EOF
 
 # 2. Sanitize a config file — only matched fields are replaced:
 sanitize config.yaml --profile profile.yaml
 # Comments, indentation, and unmatched values are preserved exactly.
+# NDJSON/log files are processed line-by-line in bounded memory (streaming).
 
 # 3. Combine with a secrets file to also catch those values in logs:
 sanitize config.yaml app.log --profile profile.yaml -s secrets.yaml
@@ -117,7 +130,7 @@ sanitize a.zip --only 'config/' b.tar.gz --only '**/*.log' -s secrets.yaml
 cat extra.log | sanitize - backup.zip --only 'logs/' config.yaml -s secrets.yaml
 ```
 
-### Quick Start - Guided Setup
+### Quick Start — Guided Setup
 
 For a logs-focused starter template, run the interactive wizard:
 
@@ -125,7 +138,25 @@ For a logs-focused starter template, run the interactive wizard:
 sanitize guided
 ```
 
-The wizard can generate a baseline secrets file, optionally encrypt it, and optionally run sanitization immediately.
+The wizard produces two files:
+
+- **`secrets.yaml`** — a streaming scanner config covering emails, IPs, UUIDs, API keys, tokens, PEM keys, and cloud provider identifiers. Encrypted to `secrets.yaml.enc` if you choose to encrypt (plaintext is then removed automatically).
+- **`profile.yaml`** — structured field rules for the formats you select (YAML/JSON, NDJSON, `.env`, TOML, INI). Use this with `--profile` to replace specific fields by name rather than scanning raw bytes.
+
+```bash
+# After the wizard finishes, run sanitize with both files:
+sanitize app.log config.yaml -s secrets.yaml.enc --password --profile profile.yaml
+```
+
+The preset controls which patterns are included:
+
+| Preset | Extra coverage |
+|--------|---------------|
+| Generic | Tokens, emails, IPs, UUIDs (default) |
+| Web app | JWTs, session cookies, OAuth tokens |
+| Kubernetes | Service-account tokens, namespaces, container IDs, k8s Secret field rules |
+| Database | Connection strings, DSNs, DB passwords |
+| AWS | Access keys, ARNs, account IDs, EC2 instance IDs |
 
 For a full step-by-step breakdown of prompts and the exact categories/patterns generated, see the `sanitize guided` section in [docs/cli-reference.md](docs/cli-reference.md).
 
@@ -286,10 +317,15 @@ assert_eq!(sanitized, again);
 |--------|-----------|-----------|
 | Plain text | `StreamScanner` (chunk + overlap) | Default fallback for all files |
 | JSON | `JsonProcessor` | Profile match or `{`/`[` heuristic |
+| NDJSON / JSON Lines | `JsonLinesProcessor` | Profile match (`jsonl`) or multi-line `{` heuristic; **streaming** — processes GB-scale log files in bounded memory |
 | YAML | `YamlProcessor` | Profile match or `---`/`- `/`: ` heuristic |
+| TOML | `TomlProcessor` | Profile match or `[section]` heuristic |
 | XML | `XmlProcessor` | Profile match or `<?xml`/`<` heuristic |
 | CSV / TSV | `CsvProcessor` | Profile match only |
+| `.env` | `EnvProcessor` | Profile match only |
+| INI / `.conf` | `IniProcessor` | Profile match only |
 | Key-value | `KeyValueProcessor` | Profile match only |
+| Log lines (mixed) | `LogLineProcessor` | Profile match only |
 | Tar | `ArchiveProcessor` | `.tar` extension |
 | Tar.gz / .tgz | `ArchiveProcessor` | `.tar.gz` / `.tgz` extension |
 | Zip | `ArchiveProcessor` | `.zip` extension |

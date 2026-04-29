@@ -72,9 +72,9 @@ use sanitize_engine::secrets::{
 };
 use sanitize_engine::{
     atomic_write, ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress,
-    AtomicFileWriter, FileReport, HmacGenerator, MappingStore, ProcessorRegistry, RandomGenerator,
-    ReplacementGenerator, ReportBuilder, ReportMetadata, ScanConfig, ScanPattern, ScanStats,
-    StreamScanner, DEFAULT_MAX_ARCHIVE_DEPTH,
+    AtomicFileWriter, Category, FieldRule, FileReport, FileTypeProfile, HmacGenerator,
+    MappingStore, ProcessorRegistry, RandomGenerator, ReplacementGenerator, ReportBuilder,
+    ReportMetadata, ScanConfig, ScanPattern, ScanStats, StreamScanner, DEFAULT_MAX_ARCHIVE_DEPTH,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -499,12 +499,23 @@ enum CloudProvider {
     Gcp,
 }
 
+/// Structured file formats to include in the generated profile.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+enum GuidedFormat {
+    YamlJson,
+    JsonLines,
+    Env,
+    Toml,
+    IniConf,
+}
+
 #[derive(Clone, Debug)]
 struct GuidedOptions {
     preset: GuidedPreset,
     domains: Vec<String>,
     providers: Vec<CloudProvider>,
     exclude_noise_ids: bool,
+    formats: Vec<GuidedFormat>,
 }
 
 fn prompt_line(prompt: &str) -> Result<String, String> {
@@ -603,6 +614,58 @@ fn prompt_cloud_providers() -> Result<Vec<CloudProvider>, String> {
     Ok(selected)
 }
 
+fn prompt_formats() -> Result<Vec<GuidedFormat>, String> {
+    eprintln!("Structured file formats to include in profile (controls field-level redaction):");
+    eprintln!("  1) YAML / JSON    — k8s manifests, docker-compose, app configs");
+    eprintln!("  2) JSON Lines     — NDJSON structured logs (.jsonl, .ndjson)");
+    eprintln!("  3) .env files     — twelve-factor app secrets, CI variables");
+    eprintln!("  4) TOML           — Rust, Hugo, and other TOML configs");
+    eprintln!("  5) INI / conf     — system services, databases, legacy apps");
+    eprintln!("  6) All of the above (default)");
+    eprintln!("  7) None           — secrets file only, no profile");
+    let raw = prompt_line("Select one or more (comma-separated, default: 6): ")?;
+
+    if raw.trim().is_empty() || raw.trim() == "6" {
+        return Ok(vec![
+            GuidedFormat::YamlJson,
+            GuidedFormat::JsonLines,
+            GuidedFormat::Env,
+            GuidedFormat::Toml,
+            GuidedFormat::IniConf,
+        ]);
+    }
+    if raw.trim() == "7" {
+        return Ok(vec![]);
+    }
+
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for token in raw.split(',').map(|s| s.trim()) {
+        let fmt = match token {
+            "1" => GuidedFormat::YamlJson,
+            "2" => GuidedFormat::JsonLines,
+            "3" => GuidedFormat::Env,
+            "4" => GuidedFormat::Toml,
+            "5" => GuidedFormat::IniConf,
+            "6" => {
+                return Ok(vec![
+                    GuidedFormat::YamlJson,
+                    GuidedFormat::JsonLines,
+                    GuidedFormat::Env,
+                    GuidedFormat::Toml,
+                    GuidedFormat::IniConf,
+                ]);
+            }
+            "7" => return Ok(vec![]),
+            _ => return Err(format!("invalid selection: '{token}'")),
+        };
+        if seen.insert(fmt) {
+            selected.push(fmt);
+        }
+    }
+    Ok(selected)
+}
+
 fn make_regex_entry(pattern: &str, category: &str, label: &str) -> SecretEntry {
     SecretEntry {
         pattern: pattern.to_string(),
@@ -614,40 +677,103 @@ fn make_regex_entry(pattern: &str, category: &str, label: &str) -> SecretEntry {
 
 fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
     let mut entries = vec![
+        // Emails — low false-positive, high value across all use cases.
         make_regex_entry(
             r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
             "email",
             "email",
         ),
-        make_regex_entry(
-            r"\b(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)\.)+(?:[a-zA-Z]{2,63})\b",
-            "hostname",
-            "hostname",
-        ),
+        // IPv4 addresses — pods, services, client IPs in logs.
         make_regex_entry(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "ipv4", "ipv4"),
+        // IPv6 addresses.
         make_regex_entry(
             r"\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b",
             "ipv6",
             "ipv6",
         ),
-        make_regex_entry(
-            r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b",
-            "mac_address",
-            "mac_address",
-        ),
+        // UUIDs — request IDs, pod IDs, resource IDs.
         make_regex_entry(
             r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b",
             "uuid",
             "uuid",
         ),
-        make_regex_entry(r"\b[a-f0-9]{12,64}\b", "container_id", "container_id"),
+        // JWTs — service account tokens, OIDC, bearer tokens.
         make_regex_entry(
             r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
             "jwt",
             "jwt",
         ),
+        // URLs including query strings (may contain tokens or credentials).
         make_regex_entry(r#"https?://[^\s"'<>]+"#, "url", "url"),
+        // PEM / private key headers — appears in certs, k8s secrets, CI vars.
+        // Near-zero false positives.
+        make_regex_entry(
+            r"-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----",
+            "auth_token",
+            "private_key_header",
+        ),
+        // Generic secret key=value in any text format.
+        // Matches: api_key=..., client_secret: ..., secret_key="...", etc.
+        make_regex_entry(
+            r#"(?i)(?:api_key|api_secret|client_secret|private_key|secret_key|auth_key|signing_key)[\s:="']+[A-Za-z0-9._~+/=-]{16,}"#,
+            "auth_token",
+            "secret_kv",
+        ),
+        // Password in key=value / YAML / env form (broader than db_password).
+        make_regex_entry(
+            r#"(?i)(?:password|passwd|pwd)[\s:="']+[^\s"']{6,}"#,
+            "custom:password",
+            "password_kv",
+        ),
+        // File paths that expose usernames (/home/alice, /Users/alice).
+        make_regex_entry(
+            r"/(?:home|Users)/[A-Za-z0-9_.-]+",
+            "file_path",
+            "user_home_path",
+        ),
+        // Docker / OCI image digests (sha256:...) — exact 64-char hex after prefix.
+        make_regex_entry(r"\bsha256:[a-f0-9]{64}\b", "container_id", "image_digest"),
+        // MAC addresses.
+        make_regex_entry(
+            r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b",
+            "mac_address",
+            "mac_address",
+        ),
+        // GitHub personal access tokens (classic and fine-grained).
+        make_regex_entry(
+            r"\bghp_[A-Za-z0-9]{36}\b",
+            "auth_token",
+            "github_pat_classic",
+        ),
+        make_regex_entry(
+            r"\bgithub_pat_[A-Za-z0-9_]{82}\b",
+            "auth_token",
+            "github_pat_fine_grained",
+        ),
+        // GCP API keys — AIza prefix, near-zero false positives.
+        make_regex_entry(r"\bAIza[A-Za-z0-9_-]{35}\b", "auth_token", "gcp_api_key"),
     ];
+
+    // Hostname regex is intentionally NOT in the base set — it matches any
+    // dotted word (log.level, db.name, fmt.Println) and creates too much noise
+    // in application logs. User-specified domain literals are added below,
+    // and cloud-specific host patterns are added per-provider.
+    // Enable it explicitly with the Aggressive preset.
+    if matches!(opts.preset, GuidedPreset::Aggressive) {
+        entries.push(make_regex_entry(
+            r"\b(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)\.){2,}(?:[a-zA-Z]{2,63})\b",
+            "hostname",
+            "hostname",
+        ));
+        // Short container IDs (docker ps short form — 12 hex chars).
+        // Aggressive-only because bare 12-hex-char strings appear frequently
+        // in hex color codes, version hashes, and other non-container contexts.
+        entries.push(make_regex_entry(
+            r"\b[a-f0-9]{12}\b",
+            "container_id",
+            "container_id_short",
+        ));
+    }
 
     if matches!(
         opts.preset,
@@ -657,9 +783,9 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
             | GuidedPreset::Database
     ) {
         entries.push(make_regex_entry(
-            r"(?i)\b(?:bearer|token|api[_-]?key|secret)[\s:=]+[A-Za-z0-9._~+/=-]{16,}\b",
+            r"(?i)\b(?:bearer|authorization)[\s:]+[A-Za-z0-9._~+/=-]{16,}\b",
             "auth_token",
-            "auth_token_context",
+            "bearer_token",
         ));
         entries.push(make_regex_entry(
             r"\b[A-Za-z0-9_\-]{20,}\b",
@@ -682,17 +808,30 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
         ));
     }
 
-    // Kubernetes specific: service account tokens, namespaces, pod names.
+    // Kubernetes specific: service account tokens, namespaces.
     if matches!(opts.preset, GuidedPreset::Kubernetes) {
         entries.push(make_regex_entry(
-            r"\bServiceAccountToken[:\s]+[A-Za-z0-9._~+/=-]{20,}\b",
+            r"(?i)token[\s:]+[A-Za-z0-9._~+/=-]{20,}",
             "auth_token",
-            "k8s_service_account_token",
+            "k8s_token",
         ));
         entries.push(make_regex_entry(
             r"\bnamespace[:\s]+[a-z][a-z0-9-]{2,62}\b",
             "custom:k8s_namespace",
             "k8s_namespace",
+        ));
+        // Full SHA256 image digests in pod specs.
+        entries.push(make_regex_entry(
+            r"\b[a-f0-9]{64}\b",
+            "container_id",
+            "k8s_image_sha",
+        ));
+        // Short container IDs are common in kubectl/docker output; safe to
+        // include here because K8s logs heavily feature these 12-char hashes.
+        entries.push(make_regex_entry(
+            r"\b[a-f0-9]{12}\b",
+            "container_id",
+            "container_id_short",
         ));
     }
 
@@ -704,12 +843,14 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
             "db_connection_string",
         ));
         entries.push(make_regex_entry(
-            r#"(?i)(?:password|passwd|pwd)[\s:=]+[^\s"']{6,}"#,
-            "custom:db_password",
-            "db_password",
+            r#"(?i)(?:user|username|login)[\s:="']+[^\s"']{3,}"#,
+            "name",
+            "db_username",
         ));
     }
 
+    // User-specified domain literals: email and hostname patterns anchored
+    // to the domain, so they only fire on that org's addresses/hosts.
     for domain in &opts.domains {
         let escaped = regex::escape(domain);
         entries.push(make_regex_entry(
@@ -739,6 +880,13 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
             "auth_token",
             "aws_access_key_id",
         ));
+        // AWS account IDs in ARNs are already covered; standalone 12-digit
+        // numbers are too noisy to match globally.
+        entries.push(make_regex_entry(
+            r"\bi-[0-9a-f]{8,17}\b",
+            "container_id",
+            "ec2_instance_id",
+        ));
     }
     if has_azure {
         entries.push(make_regex_entry(
@@ -765,6 +913,162 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
     }
 
     entries
+}
+
+/// YAML comment header written at the top of every generated profile file.
+const PROFILE_HEADER: &str = "\
+# =============================================================================
+# sanitize profile — structured field rules
+# =============================================================================
+#
+# PURPOSE
+#   This file tells sanitize which fields to redact inside structured files
+#   (YAML, JSON, .env, TOML, INI, NDJSON) before sending to an LLM or
+#   external service. It works alongside the secrets file: the secrets file
+#   covers free-text patterns; this file covers key=value fields.
+#
+# HOW TO USE
+#   sanitize input/ -s secrets.yaml --profile profile.yaml -o output/
+#
+# SAFE TO COMMIT
+#   This file contains no secrets — only field name patterns. Commit it
+#   alongside your sanitize secrets file (which you should encrypt).
+#
+# FIELD REFERENCE
+#   processor   string   Required. Processor name: yaml, json, jsonl, env, toml, ini.
+#   extensions  list     File extensions this profile applies to.
+#   fields      list     Field rules: pattern (glob) + category.
+#   options     map      Processor-specific options (e.g. compact, skip_invalid).
+#
+# WARNING: REVIEW OUTPUT BEFORE SENDING TO AN LLM.
+#          Field rules redact exact keys — add regex patterns in secrets.yaml
+#          to catch values that appear outside structured fields.
+# =============================================================================
+";
+
+fn build_guided_profiles(opts: &GuidedOptions) -> Vec<FileTypeProfile> {
+    // Shared sensitive field patterns applicable to most structured formats.
+    let credential_fields = || -> Vec<FieldRule> {
+        vec![
+            FieldRule::new("*.password").with_category(Category::Custom("password".into())),
+            FieldRule::new("*.passwd").with_category(Category::Custom("password".into())),
+            FieldRule::new("*.secret").with_category(Category::AuthToken),
+            FieldRule::new("*.secret_key").with_category(Category::AuthToken),
+            FieldRule::new("*.api_key").with_category(Category::AuthToken),
+            FieldRule::new("*.api_token").with_category(Category::AuthToken),
+            FieldRule::new("*.access_token").with_category(Category::AuthToken),
+            FieldRule::new("*.auth_token").with_category(Category::AuthToken),
+            FieldRule::new("*.token").with_category(Category::AuthToken),
+            FieldRule::new("*.private_key").with_category(Category::AuthToken),
+            FieldRule::new("*.connection_string").with_category(Category::Url),
+            FieldRule::new("*.database_url").with_category(Category::Url),
+            FieldRule::new("*.dsn").with_category(Category::Url),
+        ]
+    };
+
+    let mut profiles = Vec::new();
+
+    for fmt in &opts.formats {
+        match fmt {
+            GuidedFormat::YamlJson => {
+                // YAML — k8s manifests, Helm values, docker-compose, app configs.
+                let mut yaml_fields = credential_fields();
+                yaml_fields.push(FieldRule::new("*.email").with_category(Category::Email));
+                yaml_fields.push(FieldRule::new("*.username").with_category(Category::Name));
+                // k8s Secret objects store values under data.* (base64) and
+                // stringData.* (plaintext).
+                if matches!(opts.preset, GuidedPreset::Kubernetes) {
+                    yaml_fields.push(FieldRule::new("data.*").with_category(Category::AuthToken));
+                    yaml_fields
+                        .push(FieldRule::new("stringData.*").with_category(Category::AuthToken));
+                }
+                profiles.push(
+                    FileTypeProfile::new("yaml", yaml_fields)
+                        .with_extension(".yaml")
+                        .with_extension(".yml"),
+                );
+
+                // JSON — API responses, config files.
+                let mut json_fields = credential_fields();
+                json_fields.push(FieldRule::new("*.email").with_category(Category::Email));
+                json_fields.push(FieldRule::new("*.username").with_category(Category::Name));
+                json_fields.push(FieldRule::new("*.ip").with_category(Category::IpV4));
+                profiles.push(
+                    FileTypeProfile::new("json", json_fields)
+                        .with_extension(".json")
+                        .with_option("compact", "true"),
+                );
+            }
+
+            GuidedFormat::JsonLines => {
+                // NDJSON / JSON Lines — structured application and system logs.
+                let mut fields = credential_fields();
+                fields.push(FieldRule::new("*.email").with_category(Category::Email));
+                fields.push(FieldRule::new("*.user").with_category(Category::Name));
+                fields.push(FieldRule::new("*.username").with_category(Category::Name));
+                fields.push(FieldRule::new("*.ip").with_category(Category::IpV4));
+                fields.push(FieldRule::new("*.client_ip").with_category(Category::IpV4));
+                fields.push(FieldRule::new("*.remote_addr").with_category(Category::IpV4));
+                fields.push(FieldRule::new("*.host").with_category(Category::Hostname));
+                profiles.push(
+                    FileTypeProfile::new("jsonl", fields)
+                        .with_extension(".jsonl")
+                        .with_extension(".ndjson")
+                        // skip_invalid passes non-JSON lines (plain-text
+                        // interleaved with structured log lines) through
+                        // unchanged rather than failing.
+                        .with_option("skip_invalid", "true"),
+                );
+            }
+
+            GuidedFormat::Env => {
+                // .env files — twelve-factor app secrets and CI variables.
+                let fields = vec![
+                    FieldRule::new("*_PASSWORD").with_category(Category::Custom("password".into())),
+                    FieldRule::new("*_PASSWD").with_category(Category::Custom("password".into())),
+                    FieldRule::new("*_SECRET").with_category(Category::AuthToken),
+                    FieldRule::new("*_KEY").with_category(Category::AuthToken),
+                    FieldRule::new("*_TOKEN").with_category(Category::AuthToken),
+                    FieldRule::new("*_DSN").with_category(Category::Url),
+                    FieldRule::new("*_URL").with_category(Category::Url),
+                    FieldRule::new("DATABASE_URL").with_category(Category::Url),
+                    FieldRule::new("REDIS_URL").with_category(Category::Url),
+                    FieldRule::new("*_EMAIL").with_category(Category::Email),
+                    FieldRule::new("*_USER").with_category(Category::Name),
+                    FieldRule::new("*_USERNAME").with_category(Category::Name),
+                ];
+                profiles.push(FileTypeProfile::new("env", fields).with_extension(".env"));
+            }
+
+            GuidedFormat::Toml => {
+                let mut fields = credential_fields();
+                fields.push(FieldRule::new("*.email").with_category(Category::Email));
+                fields.push(FieldRule::new("*.username").with_category(Category::Name));
+                profiles.push(FileTypeProfile::new("toml", fields).with_extension(".toml"));
+            }
+
+            GuidedFormat::IniConf => {
+                let fields = vec![
+                    FieldRule::new("*.password").with_category(Category::Custom("password".into())),
+                    FieldRule::new("*.passwd").with_category(Category::Custom("password".into())),
+                    FieldRule::new("*.secret").with_category(Category::AuthToken),
+                    FieldRule::new("*.token").with_category(Category::AuthToken),
+                    FieldRule::new("*.api_key").with_category(Category::AuthToken),
+                    FieldRule::new("*.email").with_category(Category::Email),
+                    FieldRule::new("*.username").with_category(Category::Name),
+                    FieldRule::new("*.user").with_category(Category::Name),
+                ];
+                profiles.push(
+                    FileTypeProfile::new("ini", fields)
+                        .with_extension(".ini")
+                        .with_extension(".conf")
+                        .with_extension(".cfg"),
+                );
+            }
+        }
+    }
+
+    profiles
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,13 +1481,15 @@ fn run_guided() -> Result<(), (String, i32)> {
 
     let domains = prompt_domains().map_err(|e| (e, 1))?;
     let providers = prompt_cloud_providers().map_err(|e| (e, 1))?;
+    eprintln!();
+    let formats = prompt_formats().map_err(|e| (e, 1))?;
     let exclude_noise_ids = prompt_yes_no(
-        "Exclude noisy IDs (trace_id/span_id-like high-entropy values)?",
+        "\nExclude noisy IDs (trace_id/span_id-like high-entropy values)?",
         true,
     )
     .map_err(|e| (e, 1))?;
 
-    let out_raw = prompt_line("Output secrets file path (YAML; default: secrets.guided.yaml): ")
+    let out_raw = prompt_line("\nOutput secrets file path (YAML; default: secrets.guided.yaml): ")
         .map_err(|e| (e, 1))?;
     let requested_output_path = if out_raw.trim().is_empty() {
         PathBuf::from("secrets.guided.yaml")
@@ -1210,6 +1516,7 @@ fn run_guided() -> Result<(), (String, i32)> {
         domains,
         providers,
         exclude_noise_ids,
+        formats,
     };
     let entries = build_guided_entries(&options);
 
@@ -1246,6 +1553,57 @@ fn run_guided() -> Result<(), (String, i32)> {
         output_path.display()
     );
 
+    // --- Profile file ---
+    let profile_path: Option<PathBuf> = if options.formats.is_empty() {
+        None
+    } else {
+        let profiles = build_guided_profiles(&options);
+        let profile_yaml = serde_yaml_ng::to_string(&profiles)
+            .map_err(|e| (format!("failed to serialize profile: {e}"), 1))?;
+
+        // Default profile filename mirrors the secrets filename.
+        let default_profile_name = output_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|stem| format!("{stem}.profile.yaml"))
+            .unwrap_or_else(|| "profile.guided.yaml".to_string());
+
+        let prof_raw = prompt_line(&format!(
+            "Output profile file path (default: {default_profile_name}): "
+        ))
+        .map_err(|e| (e, 1))?;
+        let prof_path = if prof_raw.trim().is_empty() {
+            PathBuf::from(&default_profile_name)
+        } else {
+            PathBuf::from(prof_raw)
+        };
+
+        if prof_path.exists()
+            && !prompt_yes_no(
+                &format!("{} already exists. Overwrite?", prof_path.display()),
+                false,
+            )
+            .map_err(|e| (e, 1))?
+        {
+            return Err(("aborted by user".into(), 1));
+        }
+
+        let mut content = String::with_capacity(PROFILE_HEADER.len() + 1 + profile_yaml.len());
+        content.push_str(PROFILE_HEADER);
+        content.push('\n');
+        content.push_str(&profile_yaml);
+
+        atomic_write(&prof_path, content.as_bytes())
+            .map_err(|e| (format!("failed to write {}: {e}", prof_path.display()), 1))?;
+
+        eprintln!(
+            "Generated {} profile rule(s) at {} (safe to commit — no secrets inside)",
+            profiles.len(),
+            prof_path.display()
+        );
+        Some(prof_path)
+    };
+
     let encrypt =
         prompt_yes_no("Encrypt the generated secrets file now?", true).map_err(|e| (e, 1))?;
     let mut secrets_for_run = output_path.clone();
@@ -1264,6 +1622,16 @@ fn run_guided() -> Result<(), (String, i32)> {
             )
         })?;
         eprintln!("Encrypted template written to {}", encrypted_path.display());
+        // Remove the plaintext file now that encryption succeeded — leaving it
+        // on disk would defeat the purpose of encrypting.
+        if let Err(e) = fs::remove_file(&output_path) {
+            eprintln!(
+                "Warning: could not remove plaintext file {}: {e}",
+                output_path.display()
+            );
+        } else {
+            eprintln!("Plaintext file {} removed.", output_path.display());
+        }
         secrets_for_run = encrypted_path;
         run_password = Some(pw);
         run_unencrypted = false;
@@ -1272,7 +1640,15 @@ fn run_guided() -> Result<(), (String, i32)> {
     let run_now =
         prompt_yes_no("Run sanitize now with this secrets file?", true).map_err(|e| (e, 1))?;
     if !run_now {
-        eprintln!("Next: sanitize <input> -s {}", secrets_for_run.display());
+        let profile_flag = profile_path
+            .as_ref()
+            .map(|p| format!(" --profile {}", p.display()))
+            .unwrap_or_default();
+        eprintln!(
+            "Next: sanitize <input> -s {}{}",
+            secrets_for_run.display(),
+            profile_flag
+        );
         return Ok(());
     }
 
@@ -1305,7 +1681,7 @@ fn run_guided() -> Result<(), (String, i32)> {
         input: vec![input],
         output,
         secrets_file: Some(secrets_for_run),
-        profile: None,
+        profile: profile_path,
         password: false,
         password_file: None,
         encrypted_secrets: !run_unencrypted,
@@ -2385,6 +2761,8 @@ fn process_plain_file(
     let structured_ext = matches!(
         filename.rsplit('.').next().unwrap_or(""),
         "json"
+            | "jsonl"
+            | "ndjson"
             | "yaml"
             | "yml"
             | "xml"
@@ -2419,6 +2797,147 @@ fn process_plain_file(
             fs::metadata(input).map_err(|e| format!("failed to stat {}: {e}", input.display()))?;
         let file_size = file_meta.len();
 
+        // --- Streaming structured path ---
+        // If the matching profile names a processor that supports streaming,
+        // bypass fs::read entirely: pass 1 opens the file as a BufReader and
+        // populates the store, then pass 2 runs the streaming scanner over the
+        // file a second time to produce output. Both passes are bounded-memory.
+        let maybe_streaming = profiles
+            .iter()
+            .find(|p| p.matches_filename(&filename))
+            .and_then(|p| {
+                registry
+                    .get(&p.processor)
+                    .filter(|proc| proc.supports_streaming())
+                    .map(|proc| (p.clone(), Arc::clone(proc)))
+            });
+
+        if let Some((streaming_profile, streaming_proc)) = maybe_streaming {
+            let store_snapshot = store.snapshot();
+            // Pass 1: populate store (output discarded).
+            {
+                let mut reader = BufReader::new(
+                    fs::File::open(input)
+                        .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                );
+                streaming_proc
+                    .process_stream(&mut reader, &mut io::sink(), &streaming_profile, store)
+                    .map_err(|e| {
+                        format!("structured pass 1 failed for {}: {e}", input.display())
+                    })?;
+            }
+            // Build scanner augmented with store-discovered literals.
+            let per_file_scanner = Arc::new(
+                build_format_preserving_scanner(scanner, store, store_snapshot)
+                    .map_err(|e| format!("failed to build per-file scanner: {e}"))?,
+            );
+            let ext = filename.rsplit('.').next().unwrap_or("unknown");
+            let method = format!("structured+scan:{ext}");
+            let sz = file_size;
+
+            // Pass 2: streaming scan → output.
+            if cli.dry_run {
+                let label = format!("Scanning {} (dry-run)", input.display());
+                let progress_label = label.clone();
+                return with_progress_scope(progress, &label, move |progress| {
+                    let reader = BufReader::new(
+                        fs::File::open(input)
+                            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                    );
+                    let stats = per_file_scanner
+                        .scan_reader_with_progress(
+                            reader,
+                            io::sink(),
+                            Some(sz),
+                            make_scan_callback(progress.clone(), &progress_label),
+                        )
+                        .map_err(|e| format!("scan error: {e}"))?;
+                    if stats.matches_found > 0 {
+                        had_matches = true;
+                    }
+                    if let Some(rb) = report_builder {
+                        rb.record_file(FileReport::from_scan_stats(
+                            input.display().to_string(),
+                            &stats,
+                            &method,
+                        ));
+                    }
+                    info!(
+                        matches = stats.matches_found,
+                        replacements = stats.replacements_applied,
+                        "dry-run complete"
+                    );
+                    Ok(had_matches)
+                });
+            } else if let Some(out_path) = output_path {
+                let label = format!("Scanning {}", input.display());
+                let progress_label = label.clone();
+                return with_progress_scope(progress, &label, move |progress| {
+                    let reader = BufReader::new(
+                        fs::File::open(input)
+                            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                    );
+                    let mut atomic_writer = AtomicFileWriter::new(out_path)
+                        .map_err(|e| format!("failed to create output: {e}"))?;
+                    let stats = per_file_scanner
+                        .scan_reader_with_progress(
+                            reader,
+                            &mut atomic_writer,
+                            Some(sz),
+                            make_scan_callback(progress.clone(), &progress_label),
+                        )
+                        .map_err(|e| format!("scanner error: {e}"))?;
+                    if is_interrupted() {
+                        return Err("interrupted — partial output discarded".into());
+                    }
+                    atomic_writer
+                        .finish()
+                        .map_err(|e| format!("failed to finalize output: {e}"))?;
+                    if stats.matches_found > 0 {
+                        had_matches = true;
+                    }
+                    if let Some(rb) = report_builder {
+                        rb.record_file(FileReport::from_scan_stats(
+                            input.display().to_string(),
+                            &stats,
+                            &method,
+                        ));
+                    }
+                    Ok(had_matches)
+                });
+            } else {
+                let label = format!("Scanning {}", input.display());
+                let progress_label = label.clone();
+                return with_progress_scope(progress, &label, move |progress| {
+                    let reader = BufReader::new(
+                        fs::File::open(input)
+                            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                    );
+                    let stdout = io::stdout();
+                    let writer = BufWriter::new(stdout.lock());
+                    let stats = per_file_scanner
+                        .scan_reader_with_progress(
+                            reader,
+                            writer,
+                            Some(sz),
+                            make_scan_callback(progress.clone(), &progress_label),
+                        )
+                        .map_err(|e| format!("scanner error: {e}"))?;
+                    if stats.matches_found > 0 {
+                        had_matches = true;
+                    }
+                    if let Some(rb) = report_builder {
+                        rb.record_file(FileReport::from_scan_stats(
+                            input.display().to_string(),
+                            &stats,
+                            &method,
+                        ));
+                    }
+                    Ok(had_matches)
+                });
+            }
+        }
+
         if file_size > cli.max_structured_size {
             warn!(
                 file = %input.display(),
@@ -2436,7 +2955,7 @@ fn process_plain_file(
 
             // Snapshot existing store keys so we can diff after structured
             // processing to find the literals discovered by this file.
-            let store_snapshot = store.snapshot_keys();
+            let store_snapshot = store.snapshot();
 
             let label = format!("Processing structured {}", input.display());
             return with_progress_scope(progress, &label, |_| {
@@ -2455,7 +2974,7 @@ fn process_plain_file(
                             //      *original* bytes, preserving comments, indentation, and key order.
                             let ext = filename.rsplit('.').next().unwrap_or("unknown");
                             let per_file_scanner =
-                                build_format_preserving_scanner(scanner, store, &store_snapshot)
+                                build_format_preserving_scanner(scanner, store, store_snapshot)
                                     .map_err(|e| {
                                         format!("failed to build per-file scanner: {e}")
                                     })?;
@@ -2771,16 +3290,14 @@ fn try_structured_processing(
 fn build_format_preserving_scanner(
     base_scanner: &Arc<StreamScanner>,
     store: &Arc<MappingStore>,
-    before_snapshot: &std::collections::HashSet<(sanitize_engine::category::Category, String)>,
+    snapshot: usize,
 ) -> Result<StreamScanner, sanitize_engine::error::SanitizeError> {
     let extra: Vec<ScanPattern> = store
-        .iter()
-        .filter(|(cat, orig, _)| {
-            orig.len() >= 4 && !before_snapshot.contains(&(cat.clone(), orig.to_string()))
-        })
+        .iter_since(snapshot)
+        .filter(|(_, orig, _)| orig.len() >= 4)
         .filter_map(|(category, original, _)| {
-            let s = original.to_string();
-            match ScanPattern::from_literal(&s, category, format!("field:{s}")) {
+            let s = original.as_str();
+            match ScanPattern::from_literal(s, category, format!("field:{s}")) {
                 Ok(pat) => Some(pat),
                 Err(e) => {
                     warn!(value = %s, error = %e, "could not compile field literal pattern");
@@ -3313,6 +3830,16 @@ fn run_sanitize(
 
     if !profiles.is_empty() {
         info!(count = profiles.len(), "loaded field-path profiles");
+        for p in &profiles {
+            if registry.get(&p.processor).is_none() {
+                eprintln!(
+                    "Warning: profile processor '{}' is not registered. \
+                     Known processors: {}",
+                    p.processor,
+                    registry.names().join(", ")
+                );
+            }
+        }
     }
 
     // --- load secrets and build scanner -------------------------------------
@@ -4129,6 +4656,7 @@ mod tests {
             domains: vec!["corp.internal".into()],
             providers: vec![CloudProvider::Aws],
             exclude_noise_ids: true,
+            formats: vec![GuidedFormat::YamlJson, GuidedFormat::Env],
         };
 
         let entries = build_guided_entries(&opts);
@@ -4143,6 +4671,7 @@ mod tests {
             domains: vec![],
             providers: vec![CloudProvider::Gcp],
             exclude_noise_ids: false,
+            formats: vec![],
         };
 
         let entries = build_guided_entries(&opts);
@@ -4150,5 +4679,153 @@ mod tests {
             .iter()
             .any(|e| e.category == "custom:gcp_service_account"));
         assert!(entries.iter().any(|e| e.category == "custom:gcp_resource"));
+    }
+
+    #[test]
+    fn guided_profiles_use_known_processor_names() {
+        use sanitize_engine::processor::ProcessorRegistry;
+        let registry = ProcessorRegistry::with_builtins();
+
+        for preset in [
+            GuidedPreset::Balanced,
+            GuidedPreset::Aggressive,
+            GuidedPreset::WebApp,
+            GuidedPreset::Kubernetes,
+            GuidedPreset::Database,
+        ] {
+            let opts = GuidedOptions {
+                preset,
+                domains: vec![],
+                providers: vec![],
+                exclude_noise_ids: false,
+                formats: vec![
+                    GuidedFormat::YamlJson,
+                    GuidedFormat::JsonLines,
+                    GuidedFormat::Env,
+                    GuidedFormat::Toml,
+                    GuidedFormat::IniConf,
+                ],
+            };
+            let profiles = build_guided_profiles(&opts);
+            for p in &profiles {
+                assert!(
+                    registry.get(&p.processor).is_some(),
+                    "preset {:?}: unknown processor '{}'",
+                    preset,
+                    p.processor
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guided_profiles_all_formats_produce_non_empty_field_rules() {
+        let opts = GuidedOptions {
+            preset: GuidedPreset::Balanced,
+            domains: vec![],
+            providers: vec![],
+            exclude_noise_ids: false,
+            formats: vec![
+                GuidedFormat::YamlJson,
+                GuidedFormat::JsonLines,
+                GuidedFormat::Env,
+                GuidedFormat::Toml,
+                GuidedFormat::IniConf,
+            ],
+        };
+        let profiles = build_guided_profiles(&opts);
+        // YamlJson produces 2 profiles (yaml + json), each other format 1 → 6 total.
+        assert_eq!(
+            profiles.len(),
+            6,
+            "expected 6 profiles (yaml, json, jsonl, env, toml, ini)"
+        );
+        for p in &profiles {
+            assert!(
+                !p.fields.is_empty(),
+                "profile '{}' has no field rules",
+                p.processor
+            );
+        }
+    }
+
+    #[test]
+    fn guided_profiles_k8s_adds_secret_data_fields() {
+        let opts = GuidedOptions {
+            preset: GuidedPreset::Kubernetes,
+            domains: vec![],
+            providers: vec![],
+            exclude_noise_ids: false,
+            formats: vec![GuidedFormat::YamlJson],
+        };
+        let profiles = build_guided_profiles(&opts);
+        let yaml_profile = profiles.iter().find(|p| p.processor == "yaml").unwrap();
+        let patterns: Vec<&str> = yaml_profile
+            .fields
+            .iter()
+            .map(|f| f.pattern.as_str())
+            .collect();
+        assert!(
+            patterns.contains(&"data.*"),
+            "k8s yaml profile missing data.*"
+        );
+        assert!(
+            patterns.contains(&"stringData.*"),
+            "k8s yaml profile missing stringData.*"
+        );
+    }
+
+    #[test]
+    fn guided_profiles_jsonl_has_skip_invalid_option() {
+        let opts = GuidedOptions {
+            preset: GuidedPreset::Balanced,
+            domains: vec![],
+            providers: vec![],
+            exclude_noise_ids: false,
+            formats: vec![GuidedFormat::JsonLines],
+        };
+        let profiles = build_guided_profiles(&opts);
+        let jsonl = profiles.iter().find(|p| p.processor == "jsonl").unwrap();
+        assert_eq!(
+            jsonl.options.get("skip_invalid").map(|s| s.as_str()),
+            Some("true"),
+            "jsonl profile should have skip_invalid=true for mixed log files"
+        );
+    }
+
+    #[test]
+    fn guided_entries_k8s_includes_container_id_short() {
+        let opts = GuidedOptions {
+            preset: GuidedPreset::Kubernetes,
+            domains: vec![],
+            providers: vec![],
+            exclude_noise_ids: false,
+            formats: vec![],
+        };
+        let entries = build_guided_entries(&opts);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.label.as_deref() == Some("container_id_short")),
+            "k8s preset should include container_id_short"
+        );
+    }
+
+    #[test]
+    fn guided_entries_balanced_excludes_container_id_short() {
+        let opts = GuidedOptions {
+            preset: GuidedPreset::Balanced,
+            domains: vec![],
+            providers: vec![],
+            exclude_noise_ids: false,
+            formats: vec![],
+        };
+        let entries = build_guided_entries(&opts);
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.label.as_deref() == Some("container_id_short")),
+            "balanced preset should not include container_id_short"
+        );
     }
 }

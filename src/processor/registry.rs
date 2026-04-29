@@ -38,6 +38,7 @@ impl ProcessorRegistry {
         let mut reg = Self::new();
         reg.register(Arc::new(super::key_value::KeyValueProcessor));
         reg.register(Arc::new(super::json_proc::JsonProcessor));
+        reg.register(Arc::new(super::jsonl_proc::JsonLinesProcessor));
         reg.register(Arc::new(super::yaml_proc::YamlProcessor));
         reg.register(Arc::new(super::xml_proc::XmlProcessor));
         reg.register(Arc::new(super::csv_proc::CsvProcessor));

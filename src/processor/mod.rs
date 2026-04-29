@@ -42,6 +42,7 @@ pub mod csv_proc;
 pub mod env_proc;
 pub mod ini_proc;
 pub mod json_proc;
+pub mod jsonl_proc;
 pub mod key_value;
 pub mod log_line;
 pub mod profile;
@@ -57,6 +58,7 @@ pub use registry::ProcessorRegistry;
 use crate::category::Category;
 use crate::error::Result;
 use crate::store::MappingStore;
+use std::io;
 
 // ---------------------------------------------------------------------------
 // Processor trait
@@ -112,6 +114,42 @@ pub trait Processor: Send + Sync {
         profile: &FileTypeProfile,
         store: &MappingStore,
     ) -> Result<Vec<u8>>;
+
+    /// Whether this processor supports bounded-memory streaming via
+    /// [`process_stream`](Self::process_stream).
+    ///
+    /// Processors that return `true` here are eligible for the streaming
+    /// structured path in the CLI, which opens the file as a reader instead
+    /// of reading it fully into memory. The default is `false`.
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    /// Process content from a reader, writing sanitized output to a writer.
+    ///
+    /// The default implementation reads the entire reader into memory and
+    /// delegates to [`process`](Self::process). Processors that return
+    /// `true` from [`supports_streaming`](Self::supports_streaming) should
+    /// override this to handle data incrementally, keeping memory usage
+    /// bounded regardless of input size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SanitizeError`](crate::error::SanitizeError) on read, parse,
+    /// or write failure.
+    fn process_stream(
+        &self,
+        reader: &mut dyn io::Read,
+        writer: &mut dyn io::Write,
+        profile: &FileTypeProfile,
+        store: &MappingStore,
+    ) -> Result<()> {
+        let mut buf = Vec::new();
+        io::Read::read_to_end(reader, &mut buf)?;
+        let out = self.process(&buf, profile, store)?;
+        io::Write::write_all(writer, &out)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
