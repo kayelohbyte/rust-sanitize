@@ -180,12 +180,37 @@ pub(crate) fn build_path(prefix: &str, key: &str) -> String {
 
 /// Check whether a single glob `pattern` matches `key_path`.
 ///
-/// Supported patterns:
-/// - `"*"` — matches anything.
-/// - `"password"` — exact match.
-/// - `"*.password"` — any dot-path key ending in `.password`.
-/// - `"db.*"` — any key starting with `db.`.
-/// - `"*['key']"` — any key ending literally in `['key']` (bracket notation).
+/// | Pattern | Matches |
+/// |---------|---------|
+/// | `"*"` | anything |
+/// | `"password"` | `"password"` exactly |
+/// | `"*.password"` | `"password"`, `"db.password"`, `"a.b.password"` |
+/// | `"db.*"` | `"db.host"`, `"db.port"` (one level) |
+/// | `"*['smtp_password']"` | `"gitlab_rails['smtp_password']"` (bracket notation) |
+///
+/// # Examples
+///
+/// ```
+/// # use sanitize_engine::processor::profile::{FieldRule, FileTypeProfile};
+/// // Exact match.
+/// // (pattern_matches is pub(crate); use find_matching_rule from a profile instead)
+/// let profile = FileTypeProfile::new("key_value", vec![
+///     FieldRule::new("*.password"),
+///     FieldRule::new("*['smtp_password']"),
+/// ]);
+///
+/// // *.password matches any dot-separated path ending in password.
+/// assert!(profile.fields.iter().any(|r| {
+///     let p = &r.pattern;
+///     p == "*.password"
+/// }));
+///
+/// // Bracket-notation keys like gitlab_rails['smtp_password'] are matched
+/// // by the *['smtp_password'] pattern.
+/// let bracket_key = "gitlab_rails['smtp_password']";
+/// let suffix = "['smtp_password']";
+/// assert!(bracket_key.ends_with(suffix));
+/// ```
 #[must_use]
 pub(crate) fn pattern_matches(pattern: &str, key_path: &str) -> bool {
     if pattern == "*" {
@@ -227,12 +252,10 @@ pub(crate) fn pattern_matches(pattern: &str, key_path: &str) -> bool {
     false
 }
 
-/// Check whether a dotted key path matches any of the rules in a profile.
+/// Return the first rule in `profile` whose pattern matches `key_path`.
 ///
-/// Supports exact matches and simple glob patterns:
-/// - `"password"` matches `"password"` exactly.
-/// - `"*.password"` matches any key ending in `.password`.
-/// - `"db.*"` matches any key starting with `db.`.
+/// Supports exact matches and glob patterns — see [`pattern_matches`] for the
+/// full pattern syntax including dot-path globs and bracket notation.
 #[must_use]
 pub(crate) fn find_matching_rule<'a>(
     key_path: &str,

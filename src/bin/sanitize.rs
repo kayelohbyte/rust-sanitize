@@ -153,7 +153,16 @@ EXAMPLES:\n  \
   sanitize encrypt secrets.json secrets.json.enc --password\n  \
   sanitize decrypt secrets.json.enc secrets.json --password\n\n  \
   # Deterministic replacements with encrypted secrets:\n  \
-  sanitize data.csv -s s.enc --encrypted-secrets -p -d"
+  sanitize data.csv -s s.enc --encrypted-secrets -p -d\n\n  \
+  # Extract error/warning context into the JSON report (--report required):\n  \
+  sanitize app.log -s s.enc --encrypted-secrets -p --report report.json --extract-context\n  \
+  cat app.log | sanitize -s s.enc --encrypted-secrets -p --report - --extract-context\n\n  \
+  # Custom keywords and wider context window:\n  \
+  sanitize app.log -s s.enc --encrypted-secrets -p --report - \\\n    \
+    --extract-context --context-keywords timeout,oomkilled --context-lines 20\n\n  \
+  # Strip values to generate a profile template (no secrets file needed):\n  \
+  sanitize gitlab.rb --strip-values -o gitlab.rb.template\n  \
+  cat config.rb | sanitize --strip-values"
 )]
 struct Cli {
     /// Subcommand: encrypt, decrypt, or omit for default sanitize mode.

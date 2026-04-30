@@ -8,6 +8,8 @@
 //!   processed, and per-pattern match counts.
 //! - **Aggregated summary**: totals across all files plus wall-clock
 //!   duration.
+//! - **Log context** (optional): keyword-matched lines with surrounding
+//!   context windows, populated when `--extract-context` is used.
 //!
 //! # Thread Safety
 //!
@@ -18,11 +20,12 @@
 //! # Example
 //!
 //! ```rust
-//! use sanitize_engine::report::{ReportBuilder, ReportMetadata, FileReport};
+//! use sanitize_engine::log_context::{extract_context, LogContextConfig};
+//! use sanitize_engine::report::{FileReport, ReportBuilder, ReportMetadata};
 //! use std::collections::HashMap;
 //!
 //! let meta = ReportMetadata {
-//!     version: "0.2.0".into(),
+//!     version: "0.4.0".into(),
 //!     timestamp: "2026-03-01T00:00:00Z".into(),
 //!     deterministic: true,
 //!     dry_run: false,
@@ -44,9 +47,16 @@
 //!     method: "scanner".into(),
 //! });
 //!
+//! // Optionally attach log context (populated by --extract-context).
+//! let sanitized_output = "INFO ok\nERROR disk full\nINFO retrying";
+//! let ctx = extract_context(sanitized_output, &LogContextConfig::new().with_context_lines(1));
+//! builder.set_log_context(ctx);
+//!
 //! let report = builder.finish();
 //! let json = report.to_json_pretty().unwrap();
 //! assert!(json.contains("\"total_matches\": 42"));
+//! assert!(json.contains("\"log_context\""));
+//! assert!(json.contains("\"keyword\": \"error\""));
 //! ```
 
 use serde::Serialize;

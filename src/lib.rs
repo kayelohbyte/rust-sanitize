@@ -86,6 +86,32 @@
 //! assert_eq!(stats.replacements_applied, 1);
 //! assert_eq!(output.len(), input.len());
 //! ```
+//!
+//! ## Example: Log Context Extraction
+//!
+//! After sanitizing, scan the output for error/warning keywords and capture
+//! surrounding lines for LLM-friendly triage:
+//!
+//! ```rust
+//! use sanitize_engine::log_context::{extract_context, LogContextConfig};
+//!
+//! let sanitized = "INFO  request received\n\
+//!                  ERROR disk full on /dev/sda1\n\
+//!                  INFO  retrying mount\n\
+//!                  WARN  filesystem degraded\n\
+//!                  INFO  recovery complete";
+//!
+//! let config = LogContextConfig::new().with_context_lines(1);
+//! let result = extract_context(sanitized, &config);
+//!
+//! // Two keyword hits: "error" and "warn".
+//! assert_eq!(result.match_count, 2);
+//!
+//! // First match: ERROR line with one line of context on each side.
+//! assert_eq!(result.matches[0].keyword, "error");
+//! assert_eq!(result.matches[0].before, vec!["INFO  request received"]);
+//! assert_eq!(result.matches[0].after,  vec!["INFO  retrying mount"]);
+//! ```
 
 // Crate-level lint configuration.
 #![forbid(unsafe_code)]
