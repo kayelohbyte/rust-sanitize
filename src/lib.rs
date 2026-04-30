@@ -105,6 +105,7 @@ pub mod atomic;
 pub mod category;
 pub mod error;
 pub mod generator;
+pub mod log_context;
 pub mod processor;
 pub mod report;
 pub mod scanner;
@@ -117,6 +118,10 @@ pub use atomic::{atomic_write, AtomicFileWriter};
 pub use category::Category;
 pub use error::{Result, SanitizeError};
 pub use generator::{HmacGenerator, RandomGenerator, ReplacementGenerator};
+pub use log_context::{
+    extract_context, LogContextConfig, LogContextMatch, LogContextResult, DEFAULT_CONTEXT_LINES,
+    DEFAULT_KEYWORDS, DEFAULT_MAX_MATCHES,
+};
 pub use processor::archive::{
     ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress, ArchiveStats,
     DEFAULT_MAX_ARCHIVE_DEPTH,

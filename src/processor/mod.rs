@@ -183,8 +183,9 @@ pub(crate) fn build_path(prefix: &str, key: &str) -> String {
 /// Supported patterns:
 /// - `"*"` — matches anything.
 /// - `"password"` — exact match.
-/// - `"*.password"` — any key ending in `.password`.
+/// - `"*.password"` — any dot-path key ending in `.password`.
 /// - `"db.*"` — any key starting with `db.`.
+/// - `"*['key']"` — any key ending literally in `['key']` (bracket notation).
 #[must_use]
 pub(crate) fn pattern_matches(pattern: &str, key_path: &str) -> bool {
     if pattern == "*" {
@@ -193,7 +194,7 @@ pub(crate) fn pattern_matches(pattern: &str, key_path: &str) -> bool {
     if pattern == key_path {
         return true;
     }
-    // Simple glob: *.suffix
+    // Dot-path glob: *.suffix — requires a dot boundary before the suffix.
     if let Some(suffix) = pattern.strip_prefix("*.") {
         if key_path == suffix
             || key_path
@@ -203,11 +204,22 @@ pub(crate) fn pattern_matches(pattern: &str, key_path: &str) -> bool {
             return true;
         }
     }
-    // Simple glob: prefix.*
+    // Dot-path glob: prefix.*
     if let Some(prefix) = pattern.strip_suffix(".*") {
         if key_path
             .strip_prefix(prefix)
             .is_some_and(|rest| rest.starts_with('.'))
+        {
+            return true;
+        }
+    }
+    // General wildcard prefix: *suffix (e.g. *['key'] for bracket notation).
+    // Only applies when suffix does not start with '.' (those are handled above).
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        if !suffix.is_empty()
+            && !suffix.starts_with('.')
+            && !suffix.contains('*')
+            && key_path.ends_with(suffix)
         {
             return true;
         }

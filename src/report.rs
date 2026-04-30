@@ -54,6 +54,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::log_context::LogContextResult;
 use crate::scanner::ScanStats;
 
 // ---------------------------------------------------------------------------
@@ -72,6 +73,9 @@ pub struct SanitizeReport {
     pub summary: ReportSummary,
     /// Per-file details.
     pub files: Vec<FileReport>,
+    /// Log context extraction results, present when `--extract-context` was used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_context: Option<LogContextResult>,
 }
 
 impl SanitizeReport {
@@ -190,6 +194,7 @@ impl FileReport {
 pub struct ReportBuilder {
     metadata: ReportMetadata,
     files: Mutex<Vec<FileReport>>,
+    log_context: Mutex<Option<LogContextResult>>,
     start: Instant,
 }
 
@@ -211,8 +216,14 @@ impl ReportBuilder {
         Self {
             metadata,
             files: Mutex::new(Vec::new()),
+            log_context: Mutex::new(None),
             start: Instant::now(),
         }
+    }
+
+    /// Attach log context extraction results to the report.
+    pub fn set_log_context(&self, result: LogContextResult) {
+        *self.log_context.lock().expect("report mutex poisoned") = Some(result);
     }
 
     /// Record the result for a single file. Thread-safe.
@@ -234,6 +245,10 @@ impl ReportBuilder {
         #[allow(clippy::cast_possible_truncation)] // duration in ms won't exceed u64
         let duration_ms = self.start.elapsed().as_millis() as u64;
         let files = self.files.into_inner().expect("report mutex poisoned");
+        let log_context = self
+            .log_context
+            .into_inner()
+            .expect("report mutex poisoned");
 
         // Aggregate summary.
         let mut total_matches: u64 = 0;
@@ -266,6 +281,7 @@ impl ReportBuilder {
             metadata: self.metadata,
             summary,
             files,
+            log_context,
         }
     }
 }

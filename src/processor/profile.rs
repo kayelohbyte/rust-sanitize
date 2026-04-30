@@ -20,19 +20,46 @@ use serde::{Deserialize, Serialize};
 /// - Glob suffix: `"*.password"` — matches any key ending in `.password`.
 /// - Glob prefix: `"db.*"` — matches any key starting with `db.`.
 /// - Wildcard: `"*"` — matches every field.
+///
+/// # Sub-processor
+///
+/// When a field's value is itself a structured document (e.g. YAML embedded
+/// in a Ruby heredoc), set `sub_processor` to the processor name and provide
+/// `sub_fields` with rules for the nested content. The parent processor
+/// extracts the value and delegates it to the named sub-processor.
+///
+/// ```yaml
+/// - pattern: "*['ldap_servers']"
+///   sub_processor: yaml
+///   sub_fields:
+///     - pattern: "*.password"
+///       category: custom:password
+///     - pattern: "*.bind_dn"
+///       category: custom:dn
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldRule {
     /// Key pattern to match (see Pattern Syntax above).
     pub pattern: String,
 
     /// Category for replacement generation. Defaults to `Custom("field")`
-    /// if not specified.
+    /// if not specified. Ignored when `sub_processor` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<Category>,
 
     /// Optional human-readable label for reporting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+
+    /// Name of the processor to use for the field's value when it contains
+    /// an embedded structured document (e.g. `"yaml"`, `"json"`, `"toml"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_processor: Option<String>,
+
+    /// Field rules applied by `sub_processor` to the nested content.
+    /// Ignored when `sub_processor` is `None`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sub_fields: Vec<FieldRule>,
 }
 
 impl FieldRule {
@@ -43,6 +70,8 @@ impl FieldRule {
             pattern: pattern.into(),
             category: None,
             label: None,
+            sub_processor: None,
+            sub_fields: Vec::new(),
         }
     }
 
@@ -57,6 +86,20 @@ impl FieldRule {
     #[must_use]
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
         self.label = Some(label.into());
+        self
+    }
+
+    /// Set the sub-processor name for embedded structured content.
+    #[must_use]
+    pub fn with_sub_processor(mut self, name: impl Into<String>) -> Self {
+        self.sub_processor = Some(name.into());
+        self
+    }
+
+    /// Set the field rules applied by the sub-processor.
+    #[must_use]
+    pub fn with_sub_fields(mut self, fields: Vec<FieldRule>) -> Self {
+        self.sub_fields = fields;
         self
     }
 }

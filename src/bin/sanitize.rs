@@ -71,10 +71,11 @@ use sanitize_engine::secrets::{
     SecretEntry, SecretsFormat,
 };
 use sanitize_engine::{
-    atomic_write, ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress,
+    atomic_write, extract_context, ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress,
     AtomicFileWriter, Category, FieldRule, FileReport, FileTypeProfile, HmacGenerator,
-    MappingStore, ProcessorRegistry, RandomGenerator, ReplacementGenerator, ReportBuilder,
-    ReportMetadata, ScanConfig, ScanPattern, ScanStats, StreamScanner, DEFAULT_MAX_ARCHIVE_DEPTH,
+    LogContextConfig, MappingStore, ProcessorRegistry, RandomGenerator, ReplacementGenerator,
+    ReportBuilder, ReportMetadata, ScanConfig, ScanPattern, ScanStats, StreamScanner,
+    DEFAULT_MAX_ARCHIVE_DEPTH,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -303,6 +304,30 @@ struct Cli {
     /// Minimum interval between live progress refreshes.
     #[arg(long, value_name = "MS", default_value_t = DEFAULT_PROGRESS_INTERVAL_MS)]
     progress_interval_ms: u64,
+
+    /// After sanitizing, scan the output for error/warning/failure keywords
+    /// and include matching lines with surrounding context in the JSON report.
+    /// Requires `--report`.
+    #[arg(long)]
+    extract_context: bool,
+
+    /// Number of lines of context to capture before and after each keyword
+    /// match when `--extract-context` is set. Default: 10.
+    #[arg(long, value_name = "N", default_value_t = 10)]
+    context_lines: usize,
+
+    /// Comma-separated list of additional keywords to search for when
+    /// `--extract-context` is set. Merged with the built-in defaults
+    /// (error, failure, warning, warn, fatal, exception, critical).
+    #[arg(long, value_name = "KEYWORDS", value_delimiter = ',')]
+    context_keywords: Vec<String>,
+
+    /// Strip all values from structured output, emitting only keys and
+    /// structure. Useful for generating a profile template from a real
+    /// config file without exposing any secret values. Bypasses the
+    /// sanitization pipeline — no secrets file is required.
+    #[arg(long)]
+    strip_values: bool,
 }
 
 impl Cli {
@@ -1702,6 +1727,10 @@ fn run_guided() -> Result<(), (String, i32)> {
         progress: None,
         no_progress: false,
         progress_interval_ms: DEFAULT_PROGRESS_INTERVAL_MS,
+        extract_context: false,
+        context_lines: 10,
+        context_keywords: Vec::new(),
+        strip_values: false,
     };
 
     run_sanitize(cli, deterministic_password.or(run_password), HashMap::new())
@@ -2574,6 +2603,7 @@ fn process_stdin(
                             method,
                         ));
                     }
+                    maybe_extract_context(&output_bytes, cli, report_builder);
                     if !cli.dry_run {
                         write_output(output_path, &output_bytes)?;
                     }
@@ -2599,6 +2629,7 @@ fn process_stdin(
                     "scanner",
                 ));
             }
+            maybe_extract_context(&output_bytes, cli, report_builder);
             if !cli.dry_run {
                 write_output(output_path, &output_bytes)?;
             }
@@ -2687,6 +2718,33 @@ fn process_stdin_streaming<R: io::Read>(
                     "scanner",
                 ));
             }
+        } else if cli.extract_context {
+            // Buffer output so we can run log context extraction before writing.
+            let mut buf: Vec<u8> = Vec::new();
+            let stats = scanner
+                .scan_reader_with_progress(
+                    reader,
+                    &mut buf,
+                    None,
+                    make_scan_callback(progress.clone(), label),
+                )
+                .map_err(|e| format!("scanner error: {e}"))?;
+            if stats.matches_found > 0 {
+                had_matches = true;
+            }
+            if let Some(rb) = report_builder {
+                rb.record_file(FileReport::from_scan_stats(
+                    "<stdin>".to_string(),
+                    &stats,
+                    "scanner",
+                ));
+            }
+            maybe_extract_context(&buf, cli, report_builder);
+            let stdout = io::stdout();
+            stdout
+                .lock()
+                .write_all(&buf)
+                .map_err(|e| format!("failed to write to stdout: {e}"))?;
         } else {
             let stdout = io::stdout();
             let writer = BufWriter::new(stdout.lock());
@@ -3598,6 +3656,59 @@ fn write_output(output_path: Option<&Path>, data: &[u8]) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Log context extraction helper
+// ---------------------------------------------------------------------------
+
+/// If `--extract-context` is set and a report builder is present, run log
+/// context extraction on `bytes` and attach the result to the builder.
+fn maybe_extract_context(bytes: &[u8], cli: &Cli, report_builder: Option<&ReportBuilder>) {
+    if !cli.extract_context {
+        return;
+    }
+    let Some(rb) = report_builder else { return };
+    let text = String::from_utf8_lossy(bytes);
+    let mut config = LogContextConfig::new().with_context_lines(cli.context_lines);
+    if !cli.context_keywords.is_empty() {
+        config = config.with_extra_keywords(cli.context_keywords.iter().cloned());
+    }
+    rb.set_log_context(extract_context(&text, &config));
+}
+
+// ---------------------------------------------------------------------------
+// Strip-values helper
+// ---------------------------------------------------------------------------
+
+/// Strip values from each key-value line, preserving structure only.
+///
+/// Lines with a delimiter (`=` by default) become `key = `, comments and
+/// blank lines are preserved verbatim. Used by `--strip-values` to produce
+/// profile-generation templates from real config files without exposing
+/// any secret values.
+fn strip_values_from_text(content: &str, delimiter: &str, comment_prefix: &str) -> String {
+    let mut out = String::with_capacity(content.len() / 2);
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(comment_prefix) {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if let Some(delim_pos) = line.find(delimiter) {
+            let raw_key = &line[..delim_pos];
+            // Preserve leading whitespace before the key; strip the value.
+            out.push_str(raw_key);
+            out.push_str(delimiter);
+            out.push('\n');
+        } else {
+            // No delimiter — preserve as-is (e.g. section headers in INI).
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Encrypt subcommand
 // ---------------------------------------------------------------------------
 
@@ -3954,6 +4065,35 @@ fn run_sanitize(
     };
 
     let input_targets = plan_input_targets(&cli).map_err(|e| (e, 1))?;
+
+    // --- --strip-values early exit -----------------------------------------
+    // Bypass the full sanitization pipeline: emit key structure only (no values).
+    if cli.strip_values {
+        let delimiter = "#strip-values-delimiter#"; // placeholder; real one below
+        let _ = delimiter; // suppress lint
+        for target in &input_targets {
+            let (content, output_path) = match target {
+                InputTarget::Stdin { output } => {
+                    let mut buf = Vec::new();
+                    io::stdin()
+                        .read_to_end(&mut buf)
+                        .map_err(|e| (format!("failed to read stdin: {e}"), 1))?;
+                    (
+                        String::from_utf8_lossy(&buf).into_owned(),
+                        output.as_deref(),
+                    )
+                }
+                InputTarget::File { input, output } => {
+                    let text = fs::read_to_string(input)
+                        .map_err(|e| (format!("failed to read {}: {e}", input.display()), 1))?;
+                    (text, Some(output.as_path()))
+                }
+            };
+            let stripped = strip_values_from_text(&content, "=", "#");
+            write_output(output_path, stripped.as_bytes()).map_err(|e| (e, 1))?;
+        }
+        return Ok(());
+    }
 
     // --- split stdin (serial) from file targets (parallel) ------------------
     // Stdin must always be processed serially to preserve stream semantics and
