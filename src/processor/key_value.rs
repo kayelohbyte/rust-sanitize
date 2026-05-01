@@ -16,8 +16,16 @@
 //!
 //! | Key              | Default | Description                                  |
 //! |------------------|---------|----------------------------------------------|
-//! | `delimiter`      | `"="`   | The key-value separator.                     |
-//! | `comment_prefix` | `"#"`   | Lines starting with this (after whitespace)  |
+//! | `delimiter`           | `"="`   | The key-value separator.                     |
+//! | `secondary_delimiter` | *(none)*| Optional second delimiter tried when the     |
+//! |                       |         | primary delimiter's key does not match any   |
+//! |                       |         | field rule.  Surrounding quotes are stripped |
+//! |                       |         | from the key before matching, and any suffix |
+//! |                       |         | after the value (e.g. a trailing `,`) is     |
+//! |                       |         | preserved in the output.  Useful for Ruby    |
+//! |                       |         | hash literals that use `=>` as their         |
+//! |                       |         | delimiter alongside a `=`-delimited file.    |
+//! | `comment_prefix`      | `"#"`   | Lines starting with this (after whitespace)  |
 //! |                  |         | are treated as comments and preserved as-is. |
 //!
 //! # Heredoc / Sub-processor Support
@@ -99,6 +107,10 @@ impl Processor for KeyValueProcessor {
             .options
             .get("comment_prefix")
             .map_or("#", |s| s.as_str());
+        let secondary_delimiter = profile
+            .options
+            .get("secondary_delimiter")
+            .map(|s| s.as_str());
 
         let mut output = String::with_capacity(text.len());
         let mut state = LineState::Normal;
@@ -110,6 +122,7 @@ impl Processor for KeyValueProcessor {
                 &mut output,
                 delimiter,
                 comment_prefix,
+                secondary_delimiter,
                 profile,
                 store,
             )?;
@@ -140,6 +153,7 @@ fn process_line(
     output: &mut String,
     delimiter: &str,
     comment_prefix: &str,
+    secondary_delimiter: Option<&str>,
     profile: &FileTypeProfile,
     store: &MappingStore,
 ) -> Result<()> {
@@ -211,6 +225,33 @@ fn process_line(
                         output,
                     );
                     return Ok(());
+                }
+            }
+            // Try secondary delimiter (e.g. `=>` for Ruby hash lines like
+            // `  'aws_access_key_id' => 'KEY',`).
+            if let Some(sec_delim) = secondary_delimiter {
+                if let Some(delim_pos) = line.find(sec_delim) {
+                    let raw_key = &line[..delim_pos];
+                    let after_delim = &line[delim_pos + sec_delim.len()..];
+                    // Strip surrounding quotes from the key before matching
+                    // (e.g. `'aws_access_key_id'` → `aws_access_key_id`).
+                    let trimmed_key = raw_key.trim();
+                    let (_, unquoted_key) = detect_quotes(trimmed_key);
+                    if let Some(rule) = find_matching_rule(unquoted_key, profile) {
+                        let (quote_char, inner, suffix) =
+                            detect_quoted_value_with_suffix(after_delim);
+                        let replaced = replace_value(inner, rule, store)?;
+                        emit_replaced_with_suffix(
+                            raw_key,
+                            sec_delim,
+                            after_delim,
+                            quote_char,
+                            &replaced,
+                            suffix,
+                            output,
+                        );
+                        return Ok(());
+                    }
                 }
             }
             output.push_str(line);
@@ -295,6 +336,57 @@ fn emit_replaced(
         output.push_str(value);
     }
     output.push('\n');
+}
+
+/// Like [`emit_replaced`] but appends a `suffix` after the closing quote.
+///
+/// Used for secondary-delimiter lines (e.g. Ruby hash `'key' => 'value',`)
+/// where a trailing comma or closing brace must be preserved.
+fn emit_replaced_with_suffix(
+    raw_key: &str,
+    delimiter: &str,
+    after_delim: &str,
+    quote_char: Option<char>,
+    value: &str,
+    suffix: &str,
+    output: &mut String,
+) {
+    let ws = leading_whitespace(after_delim);
+    output.push_str(raw_key);
+    output.push_str(delimiter);
+    output.push_str(ws);
+    if let Some(q) = quote_char {
+        output.push(q);
+        output.push_str(value);
+        output.push(q);
+    } else {
+        output.push_str(value);
+    }
+    output.push_str(suffix);
+    output.push('\n');
+}
+
+/// Detect a quoted value in `after_delim` and return `(quote_char, inner, suffix)`.
+///
+/// Unlike [`detect_quotes`], this finds the *first* quoted span after any
+/// leading whitespace and captures any trailing suffix (e.g. a comma in a
+/// Ruby hash line `=> 'VALUE',`).  For unquoted values the whole trimmed
+/// string is returned as `inner` with an empty suffix.
+fn detect_quoted_value_with_suffix(after_delim: &str) -> (Option<char>, &str, &str) {
+    let trimmed = after_delim.trim_start();
+    if let Some(&first) = trimmed.as_bytes().first() {
+        if first == b'\'' || first == b'"' {
+            let q = first as char;
+            if let Some(close_pos) = trimmed[1..].find(q) {
+                // inner: the text between the quotes
+                let inner = &trimmed[1..=close_pos];
+                // suffix: everything after the closing quote (e.g. `,`)
+                let suffix = &trimmed[close_pos + 2..];
+                return (Some(q), inner, suffix);
+            }
+        }
+    }
+    (None, trimmed, "")
 }
 
 /// Detect a Ruby-style heredoc opener in `value` and return

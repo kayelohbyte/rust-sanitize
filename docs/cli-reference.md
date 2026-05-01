@@ -14,7 +14,7 @@ The default mode (no subcommand) sanitizes one or more files and archives. Multi
 
 ### `sanitize guided`
 
-Interactive wizard for generating a logs-focused starter secrets template.
+Interactive wizard for generating a logs-focused starter secrets template and optional structured profile.
 
 ```
 sanitize guided
@@ -22,113 +22,106 @@ sanitize guided
 
 What it does:
 
-- Prompts for template strictness (`balanced` vs `aggressive`).
+- Prompts for a **workspace type** (Generic, Web app, Kubernetes, Database, AWS) to seed type-specific patterns.
+- Prompts for **replacement strictness** (`Balanced` vs `Aggressive`) to control breadth of token matching.
 - Asks for up to 3 company domains to seed domain-specific host/email patterns.
 - Asks for cloud providers (AWS, Azure, GCP) and adds provider-specific entries.
-- Generates a plaintext YAML secrets file (`.yaml`).
-- Optionally encrypts the generated file.
-- Optionally runs sanitization immediately using the generated file.
+- Asks which **structured file formats** to include (YAML/JSON, JSON Lines, `.env`, TOML, INI/conf) and generates a matching profile file.
+- Prompts for noisy-ID handling (`trace_id`/`span_id`-like high-entropy noise toggle).
+- Generates and validates a plaintext YAML secrets file (default: `secrets.guided.yaml`).
+- Generates a profile file alongside it (default: `<stem>.profile.yaml`) when formats are selected.
+- Optionally encrypts the secrets file and removes the plaintext copy.
+- Optionally runs sanitization immediately using the generated files.
 
 #### Guided Flow (Step by Step)
 
-1. Starts interactive wizard and checks for a TTY (non-interactive shells are rejected).
-2. Asks for strictness profile:
-   - `Balanced`: core log/network identifiers.
-   - `Aggressive`: balanced set plus token-oriented patterns.
-3. Prompts for company domains (comma-separated, up to 3).
-4. Prompts for cloud provider scope (AWS, Azure, GCP, none).
-5. Prompts for noisy-ID handling (`trace_id`/`span_id`-like high-entropy noise toggle).
-6. Prompts for output path, then forces YAML output (`.yaml`).
-7. Generates secrets entries and validates all regexes by compiling them before writing.
-8. Writes plaintext YAML template.
-9. Optionally encrypts the generated template and writes a sibling `.enc` file.
-10. Optionally continues directly into a sanitize run:
-   - Prompts for input path (or `-` for stdin).
-   - Prompts for optional output path.
-   - Prompts for dry-run choice.
-   - Prompts for deterministic mode choice.
+1. Checks for a TTY (non-interactive shells are rejected with an error).
+2. Asks for **workspace type** (select 1–5):
+   - `1) Generic` — tokens, emails, IPs, hostnames, UUIDs (default).
+   - `2) Web app` — JWTs, session cookies, emails, URLs.
+   - `3) Kubernetes` — service accounts, tokens, namespaces.
+   - `4) Database` — passwords, connection strings, usernames.
+   - `5) AWS` — like Generic but uses the Aggressive strictness preset.
+3. Asks for **replacement strictness** (select 1–2; default: Aggressive):
+   - `1) Balanced` — replace clearly sensitive values only.
+   - `2) Aggressive` — also replace high-entropy tokens (recommended for LLM sharing).
+4. Prompts for company domains (comma-separated, up to 3).
+5. Prompts for cloud provider scope (AWS, Azure, GCP, none).
+6. Prompts for **structured file formats** to include in the generated profile:
+   - `1) YAML / JSON` — k8s manifests, docker-compose, app configs.
+   - `2) JSON Lines` — NDJSON structured logs (`.jsonl`, `.ndjson`).
+   - `3) .env files` — twelve-factor app secrets, CI variables.
+   - `4) TOML` — Rust, Hugo, and other TOML configs.
+   - `5) INI / conf` — system services, databases, legacy apps.
+   - `6) All of the above` (default).
+   - `7) None` — secrets file only, no profile.
+7. Prompts for noisy-ID handling (`trace_id`/`span_id`-like high-entropy noise toggle).
+8. Prompts for output secrets file path (default: `secrets.guided.yaml`); forces `.yaml` extension.
+9. Generates secrets entries and validates all regexes by compiling them before writing.
+10. Writes plaintext YAML secrets file.
+11. If formats were selected, prompts for profile file path (default: `<secrets-stem>.profile.yaml`) and writes it.
+12. Optionally encrypts the secrets file; removes plaintext after successful encryption.
+13. Optionally runs sanitization immediately:
+    - Prompts for input path (or `-` for stdin).
+    - Prompts for optional output path.
+    - Prompts for dry-run choice.
+    - Prompts for deterministic mode choice.
 
 #### What Guided Picks Out to Sanitize
 
 The guided template writes regex rules with these categories and targets.
 
-Always included (balanced + aggressive):
+Always included (all workspace types and strictness levels):
 
 - `email`: email addresses.
-- `hostname`: DNS-style hostnames/FQDNs.
 - `ipv4`: IPv4 addresses.
 - `ipv6`: IPv6 addresses.
 - `mac_address`: MAC addresses with `:` or `-` separators.
 - `uuid`: RFC-like UUIDs.
-- `container_id`: long lowercase hex IDs (12-64 chars).
 - `jwt`: JWT-like `header.payload.signature` tokens.
 - `url`: `http://` and `https://` URLs.
+- `auth_token`: PEM/private-key headers, generic `secret_key`/`api_key` key-value patterns, GitHub PAT patterns, GCP API key prefix.
+- `custom:password`: password key-value pattern.
+- `file_path`: `/home/<user>` and `/Users/<user>` paths.
+- `container_id`: Docker image digests (`sha256:<64-hex>`).
 
-Aggressive-only additions:
+Aggressive-strictness additions (also included for Web app, Kubernetes, and Database workspace types):
 
-- `auth_token`: context-keyed token matches (e.g. `bearer`, `token`, `api_key`, `secret` plus long value).
-- `custom:high_entropy_token`: broad long token pattern (`[A-Za-z0-9_-]{20,}`), unless noisy-ID exclusion is enabled.
+- `auth_token`: bearer/authorization token context regex.
+- `custom:high_entropy_token`: broad long-token pattern (`[A-Za-z0-9_-]{20,}`), unless noisy-ID exclusion is enabled.
 
-#### Balanced Profile Details
+Aggressive-strictness-only additions (not included at Balanced strictness):
 
-`Balanced` is intended to catch common technical identifiers in logs while minimizing broad token captures.
+- `hostname`: broad DNS-style FQDN regex. Intentionally excluded from Balanced because it matches many non-secret dotted identifiers in application logs.
+- `container_id`: short 12-hex container ID pattern.
 
-Balanced includes:
+Web app workspace additions:
 
-- `email`
-- `hostname`
-- `ipv4`
-- `ipv6`
-- `mac_address`
-- `uuid`
-- `container_id`
-- `jwt`
-- `url`
-- Domain-derived `email` and `hostname` rules (if domains are provided)
-- Provider-derived rules for selected clouds (AWS/Azure/GCP)
+- `auth_token`: session ID/token key-value regex.
+- `auth_token`: OAuth access/refresh token key-value regex.
 
-Balanced excludes:
+Kubernetes workspace additions:
 
-- `auth_token_context` aggressive token-context regex
-- `custom:high_entropy_token` broad token regex
+- `auth_token`: generic token key-value regex.
+- `custom:k8s_namespace`: Kubernetes namespace regex.
+- `container_id`: full 64-char SHA256 image digest and short 12-char container ID.
 
-In practice, `Balanced` reduces false positives in logs with many opaque IDs while still sanitizing network/resource identifiers.
+Database workspace additions:
 
-#### Aggressive Profile Details
-
-`Aggressive` is intended to maximize secret/token detection in logs where broad matching is preferred over precision.
-
-Aggressive includes everything in `Balanced`, plus:
-
-- `auth_token_context`: context-keyed token regex for patterns like `bearer`, `token`, `api_key`, `secret` followed by long values.
-- `custom:high_entropy_token`: broad long-token regex (`[A-Za-z0-9_-]{20,}`), unless noisy-ID exclusion is enabled.
-
-Aggressive behavior notes:
-
-- Better coverage for API keys, bearer values, and opaque credential-like strings in unstructured logs.
-- Higher false-positive risk for long identifiers that are not secrets (for example telemetry IDs, synthetic IDs, long slugs).
-- If noisy-ID exclusion is enabled in guided prompts, the broad high-entropy token entry is removed to reduce alert noise.
-
-When to choose `Aggressive`:
-
-- Logs are highly unstructured and frequently contain ad-hoc credential formats.
-- You prefer over-redaction during first pass, then tune patterns down.
-
-When to prefer `Balanced`:
-
-- Logs contain many non-secret high-entropy identifiers.
-- You need lower false-positive rates for initial rollout.
+- `url`: database connection string regex (postgres, mysql, mongodb, redis, amqp, jdbc).
+- `name`: username key-value regex.
 
 Domain-derived additions (for each provided domain):
 
 - `email`: domain-specific email regex (`...@<domain>`).
-- `hostname`: domain-specific host regex (`*.domain.tld` style).
+- `hostname`: domain-specific host regex (`*.<domain>` style).
 
 Cloud-provider additions:
 
 - AWS selected:
   - `aws_arn`: ARN-like values.
   - `auth_token`: AWS access key ID shape (`AKIA`/`ASIA` + 16 chars).
+  - `container_id`: EC2 instance ID shape (`i-<8-17 hex chars>`).
 - Azure selected:
   - `azure_resource_id`: subscription/resourceGroups/provider path shapes.
 - GCP selected:
@@ -137,7 +130,23 @@ Cloud-provider additions:
 
 Intentionally excluded by default (logs-first design):
 
-- `ssn`, `phone`, `credit_card`, `name`, `file_path`.
+- `ssn`, `phone`, `credit_card`.
+
+#### Strictness Levels
+
+**`Balanced`** — replace clearly sensitive values only.
+
+- Focuses on high-confidence, low-false-positive patterns.
+- Excludes broad hostname regex and short container-ID patterns.
+- Excludes `bearer`/`authorization` token context regex and broad high-entropy token pattern.
+- Suitable for logs containing many non-secret high-entropy identifiers (trace IDs, synthetic IDs).
+
+**`Aggressive`** — replace high-entropy tokens too (recommended for LLM sharing).
+
+- Adds the broad hostname regex, short container-ID patterns, and high-entropy token pattern.
+- Higher false-positive risk for long identifiers that are not secrets.
+- If noisy-ID exclusion is enabled, the high-entropy token entry is removed.
+- Recommended when over-redaction on a first pass is acceptable.
 
 #### Replacement Behavior for Guided Rules
 
@@ -147,18 +156,13 @@ Intentionally excluded by default (logs-first design):
 
 #### Example Generated YAML (Guided)
 
-Example (aggressive profile, with domains and GCP selected):
+Example (Generic workspace, Aggressive strictness, `example.com` domain, GCP selected):
 
 ```yaml
 - pattern: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
   kind: regex
   category: email
   label: email
-
-- pattern: \b(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)\.)+(?:[a-zA-Z]{2,63})\b
-  kind: regex
-  category: hostname
-  label: hostname
 
 - pattern: \b(?:\d{1,3}\.){3}\d{1,3}\b
   kind: regex
@@ -170,10 +174,10 @@ Example (aggressive profile, with domains and GCP selected):
   category: jwt
   label: jwt
 
-- pattern: (?i)\b(?:bearer|token|api[_-]?key|secret)[\s:=]+[A-Za-z0-9._~+/=-]{16,}\b
+- pattern: (?i)(?:bearer|authorization)[\s:]+[A-Za-z0-9._~+/=-]{16,}\b
   kind: regex
   category: auth_token
-  label: auth_token_context
+  label: bearer_token
 
 - pattern: '[A-Za-z0-9._%+-]+@example\.com'
   kind: regex
@@ -196,16 +200,12 @@ Example (aggressive profile, with domains and GCP selected):
   label: gcp_resource
 ```
 
-Balanced profile note for this example:
-
-- The `auth_token_context` entry above is omitted in `Balanced`.
-- If noisy-ID exclusion is enabled, broad high-entropy token entries are also omitted.
-
 Notes:
 
 - Guided mode is intended for application/system logs and excludes common consumer-PII categories by default.
 - In non-interactive environments, guided mode exits with an error because it requires a TTY.
 - GCP patterns currently use `custom:gcp_*` categories (no built-in GCP formatter yet).
+- The generated profile file contains no secrets and is safe to commit to version control.
 
 ### Default Mode — Sanitize
 
@@ -220,9 +220,10 @@ Notes:
 | `-f, --format <FMT>` | `-f` | Force input format, overriding file-extension detection. Values: `text`, `json`, `yaml`, `xml`, `csv`, `key-value`. Required for structured processing when reading from stdin. |
 | `-n, --dry-run` | `-n` | Scan and report matches without writing output. |
 | `--fail-on-match` | | Exit with code 2 if any matches are found. |
-| `-r, --report [PATH]` | `-r` | Write a JSON report to `PATH` (or stderr if no path given). Use `--report -` to write the report to stdout. |
+| `-r, --report [PATH]` | `-r` | Write a JSON report to `PATH` (or stderr if no path given). Use `--report -` to write the report to stdout. The report includes: `metadata` (tool version, flags), `summary` (totals, `duration_ms`, `pattern_counts`), and a `files` array with per-file `matches`, `replacements`, byte counts, `pattern_counts`, and `method`. `pattern_counts` maps each pattern `label` to its scanner hit count; it is empty (`{}`) when all matches came from the structured-processor pass or when patterns have no label. |
 | `--strict` | | Abort on the first error instead of skipping and continuing. |
-| `-d, --deterministic` | `-d` | Use HMAC-deterministic replacements (reproducible across runs with the same password). Requires a password via `SANITIZE_PASSWORD`, `--password-file`, or `-p`. When combined with `--profile`, values discovered by structured scanning are saved to `--secrets-file` (creating the file if absent). |
+| `-d, --deterministic` | `-d` | Use HMAC-deterministic replacements (reproducible across runs with the same password). Requires a password via `SANITIZE_PASSWORD`, `--password-file`, or `-p`. When combined with `--profile`, also implies `--update-secrets`. |
+| `--update-secrets` | | After a profile-driven run, append values discovered by structured scanning to `--secrets-file` (or `sanitize-discovered.yaml` if no secrets file is given) as `kind: literal` entries. Existing patterns are not duplicated. Use this to grow your secrets file incrementally as you process new config files. |
 | `--include-binary` | | Process entries that appear to be binary data (default: skip). |
 | `--threads <N>` | | Number of worker threads. When multiple input files are given, files are processed in parallel up to this limit. For a single archive input, entries are sanitized in parallel using the same budget. Defaults to the number of logical CPUs. Capped to available parallelism. |
 | `--chunk-size <BYTES>` | | Chunk size for the streaming scanner in bytes (default: `1048576` = 1 MiB). |
@@ -236,6 +237,11 @@ Notes:
 | `--progress <MODE>` | | Progress display mode: `auto`, `on`, or `off`. Default: `auto`. |
 | `--no-progress` | | Alias for `--progress off`. |
 | `--progress-interval-ms <MS>` | | Minimum interval between progress refreshes (default: `200`). |
+| `--extract-context` | | After sanitizing, scan the output for error/warning/failure keywords and embed matching lines with surrounding context in the JSON report. Each file entry in `files[]` gets its own `log_context` object. Requires `--report`. Has no effect without `--report`. For stdout paths larger than 256 MiB the flag is silently skipped (use file output and the two-pass reader path instead). |
+| `--context-lines <N>` | | Lines of context to capture before and after each keyword match when `--extract-context` is set. Default: `10`. |
+| `--context-keywords <KEYWORDS>` | | Comma-separated list of additional keywords to scan for. Merged with the built-in defaults (`error`, `failure`, `warning`, `warn`, `fatal`, `exception`, `critical`). Example: `--context-keywords timeout,oomkilled,backoff`. |
+| `--force-text` | | Bypass all structured processors (JSON, YAML, XML, TOML, etc.) and run only the streaming scanner on every file. Use when you want a guarantee that every byte is pattern-scanned regardless of file type. |
+| `--strip-values` | | Strip all values from structured output, emitting only keys and structure. Useful for generating a profile template from a real config file without exposing any values. Bypasses the sanitization pipeline — no secrets file is required. |
 | `-h, --help` | `-h` | Print help. |
 | `-V, --version` | `-V` | Print version. |
 
@@ -366,6 +372,49 @@ sanitize -s secrets.json <<< "my secret api-key-12345"
 ```
 
 Stdin mode supports plain text streaming by default. Use `--format` / `-f` to enable structured processing (e.g., `-f json` for JSON-aware field replacement). Archive formats (tar, zip) are not supported via stdin.
+
+#### Processing Order
+
+The order in which stdin and file inputs are processed depends on whether `--profile` is active.
+
+**Without `--profile`:**
+
+1. Stdin — processed immediately with the base scanner.
+2. All file targets — run in parallel (Phase 2 only).
+
+**With `--profile`:**
+
+1. **Phase 1 — serial, in command-line order** — plain files that match a `--profile` entry, using the structured processor to discover and record field values.
+2. **Archive discovery pre-pass** — each archive in the input is read a second time to find profile-matched entries and add their values to the store.
+3. **Augmented scanner is built** — base secrets patterns + all literals discovered in steps 1–2.
+4. **Stdin** — now processed with the augmented scanner, so values found in structured config files are also replaced in piped input.
+5. **Phase 2 — parallel** — archives and non-profile plain files, using the augmented scanner.
+
+Deferring stdin until after file discovery is what makes piping work correctly alongside `--profile`:
+
+```bash
+# config.yaml runs first (Phase 1), discovers e.g. password: hunter2
+# error.json (stdin) is processed after — "hunter2" is replaced in it too
+cat error.json | sanitize config.yaml --profile profile.yaml -s secrets.yaml
+
+# Without --profile, stdin runs immediately (no deferral — no discovery happens)
+cat error.json | sanitize -s secrets.yaml
+```
+
+**Does file order matter?**
+
+In the common case (no `--profile`), all file targets go straight to Phase 2 and run in parallel — command-line order has no effect on results. The mapping store is thread-safe with first-writer-wins semantics, so the same value always receives the same replacement regardless of which file encounters it first.
+
+With `--profile`, Phase 1 files run in command-line order. In practice, order rarely matters because each value has one canonical replacement — the order only affects which file *first* adds a given value to the store, not what the replacement is.
+
+**Cross-file consistency**
+
+The mapping store is shared across all phases and all threads. If `hunter2` is discovered as a password in `config.yaml` (Phase 1), the same replacement is applied everywhere that literal appears — in Phase 2 archives, plain-text logs, and deferred stdin.
+
+```bash
+# file order within Phase 2 does not affect replacements:
+sanitize a.log b.log c.log -s secrets.yaml   # same result as c b a order
+```
 
 #### Examples
 
@@ -647,6 +696,59 @@ sanitize config.yaml -s s.enc --encrypted-secrets --password -n
 ```bash
 sanitize config.yaml -s s.enc --encrypted-secrets -P /run/secrets/pw --fail-on-match
 ```
+
+**Extract error context into the JSON report (for LLM triage):**
+
+```bash
+# Basic: report gets a log_context block per file with default keywords and 10 lines of context.
+sanitize app.log -s secrets.yaml --report report.json --extract-context
+
+# Multiple files: each file gets its own log_context in the report.
+sanitize app.log worker.log -s secrets.yaml --report report.json --extract-context
+
+# Custom context window and extra keywords:
+sanitize app.log -s secrets.yaml --report report.json \
+  --extract-context --context-lines 20 --context-keywords timeout,oomkilled,backoff
+
+# Pipe stdin and capture context (output to file required when input > 256 MiB):
+cat app.log | sanitize -s secrets.yaml --report - --extract-context
+
+# Only keywords you care about (replaces defaults):
+# Use --context-keywords with the full list you want; to override defaults entirely,
+# pass your list and omit the built-in terms you want to exclude.
+sanitize app.log -s secrets.yaml --report report.json \
+  --extract-context --context-keywords fatal,critical
+```
+
+**Report JSON — `log_context` shape** (present per file when `--extract-context` is used):
+
+```json
+{
+  "path": "app.log",
+  "matches": 3,
+  "replacements": 3,
+  "bytes_processed": 10240,
+  "bytes_output": 10240,
+  "pattern_counts": { "kael_email": 2 },
+  "method": "scanner",
+  "log_context": {
+    "total_lines": 1500,
+    "match_count": 2,
+    "truncated": false,
+    "matches": [
+      {
+        "line_number": 42,
+        "keyword": "error",
+        "line": "2026-05-01T10:00:05Z ERROR db: connection timeout",
+        "before": ["2026-05-01T10:00:04Z INFO  executing query"],
+        "after":  ["2026-05-01T10:00:06Z INFO  retrying connection"]
+      }
+    ]
+  }
+}
+```
+
+`log_context` is omitted entirely from a file entry when `--extract-context` was not used. `truncated: true` means `max_matches` (default 50) was hit before the end of the file; increase `--context-lines` is not the right knob here — truncation is about total match count, not window size.
 
 **Read password from a file (avoids shell history and /proc exposure):**
 

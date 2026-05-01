@@ -140,23 +140,25 @@ sanitize guided
 
 The wizard produces two files:
 
-- **`secrets.yaml`** — a streaming scanner config covering emails, IPs, UUIDs, API keys, tokens, PEM keys, and cloud provider identifiers. Encrypted to `secrets.yaml.enc` if you choose to encrypt (plaintext is then removed automatically).
-- **`profile.yaml`** — structured field rules for the formats you select (YAML/JSON, NDJSON, `.env`, TOML, INI). Use this with `--profile` to replace specific fields by name rather than scanning raw bytes.
+- **`secrets.guided.yaml`** — a streaming scanner config covering emails, IPs, UUIDs, API keys, tokens, PEM keys, and cloud provider identifiers. Encrypted to `secrets.guided.yaml.enc` if you choose to encrypt (plaintext is then removed automatically).
+- **`secrets.guided.profile.yaml`** — structured field rules for the formats you select (YAML/JSON, NDJSON, `.env`, TOML, INI). Use this with `--profile` to replace specific fields by name rather than scanning raw bytes. Omitted if you choose `None` for formats.
 
 ```bash
 # After the wizard finishes, run sanitize with both files:
-sanitize app.log config.yaml -s secrets.yaml.enc --password --profile profile.yaml
+sanitize app.log config.yaml -s secrets.guided.yaml.enc --encrypted-secrets --password --profile secrets.guided.profile.yaml
 ```
 
-The preset controls which patterns are included:
+The **workspace type** controls which patterns are included:
 
-| Preset | Extra coverage |
-|--------|---------------|
+| Workspace type | Extra coverage |
+|----------------|----------------|
 | Generic | Tokens, emails, IPs, UUIDs (default) |
-| Web app | JWTs, session cookies, OAuth tokens |
-| Kubernetes | Service-account tokens, namespaces, container IDs, k8s Secret field rules |
-| Database | Connection strings, DSNs, DB passwords |
-| AWS | Access keys, ARNs, account IDs, EC2 instance IDs |
+| Web app | Session IDs, OAuth access/refresh tokens |
+| Kubernetes | Service-account tokens, namespaces, container IDs, k8s `data.*`/`stringData.*` field rules |
+| Database | Connection strings, DSNs, DB usernames |
+| AWS | Like Generic but defaults to Aggressive strictness |
+
+A second prompt sets the **replacement strictness** (`Balanced` or `Aggressive`). Aggressive additionally matches broad hostnames, short container IDs, and high-entropy token patterns — recommended when sharing logs with an LLM.
 
 For a full step-by-step breakdown of prompts and the exact categories/patterns generated, see the `sanitize guided` section in [docs/cli-reference.md](docs/cli-reference.md).
 

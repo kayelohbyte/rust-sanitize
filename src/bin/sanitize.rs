@@ -71,11 +71,11 @@ use sanitize_engine::secrets::{
     SecretEntry, SecretsFormat,
 };
 use sanitize_engine::{
-    atomic_write, extract_context, ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress,
-    AtomicFileWriter, Category, FieldRule, FileReport, FileTypeProfile, HmacGenerator,
-    LogContextConfig, MappingStore, ProcessorRegistry, RandomGenerator, ReplacementGenerator,
-    ReportBuilder, ReportMetadata, ScanConfig, ScanPattern, ScanStats, StreamScanner,
-    DEFAULT_MAX_ARCHIVE_DEPTH,
+    atomic_write, extract_context, extract_context_reader, ArchiveFilter, ArchiveFormat,
+    ArchiveProcessor, ArchiveProgress, AtomicFileWriter, Category, FieldRule, FileReport,
+    FileTypeProfile, HmacGenerator, LogContextConfig, MappingStore, ProcessorRegistry,
+    RandomGenerator, ReplacementGenerator, ReportBuilder, ReportMetadata, ScanConfig, ScanPattern,
+    ScanStats, StreamScanner, DEFAULT_MAX_ARCHIVE_DEPTH,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -95,6 +95,13 @@ use zeroize::Zeroizing;
 /// limit fall back to the streaming scanner which operates in bounded
 /// memory. Configurable via `--max-structured-size`.
 const DEFAULT_MAX_STRUCTURED_FILE_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Maximum output size buffered in memory when `--extract-context` is used
+/// and the sanitized output is directed to stdout (not a file). Outputs
+/// larger than this skip context extraction and emit a warning. Users with
+/// large log files should use `-o`/`--output` so the two-pass file path is
+/// taken instead.
+const MAX_CONTEXT_BUFFER_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
 /// Global flag set by the SIGINT/SIGTERM handler.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -246,9 +253,18 @@ struct Cli {
 
     /// Use HMAC-deterministic replacements so that identical inputs
     /// always produce identical outputs across runs (requires a stable
-    /// seed derived from the secrets key).
+    /// seed derived from the secrets key). When combined with `--profile`,
+    /// also implies `--update-secrets`.
     #[arg(short = 'd', long)]
     deterministic: bool,
+
+    /// After a profile-driven run, append any values discovered by structured
+    /// scanning to the secrets file (`--secrets-file`, or
+    /// `sanitize-discovered.yaml` if none is given) as `kind: literal`
+    /// entries. Existing patterns are not duplicated.  Implies the same
+    /// write when `--deterministic` is also set.
+    #[arg(long)]
+    update_secrets: bool,
 
     /// Process entries that appear to be binary data (default: skip).
     #[arg(long)]
@@ -1725,6 +1741,7 @@ fn run_guided() -> Result<(), (String, i32)> {
         report: None,
         strict: false,
         deterministic,
+        update_secrets: false,
         include_binary: false,
         force_text: false,
         threads: None,
@@ -2612,7 +2629,7 @@ fn process_stdin(
                             method,
                         ));
                     }
-                    maybe_extract_context(&output_bytes, cli, report_builder);
+                    maybe_extract_context(&output_bytes, "<stdin>", cli, report_builder);
                     if !cli.dry_run {
                         write_output(output_path, &output_bytes)?;
                     }
@@ -2638,7 +2655,7 @@ fn process_stdin(
                     "scanner",
                 ));
             }
-            maybe_extract_context(&output_bytes, cli, report_builder);
+            maybe_extract_context(&output_bytes, "<stdin>", cli, report_builder);
             if !cli.dry_run {
                 write_output(output_path, &output_bytes)?;
             }
@@ -2748,7 +2765,7 @@ fn process_stdin_streaming<R: io::Read>(
                     "scanner",
                 ));
             }
-            maybe_extract_context(&buf, cli, report_builder);
+            maybe_extract_context(&buf, "<stdin>", cli, report_builder);
             let stdout = io::stdout();
             stdout
                 .lock()
@@ -2970,35 +2987,87 @@ fn process_plain_file(
                             &method,
                         ));
                     }
+                    maybe_extract_context_reader(
+                        out_path,
+                        &input.display().to_string(),
+                        cli,
+                        report_builder,
+                    );
                     Ok(had_matches)
                 });
             } else {
                 let label = format!("Scanning {}", input.display());
                 let progress_label = label.clone();
                 return with_progress_scope(progress, &label, move |progress| {
-                    let reader = BufReader::new(
-                        fs::File::open(input)
-                            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-                    );
-                    let stdout = io::stdout();
-                    let writer = BufWriter::new(stdout.lock());
-                    let stats = per_file_scanner
-                        .scan_reader_with_progress(
-                            reader,
-                            writer,
-                            Some(sz),
-                            make_scan_callback(progress.clone(), &progress_label),
-                        )
-                        .map_err(|e| format!("scanner error: {e}"))?;
-                    if stats.matches_found > 0 {
-                        had_matches = true;
-                    }
-                    if let Some(rb) = report_builder {
-                        rb.record_file(FileReport::from_scan_stats(
-                            input.display().to_string(),
-                            &stats,
-                            &method,
-                        ));
+                    if cli.extract_context && sz <= MAX_CONTEXT_BUFFER_BYTES {
+                        let reader = BufReader::new(
+                            fs::File::open(input)
+                                .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                        );
+                        let mut buf: Vec<u8> = Vec::new();
+                        let stats = per_file_scanner
+                            .scan_reader_with_progress(
+                                reader,
+                                &mut buf,
+                                Some(sz),
+                                make_scan_callback(progress.clone(), &progress_label),
+                            )
+                            .map_err(|e| format!("scanner error: {e}"))?;
+                        if stats.matches_found > 0 {
+                            had_matches = true;
+                        }
+                        if let Some(rb) = report_builder {
+                            rb.record_file(FileReport::from_scan_stats(
+                                input.display().to_string(),
+                                &stats,
+                                &method,
+                            ));
+                        }
+                        maybe_extract_context(
+                            &buf,
+                            &input.display().to_string(),
+                            cli,
+                            report_builder,
+                        );
+                        let stdout = io::stdout();
+                        stdout
+                            .lock()
+                            .write_all(&buf)
+                            .map_err(|e| format!("failed to write to stdout: {e}"))?;
+                    } else {
+                        if cli.extract_context {
+                            warn!(
+                                file = %input.display(),
+                                size = sz,
+                                max = MAX_CONTEXT_BUFFER_BYTES,
+                                "--extract-context: file too large to buffer for stdout; \
+                                 use -o/--output to write to a file for context extraction"
+                            );
+                        }
+                        let reader = BufReader::new(
+                            fs::File::open(input)
+                                .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                        );
+                        let stdout = io::stdout();
+                        let writer = BufWriter::new(stdout.lock());
+                        let stats = per_file_scanner
+                            .scan_reader_with_progress(
+                                reader,
+                                writer,
+                                Some(sz),
+                                make_scan_callback(progress.clone(), &progress_label),
+                            )
+                            .map_err(|e| format!("scanner error: {e}"))?;
+                        if stats.matches_found > 0 {
+                            had_matches = true;
+                        }
+                        if let Some(rb) = report_builder {
+                            rb.record_file(FileReport::from_scan_stats(
+                                input.display().to_string(),
+                                &stats,
+                                &method,
+                            ));
+                        }
                     }
                     Ok(had_matches)
                 });
@@ -3102,6 +3171,12 @@ fn process_plain_file(
                         return Ok(had_matches);
                     }
                 }
+                maybe_extract_context(
+                    &output_bytes,
+                    &input.display().to_string(),
+                    cli,
+                    report_builder,
+                );
                 write_output(output_path, &output_bytes)?;
                 Ok(had_matches)
             });
@@ -3185,36 +3260,85 @@ fn process_plain_file(
                     method,
                 ));
             }
+            maybe_extract_context_reader(
+                out_path,
+                &input.display().to_string(),
+                cli,
+                report_builder,
+            );
             Ok(had_matches)
         })
     } else {
         let label = format!("Scanning {}", input.display());
         let progress_label = label.clone();
         with_progress_scope(progress, &label, move |progress| {
-            let reader = BufReader::new(
-                fs::File::open(input)
-                    .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-            );
-            let stdout = io::stdout();
-            let writer = BufWriter::new(stdout.lock());
-            let progress_for_scan = progress.clone();
-            let stats = scanner
-                .scan_reader_with_progress(
-                    reader,
-                    writer,
-                    Some(file_size(input)?),
-                    make_scan_callback(progress_for_scan, &progress_label),
-                )
-                .map_err(|e| format!("scanner error: {e}"))?;
-            if stats.matches_found > 0 {
-                had_matches = true;
-            }
-            if let Some(rb) = report_builder {
-                rb.record_file(FileReport::from_scan_stats(
-                    input.display().to_string(),
-                    &stats,
-                    method,
-                ));
+            let sz = file_size(input)?;
+            if cli.extract_context && sz <= MAX_CONTEXT_BUFFER_BYTES {
+                let reader = BufReader::new(
+                    fs::File::open(input)
+                        .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                );
+                let mut buf: Vec<u8> = Vec::new();
+                let progress_for_scan = progress.clone();
+                let stats = scanner
+                    .scan_reader_with_progress(
+                        reader,
+                        &mut buf,
+                        Some(sz),
+                        make_scan_callback(progress_for_scan, &progress_label),
+                    )
+                    .map_err(|e| format!("scanner error: {e}"))?;
+                if stats.matches_found > 0 {
+                    had_matches = true;
+                }
+                if let Some(rb) = report_builder {
+                    rb.record_file(FileReport::from_scan_stats(
+                        input.display().to_string(),
+                        &stats,
+                        method,
+                    ));
+                }
+                maybe_extract_context(&buf, &input.display().to_string(), cli, report_builder);
+                let stdout = io::stdout();
+                stdout
+                    .lock()
+                    .write_all(&buf)
+                    .map_err(|e| format!("failed to write to stdout: {e}"))?;
+            } else {
+                if cli.extract_context {
+                    warn!(
+                        file = %input.display(),
+                        size = sz,
+                        max = MAX_CONTEXT_BUFFER_BYTES,
+                        "--extract-context: file too large to buffer for stdout; \
+                         use -o/--output to write to a file for context extraction"
+                    );
+                }
+                let reader = BufReader::new(
+                    fs::File::open(input)
+                        .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                );
+                let stdout = io::stdout();
+                let writer = BufWriter::new(stdout.lock());
+                let progress_for_scan = progress.clone();
+                let stats = scanner
+                    .scan_reader_with_progress(
+                        reader,
+                        writer,
+                        Some(sz),
+                        make_scan_callback(progress_for_scan, &progress_label),
+                    )
+                    .map_err(|e| format!("scanner error: {e}"))?;
+                if stats.matches_found > 0 {
+                    had_matches = true;
+                }
+                if let Some(rb) = report_builder {
+                    rb.record_file(FileReport::from_scan_stats(
+                        input.display().to_string(),
+                        &stats,
+                        method,
+                    ));
+                }
             }
             Ok(had_matches)
         })
@@ -3616,6 +3740,7 @@ fn record_archive_stats(rb: &ReportBuilder, stats: &sanitize_engine::ArchiveStat
                 bytes_output: 0,
                 pattern_counts: std::collections::HashMap::new(),
                 method: method.clone(),
+                log_context: None,
             });
         }
     }
@@ -3632,6 +3757,7 @@ fn record_archive_stats(rb: &ReportBuilder, stats: &sanitize_engine::ArchiveStat
                 "archive({} files, {} structured, {} scanner)",
                 stats.files_processed, stats.structured_hits, stats.scanner_fallback
             ),
+            log_context: None,
         });
     }
 }
@@ -3669,8 +3795,14 @@ fn write_output(output_path: Option<&Path>, data: &[u8]) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// If `--extract-context` is set and a report builder is present, run log
-/// context extraction on `bytes` and attach the result to the builder.
-fn maybe_extract_context(bytes: &[u8], cli: &Cli, report_builder: Option<&ReportBuilder>) {
+/// context extraction on `bytes` and attach the result to the file entry
+/// identified by `report_path`.
+fn maybe_extract_context(
+    bytes: &[u8],
+    report_path: &str,
+    cli: &Cli,
+    report_builder: Option<&ReportBuilder>,
+) {
     if !cli.extract_context {
         return;
     }
@@ -3680,7 +3812,39 @@ fn maybe_extract_context(bytes: &[u8], cli: &Cli, report_builder: Option<&Report
     if !cli.context_keywords.is_empty() {
         config = config.with_extra_keywords(cli.context_keywords.iter().cloned());
     }
-    rb.set_log_context(extract_context(&text, &config));
+    rb.set_file_log_context(report_path, extract_context(&text, &config));
+}
+
+/// Streaming variant: re-opens `out_path` (the committed output file) and runs
+/// log context extraction without loading the full file into memory.
+/// Suitable for large log files where buffering the sanitized output is not
+/// feasible. `report_path` is the key used in the report (the input file path).
+/// No-ops when `--extract-context` is not set or there is no report builder.
+fn maybe_extract_context_reader(
+    out_path: &Path,
+    report_path: &str,
+    cli: &Cli,
+    report_builder: Option<&ReportBuilder>,
+) {
+    if !cli.extract_context {
+        return;
+    }
+    let Some(rb) = report_builder else { return };
+    let mut config = LogContextConfig::new().with_context_lines(cli.context_lines);
+    if !cli.context_keywords.is_empty() {
+        config = config.with_extra_keywords(cli.context_keywords.iter().cloned());
+    }
+    let file = match fs::File::open(out_path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(error = %e, path = %out_path.display(), "--extract-context: failed to open output file for context scan");
+            return;
+        }
+    };
+    match extract_context_reader(BufReader::new(file), &config) {
+        Ok(result) => rb.set_file_log_context(report_path, result),
+        Err(e) => warn!(error = %e, "--extract-context: failed to read output for log context"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4108,29 +4272,38 @@ fn run_sanitize(
     // Stdin must always be processed serially to preserve stream semantics and
     // terminal UX. File targets are processed in parallel via rayon when
     // thread_count > 1 and there is more than one file target.
+    //
+    // When --profile is active, stdin is deferred until after file processing
+    // so that the augmented scanner (base patterns + all literals discovered
+    // from profile-matched files and archives) is fully built before stdin
+    // is read. Without this, values discovered from structured files would
+    // not be replaced in the piped input.
     let (stdin_targets, file_targets): (Vec<_>, Vec<_>) = input_targets
         .into_iter()
         .partition(|t| matches!(t, InputTarget::Stdin { .. }));
 
     let mut had_matches = false;
 
-    // Process stdin targets sequentially.
-    for target in stdin_targets {
-        let InputTarget::Stdin { output } = target else {
-            unreachable!()
-        };
-        let result = process_stdin(
-            &cli,
-            output.as_deref(),
-            &scanner,
-            &registry,
-            &store,
-            &profiles,
-            report_builder.as_ref(),
-            progress_reporter.as_ref(),
-        )
-        .map_err(|e| (e, 1))?;
-        had_matches |= result;
+    // When no --profile is active there is no augmented scanner to wait for,
+    // so process stdin immediately (original behaviour).
+    if profiles.is_empty() {
+        for target in &stdin_targets {
+            let InputTarget::Stdin { ref output } = target else {
+                unreachable!()
+            };
+            let result = process_stdin(
+                &cli,
+                output.as_deref(),
+                &scanner,
+                &registry,
+                &store,
+                &profiles,
+                report_builder.as_ref(),
+                progress_reporter.as_ref(),
+            )
+            .map_err(|e| (e, 1))?;
+            had_matches |= result;
+        }
     }
 
     // --- two-phase file processing ------------------------------------------
@@ -4234,6 +4407,28 @@ fn run_sanitize(
         &store,
         scan_config,
     )?;
+
+    // When --profile is active, stdin was deferred until here so it benefits
+    // from the fully-populated augmented scanner.
+    if !profiles.is_empty() {
+        for target in stdin_targets {
+            let InputTarget::Stdin { output } = target else {
+                unreachable!()
+            };
+            let result = process_stdin(
+                &cli,
+                output.as_deref(),
+                &augmented_scanner,
+                &registry,
+                &store,
+                &profiles,
+                report_builder.as_ref(),
+                progress_reporter.as_ref(),
+            )
+            .map_err(|e| (e, 1))?;
+            had_matches |= result;
+        }
+    }
 
     // Phase 2 — parallel when multiple targets, serial otherwise.
     // Each worker gets Arc clones — all inner state is Send + Sync.
@@ -4343,10 +4538,11 @@ fn run_sanitize(
         return Err(("interrupted by signal".into(), 130));
     }
 
-    // --- persist discovered secrets (deterministic mode + profile) ----------
-    // When running deterministically with a profile, save the literal values
-    // found by structured scanning so future runs' scanner can match them.
-    if cli.deterministic && !profiles.is_empty() {
+    // --- persist discovered secrets (profile + deterministic or --update-secrets) ----------
+    // When a profile is active and either --deterministic or --update-secrets is set,
+    // append literal values found by structured scanning to the secrets file so that
+    // future runs' scanner can match them everywhere they appear.
+    if (cli.deterministic || cli.update_secrets) && !profiles.is_empty() {
         let save_path = cli
             .secrets_file
             .clone()

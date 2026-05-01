@@ -22,7 +22,7 @@ All public types are re-exported from the crate root (`sanitize_engine::*`) for 
 | `ScanConfig::new(chunk_size, overlap_size)` | Explicit construction. |
 | `ScanConfig::default()` | Defaults: 1 MiB chunk, 4 KiB overlap. |
 | `ScanConfig::validate()` | Validate that `chunk_size > 0` and `overlap_size < chunk_size`. |
-| `ScanStats` | Results of a scan: `bytes_processed`, `bytes_output`, `matches_found`, `replacements_applied`, `pattern_counts: HashMap<String, u64>`. |
+| `ScanStats` | Results of a scan: `bytes_processed`, `bytes_output`, `matches_found`, `replacements_applied`, `pattern_counts: HashMap<String, u64>`. `pattern_counts` is keyed by the `label` field of each `ScanPattern` and counts how many times that pattern matched. Only the scanner path populates this map; structured-processor hits are counted in `matches_found` but are not broken down by label here. |
 
 ## Store Module (`store`)
 
@@ -62,7 +62,7 @@ All public types are re-exported from the crate root (`sanitize_engine::*`) for 
 | Type / Function | Description |
 |-----------------|-------------|
 | `Processor` | Trait: `fn name()`, `fn can_handle(content, profile)`, `fn process(content, profile, store)`. Must be `Send + Sync`. |
-| `ProcessorRegistry` | Maps processor names to `Arc<dyn Processor>`. `ProcessorRegistry::with_builtins()` pre-loads all five processors. |
+| `ProcessorRegistry` | Maps processor names to `Arc<dyn Processor>`. `ProcessorRegistry::with_builtins()` pre-loads all ten built-in processors: `key_value`, `json`, `jsonl`, `yaml`, `xml`, `csv`, `toml`, `env`, `ini`, `log`. |
 | `FileTypeProfile` | Associates a processor name, file extensions, field rules, and options. |
 | `FieldRule` | A field pattern + optional category and label. |
 
@@ -82,12 +82,102 @@ All public types are re-exported from the crate root (`sanitize_engine::*`) for 
 
 | Type / Function | Description |
 |-----------------|-------------|
-| `SanitizeReport` | Top-level report: `metadata`, `summary`, `files: Vec<FileReport>`. |
+| `SanitizeReport` | Top-level report: `metadata`, `summary`, `files: Vec<FileReport>`. Never contains original secret values. |
 | `SanitizeReport::to_json()` / `to_json_pretty()` | Serialize to compact or pretty-printed JSON. |
 | `ReportMetadata` | Run parameters: `version`, `timestamp`, `deterministic`, `dry_run`, `strict`, `chunk_size`, `threads`, `secrets_file`. |
-| `ReportSummary` | Aggregated summary: `total_files`, `total_matches`, `total_replacements`, `total_bytes_processed`, `total_bytes_output`, `duration_ms`, `pattern_counts`. |
-| `ReportBuilder` | Thread-safe report builder. `record_file()` adds entries; `finish()` computes duration and returns `SanitizeReport`. |
-| `FileReport` | Per-file results: `path`, `matches`, `replacements`, byte counts, `pattern_counts`, `method` (e.g. `"scanner"`, `"structured:json"`). |
+| `ReportSummary` | Aggregated summary: `total_files`, `total_matches`, `total_replacements`, `total_bytes_processed`, `total_bytes_output`, `duration_ms`, `pattern_counts`. `pattern_counts` is aggregated from all file entries. |
+| `ReportBuilder` | Thread-safe report builder. Wrap in `Arc` for multi-threaded use. `record_file()` / `record_files()` add entries; `set_file_log_context(path, result)` attaches log context to a specific file entry; `finish()` computes wall-clock duration and returns `SanitizeReport`. |
+| `FileReport` | Per-file results: `path`, `matches`, `replacements`, `bytes_processed`, `bytes_output`, `pattern_counts`, `method`, and optional `log_context`. `pattern_counts` maps each pattern label to its hit count for that file; it is empty (`{}`) when no labeled patterns matched or when matches came exclusively from the structured processor pass. `method` is `"scanner"` for plain-text streaming, `"structured:<format>"` for structured files (e.g. `"structured:json"`), or a composite for archives. `log_context` is `null`/absent unless `--extract-context` was used. |
+| `FileReport::from_scan_stats(path, stats, method)` | Convenience constructor: converts `ScanStats` into a `FileReport`. |
+
+## Log Context Module (`log_context`)
+
+Scans sanitized output for error/warning keywords and captures the surrounding lines as context windows — useful for feeding triage information to LLMs or dashboards without exposing raw logs.
+
+| Type / Constant / Function | Description |
+|----------------------------|-------------|
+| `DEFAULT_KEYWORDS` | Built-in keyword list: `["error", "failure", "warning", "warn", "fatal", "exception", "critical"]`. Matched as case-insensitive substrings. |
+| `DEFAULT_CONTEXT_LINES` | Default lines of context around each match: `10`. |
+| `DEFAULT_MAX_MATCHES` | Default cap on matches per result: `50`. |
+| `LogContextConfig` | Configuration: `keywords`, `context_lines`, `max_matches`, `case_sensitive`. |
+| `LogContextConfig::new()` | Default config (uses built-in keywords, 10 context lines, 50 match cap, case-insensitive). |
+| `LogContextConfig::with_extra_keywords(iter)` | Merge additional keywords into the list without replacing the defaults. |
+| `LogContextConfig::with_keywords(iter)` | Replace the keyword list entirely. |
+| `LogContextConfig::with_context_lines(n)` | Set lines of context before/after each match. |
+| `LogContextConfig::with_max_matches(n)` | Set the match cap. |
+| `LogContextConfig::case_sensitive(bool)` | Enable case-sensitive matching (default: `false`). |
+| `LogContextResult` | Output: `total_lines`, `match_count`, `truncated`, `matches: Vec<LogContextMatch>`. `truncated` is `true` when `max_matches` was reached before end-of-input. |
+| `LogContextMatch` | A single match: `line_number` (1-based), `keyword` (which keyword triggered the match), `line` (the matching line), `before: Vec<String>` (up to `context_lines` preceding lines), `after: Vec<String>` (up to `context_lines` following lines). |
+| `extract_context(content, config)` | In-memory variant. Collects all lines into a `Vec<&str>` first; suitable for content already in a buffer. |
+| `extract_context_reader(reader, config)` | Streaming variant for large files. Uses an `O(context_lines)` ring buffer regardless of input size. Safe for multi-gigabyte files. Returns `io::Result<LogContextResult>`. |
+
+### Example — in-memory
+
+```rust
+use sanitize_engine::log_context::{extract_context, LogContextConfig};
+
+let log = "INFO  startup\nERROR disk full\nINFO  retrying\nINFO  done";
+let config = LogContextConfig::new().with_context_lines(1);
+let result = extract_context(log, &config);
+
+assert_eq!(result.match_count, 1);
+assert_eq!(result.matches[0].line_number, 2);
+assert_eq!(result.matches[0].keyword, "error");
+assert_eq!(result.matches[0].before, vec!["INFO  startup"]);
+assert_eq!(result.matches[0].after,  vec!["INFO  retrying"]);
+```
+
+### Example — streaming (large files)
+
+```rust
+use sanitize_engine::log_context::{extract_context_reader, LogContextConfig};
+use std::io::BufReader;
+use std::fs::File;
+
+let f = File::open("huge.log")?;
+let config = LogContextConfig::new()
+    .with_extra_keywords(["oomkilled", "timeout"])
+    .with_context_lines(5)
+    .with_max_matches(200);
+let result = extract_context_reader(BufReader::new(f), &config)?;
+println!("{} matches found in {} lines", result.match_count, result.total_lines);
+```
+
+### Report JSON shape for a file entry with `log_context`
+
+When `--extract-context` is used, each file entry in the report's `files` array gains a `log_context` object:
+
+```json
+{
+  "path": "app.log",
+  "matches": 3,
+  "replacements": 3,
+  "bytes_processed": 10240,
+  "bytes_output": 10240,
+  "pattern_counts": { "kael_email": 2, "api_key": 1 },
+  "method": "scanner",
+  "log_context": {
+    "total_lines": 1500,
+    "match_count": 2,
+    "truncated": false,
+    "matches": [
+      {
+        "line_number": 42,
+        "keyword": "error",
+        "line": "2026-05-01T10:00:05Z ERROR db: connection timeout (DB_CONN_ERR)",
+        "before": [
+          "2026-05-01T10:00:04Z INFO  db: executing query"
+        ],
+        "after": [
+          "2026-05-01T10:00:06Z INFO  retry: retrying connection"
+        ]
+      }
+    ]
+  }
+}
+```
+
+`log_context` is omitted entirely from a file entry when `--extract-context` was not used.
 
 ## Atomic I/O Module (`atomic`)
 

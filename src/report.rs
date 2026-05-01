@@ -45,12 +45,13 @@
 //!     bytes_output: 10_200,
 //!     pattern_counts: HashMap::from([("email".into(), 30), ("ipv4".into(), 12)]),
 //!     method: "scanner".into(),
+//!     log_context: None,
 //! });
 //!
-//! // Optionally attach log context (populated by --extract-context).
+//! // Optionally attach per-file log context (populated by --extract-context).
 //! let sanitized_output = "INFO ok\nERROR disk full\nINFO retrying";
 //! let ctx = extract_context(sanitized_output, &LogContextConfig::new().with_context_lines(1));
-//! builder.set_log_context(ctx);
+//! builder.set_file_log_context("data.log", ctx);
 //!
 //! let report = builder.finish();
 //! let json = report.to_json_pretty().unwrap();
@@ -81,11 +82,9 @@ pub struct SanitizeReport {
     pub metadata: ReportMetadata,
     /// Aggregated summary across all files.
     pub summary: ReportSummary,
-    /// Per-file details.
+    /// Per-file details. Each entry may include `log_context` when
+    /// `--extract-context` was used.
     pub files: Vec<FileReport>,
-    /// Log context extraction results, present when `--extract-context` was used.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub log_context: Option<LogContextResult>,
 }
 
 impl SanitizeReport {
@@ -168,6 +167,10 @@ pub struct FileReport {
     pub pattern_counts: HashMap<String, u64>,
     /// Processing method: `"scanner"`, `"structured:json"`, etc.
     pub method: String,
+    /// Log context extraction results for this file, present when
+    /// `--extract-context` was used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_context: Option<LogContextResult>,
 }
 
 impl FileReport {
@@ -186,6 +189,7 @@ impl FileReport {
             bytes_output: stats.bytes_output,
             pattern_counts: stats.pattern_counts.clone(),
             method: method.into(),
+            log_context: None,
         }
     }
 }
@@ -204,7 +208,6 @@ impl FileReport {
 pub struct ReportBuilder {
     metadata: ReportMetadata,
     files: Mutex<Vec<FileReport>>,
-    log_context: Mutex<Option<LogContextResult>>,
     start: Instant,
 }
 
@@ -226,14 +229,18 @@ impl ReportBuilder {
         Self {
             metadata,
             files: Mutex::new(Vec::new()),
-            log_context: Mutex::new(None),
             start: Instant::now(),
         }
     }
 
-    /// Attach log context extraction results to the report.
-    pub fn set_log_context(&self, result: LogContextResult) {
-        *self.log_context.lock().expect("report mutex poisoned") = Some(result);
+    /// Attach log context extraction results to the [`FileReport`] identified
+    /// by `path`. The file must already have been recorded via
+    /// [`Self::record_file`]. Thread-safe.
+    pub fn set_file_log_context(&self, path: &str, result: LogContextResult) {
+        let mut files = self.files.lock().expect("report mutex poisoned");
+        if let Some(file) = files.iter_mut().find(|f| f.path == path) {
+            file.log_context = Some(result);
+        }
     }
 
     /// Record the result for a single file. Thread-safe.
@@ -255,10 +262,6 @@ impl ReportBuilder {
         #[allow(clippy::cast_possible_truncation)] // duration in ms won't exceed u64
         let duration_ms = self.start.elapsed().as_millis() as u64;
         let files = self.files.into_inner().expect("report mutex poisoned");
-        let log_context = self
-            .log_context
-            .into_inner()
-            .expect("report mutex poisoned");
 
         // Aggregate summary.
         let mut total_matches: u64 = 0;
@@ -291,7 +294,6 @@ impl ReportBuilder {
             metadata: self.metadata,
             summary,
             files,
-            log_context,
         }
     }
 }
@@ -326,6 +328,7 @@ mod tests {
             bytes_output: matches * 110,
             pattern_counts: HashMap::from([(pattern.into(), matches)]),
             method: "scanner".into(),
+            log_context: None,
         }
     }
 
@@ -382,6 +385,7 @@ mod tests {
             bytes_output: 520,
             pattern_counts: HashMap::from([("hostname".into(), 2)]),
             method: "structured:yaml".into(),
+            log_context: None,
         });
         let report = builder.finish();
         let json = report.to_json_pretty().unwrap();
@@ -513,6 +517,7 @@ mod tests {
             bytes_output: 10_900_000_000,
             pattern_counts: HashMap::from([("email".into(), 600_000), ("ipv4".into(), 400_000)]),
             method: "scanner".into(),
+            log_context: None,
         });
         let report = builder.finish();
         assert_eq!(report.summary.total_matches, 1_000_000);

@@ -1,0 +1,192 @@
+{
+  "metadata": {
+    "version": "0.3.0",
+    "timestamp": "epoch+20574d 09:44:57Z",
+    "deterministic": false,
+    "dry_run": false,
+    "strict": false,
+    "chunk_size": 1048576,
+    "threads": null,
+    "secrets_file": "secrets.yaml"
+  },
+  "summary": {
+    "total_files": 2,
+    "total_matches": 3,
+    "total_replacements": 3,
+    "total_bytes_processed": 6294,
+    "total_bytes_output": 6294,
+    "duration_ms": 5,
+    "pattern_counts": {}
+  },
+  "files": [
+    {
+      "path": "error.json",
+      "matches": 1,
+      "replacements": 1,
+      "bytes_processed": 2761,
+      "bytes_output": 2761,
+      "pattern_counts": {},
+      "method": "scanner",
+      "log_context": {
+        "total_lines": 25,
+        "match_count": 5,
+        "truncated": false,
+        "matches": [
+          {
+            "line_number": 6,
+            "keyword": "error",
+            "line": "{\"timestamp\":\"2026-05-01T10:00:05Z\",\"level\":\"ERROR\",\"service\":\"db\",\"message\":\"Database connection timeout\",\"code\":\"DB_CONN_ERR\"}",
+            "before": [
+              "{\"timestamp\":\"2026-05-01T10:00:00Z\",\"level\":\"INFO\",\"service\":\"auth\",\"message\":\"User login attempt\",\"userId\":\"u123\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:01Z\",\"level\":\"INFO\",\"service\":\"auth\",\"message\":\"Password validated\",\"userId\":\"u123\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:02Z\",\"level\":\"INFO\",\"service\":\"auth\",\"message\":\"Session created\",\"sessionId\":\"s456\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:03Z\",\"level\":\"INFO\",\"service\":\"api\",\"message\":\"Request received\",\"endpoint\":\"/api/data\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:04Z\",\"level\":\"INFO\",\"service\":\"db\",\"message\":\"Query executed\",\"query\":\"SELECT * FROM table\"}"
+            ],
+            "after": [
+              "{\"timestamp\":\"2026-05-01T10:00:06Z\",\"level\":\"INFO\",\"service\":\"retry\",\"message\":\"Retrying database connection\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:07Z\",\"level\":\"INFO\",\"service\":\"db\",\"message\":\"Connection re-established\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:08Z\",\"level\":\"INFO\",\"service\":\"api\",\"message\":\"Processing request\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:09Z\",\"level\":\"INFO\",\"service\":\"api\",\"message\":\"Sending response\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:10Z\",\"level\":\"INFO\",\"service\":\"auth\",\"message\":\"Token validated\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:11Z\",\"level\":\"INFO\",\"service\":\"cache\",\"message\":\"Cache hit\",\"key\":\"2abf@test.com\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:12Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Job started\",\"jobId\":\"j789\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:13Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Processing data\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:14Z\",\"level\":\"ERROR\",\"service\":\"worker\",\"message\":\"Unhandled exception during processing\",\"code\":\"PROC_ERR\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:15Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Attempting recovery\"}"
+            ]
+          },
+          {
+            "line_number": 15,
+            "keyword": "error",
+            "line": "{\"timestamp\":\"2026-05-01T10:00:14Z\",\"level\":\"ERROR\",\"service\":\"worker\",\"message\":\"Unhandled exception during processing\",\"code\":\"PROC_ERR\"}",
+            "before": [
+              "{\"timestamp\":\"2026-05-01T10:00:04Z\",\"level\":\"INFO\",\"service\":\"db\",\"message\":\"Query executed\",\"query\":\"SELECT * FROM table\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:05Z\",\"level\":\"ERROR\",\"service\":\"db\",\"message\":\"Database connection timeout\",\"code\":\"DB_CONN_ERR\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:06Z\",\"level\":\"INFO\",\"service\":\"retry\",\"message\":\"Retrying database connection\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:07Z\",\"level\":\"INFO\",\"service\":\"db\",\"message\":\"Connection re-established\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:08Z\",\"level\":\"INFO\",\"service\":\"api\",\"message\":\"Processing request\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:09Z\",\"level\":\"INFO\",\"service\":\"api\",\"message\":\"Sending response\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:10Z\",\"level\":\"INFO\",\"service\":\"auth\",\"message\":\"Token validated\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:11Z\",\"level\":\"INFO\",\"service\":\"cache\",\"message\":\"Cache hit\",\"key\":\"2abf@test.com\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:12Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Job started\",\"jobId\":\"j789\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:13Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Processing data\"}"
+            ],
+            "after": [
+              "{\"timestamp\":\"2026-05-01T10:00:15Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Attempting recovery\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:16Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Recovery successful\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:17Z\",\"level\":\"INFO\",\"service\":\"api\",\"message\":\"Request completed\",\"status\":200}",
+              "{\"timestamp\":\"2026-05-01T10:00:18Z\",\"level\":\"INFO\",\"service\":\"metrics\",\"message\":\"Metrics recorded\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:19Z\",\"level\":\"INFO\",\"service\":\"scheduler\",\"message\":\"Scheduled job triggered\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:20Z\",\"level\":\"INFO\",\"service\":\"scheduler\",\"message\":\"Job completed\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:21Z\",\"level\":\"INFO\",\"service\":\"auth\",\"message\":\"Warniong User logout\",\"userId\":\"u123\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:22Z\",\"level\":\"INFO\",\"service\":\"cleanup\",\"message\":\"Session cleared\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:23Z\",\"level\":\"INFO\",\"service\":\"system\",\"message\":\"Health check passed, healthy CAT\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:24Z\",\"level\":\"INFO\",\"service\":\"system\",\"message\":\"System idle pet the cat\"}"
+            ]
+          },
+          {
+            "line_number": 22,
+            "keyword": "warn",
+            "line": "{\"timestamp\":\"2026-05-01T10:00:21Z\",\"level\":\"INFO\",\"service\":\"auth\",\"message\":\"Warniong User logout\",\"userId\":\"u123\"}",
+            "before": [
+              "{\"timestamp\":\"2026-05-01T10:00:11Z\",\"level\":\"INFO\",\"service\":\"cache\",\"message\":\"Cache hit\",\"key\":\"2abf@test.com\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:12Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Job started\",\"jobId\":\"j789\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:13Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Processing data\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:14Z\",\"level\":\"ERROR\",\"service\":\"worker\",\"message\":\"Unhandled exception during processing\",\"code\":\"PROC_ERR\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:15Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Attempting recovery\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:16Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Recovery successful\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:17Z\",\"level\":\"INFO\",\"service\":\"api\",\"message\":\"Request completed\",\"status\":200}",
+              "{\"timestamp\":\"2026-05-01T10:00:18Z\",\"level\":\"INFO\",\"service\":\"metrics\",\"message\":\"Metrics recorded\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:19Z\",\"level\":\"INFO\",\"service\":\"scheduler\",\"message\":\"Scheduled job triggered\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:20Z\",\"level\":\"INFO\",\"service\":\"scheduler\",\"message\":\"Job completed\"}"
+            ],
+            "after": [
+              "{\"timestamp\":\"2026-05-01T10:00:22Z\",\"level\":\"INFO\",\"service\":\"cleanup\",\"message\":\"Session cleared\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:23Z\",\"level\":\"INFO\",\"service\":\"system\",\"message\":\"Health check passed, healthy CAT\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:24Z\",\"level\":\"INFO\",\"service\":\"system\",\"message\":\"System idle pet the cat\"}"
+            ]
+          },
+          {
+            "line_number": 24,
+            "keyword": "cat",
+            "line": "{\"timestamp\":\"2026-05-01T10:00:23Z\",\"level\":\"INFO\",\"service\":\"system\",\"message\":\"Health check passed, healthy CAT\"}",
+            "before": [
+              "{\"timestamp\":\"2026-05-01T10:00:13Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Processing data\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:14Z\",\"level\":\"ERROR\",\"service\":\"worker\",\"message\":\"Unhandled exception during processing\",\"code\":\"PROC_ERR\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:15Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Attempting recovery\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:16Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Recovery successful\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:17Z\",\"level\":\"INFO\",\"service\":\"api\",\"message\":\"Request completed\",\"status\":200}",
+              "{\"timestamp\":\"2026-05-01T10:00:18Z\",\"level\":\"INFO\",\"service\":\"metrics\",\"message\":\"Metrics recorded\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:19Z\",\"level\":\"INFO\",\"service\":\"scheduler\",\"message\":\"Scheduled job triggered\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:20Z\",\"level\":\"INFO\",\"service\":\"scheduler\",\"message\":\"Job completed\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:21Z\",\"level\":\"INFO\",\"service\":\"auth\",\"message\":\"Warniong User logout\",\"userId\":\"u123\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:22Z\",\"level\":\"INFO\",\"service\":\"cleanup\",\"message\":\"Session cleared\"}"
+            ],
+            "after": [
+              "{\"timestamp\":\"2026-05-01T10:00:24Z\",\"level\":\"INFO\",\"service\":\"system\",\"message\":\"System idle pet the cat\"}"
+            ]
+          },
+          {
+            "line_number": 25,
+            "keyword": "cat",
+            "line": "{\"timestamp\":\"2026-05-01T10:00:24Z\",\"level\":\"INFO\",\"service\":\"system\",\"message\":\"System idle pet the cat\"}",
+            "before": [
+              "{\"timestamp\":\"2026-05-01T10:00:14Z\",\"level\":\"ERROR\",\"service\":\"worker\",\"message\":\"Unhandled exception during processing\",\"code\":\"PROC_ERR\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:15Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Attempting recovery\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:16Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Recovery successful\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:17Z\",\"level\":\"INFO\",\"service\":\"api\",\"message\":\"Request completed\",\"status\":200}",
+              "{\"timestamp\":\"2026-05-01T10:00:18Z\",\"level\":\"INFO\",\"service\":\"metrics\",\"message\":\"Metrics recorded\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:19Z\",\"level\":\"INFO\",\"service\":\"scheduler\",\"message\":\"Scheduled job triggered\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:20Z\",\"level\":\"INFO\",\"service\":\"scheduler\",\"message\":\"Job completed\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:21Z\",\"level\":\"INFO\",\"service\":\"auth\",\"message\":\"Warniong User logout\",\"userId\":\"u123\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:22Z\",\"level\":\"INFO\",\"service\":\"cleanup\",\"message\":\"Session cleared\"}",
+              "{\"timestamp\":\"2026-05-01T10:00:23Z\",\"level\":\"INFO\",\"service\":\"system\",\"message\":\"Health check passed, healthy CAT\"}"
+            ],
+            "after": []
+          }
+        ]
+      }
+    },
+    {
+      "path": "stack-trace-error.json",
+      "matches": 2,
+      "replacements": 2,
+      "bytes_processed": 3533,
+      "bytes_output": 3533,
+      "pattern_counts": {},
+      "method": "scanner",
+      "log_context": {
+        "total_lines": 30,
+        "match_count": 1,
+        "truncated": false,
+        "matches": [
+          {
+            "line_number": 25,
+            "keyword": "error",
+            "line": "{\"timestamp\":\"2026-05-01T11:00:14Z\",\"level\":\"ERROR\",\"service\":\"payment\",\"message\":\"Null reference exception\",\"code\":\"NULL_REF\",\"stackTrace\":\"Error: NullReferenceException\\n    at PaymentService.getDetails (payment.js:45:15)\\n    at OrderService.enrichOrders (orders.js:78:22)\\n    at processTicksAndRejections (internal/process/task_queues.js:95:5)\"}",
+            "before": [
+              "{\"timestamp\":\"2026-05-01T11:00:15Z\",\"level\":\"INFO\",\"service\":\"orders\",\"message\":\"Fallback to cached payment data\"}",
+              "{\"timestamp\":\"2026-05-01T11:00:16Z\",\"level\":\"INFO\",\"service\":\"cache\",\"message\":\"Retrieving cached data\",\"key\":\"payments_u555\"}",
+              "{\"timestamp\":\"2026-05-01T11:00:17Z\",\"level\":\"INFO\",\"service\":\"orders\",\"message\":\"Merging order and payment data\"}",
+              "{\"timestamp\":\"2026-05-01T11:00:18Z\",\"level\":\"INFO\",\"service\":\"orders\",\"message\":\"Finalizing response\"}",
+              "{\"timestamp\":\"2026-05-01T11:00:19Z\",\"level\":\"INFO\",\"service\":\"api\",\"message\":\"Sending response to 5ade1\",\"status\":200}",
+              "{\"timestamp\":\"2026-05-01T11:00:20Z\",\"level\":\"INFO\",\"service\":\"metrics\",\"message\":\"Recording latency\"}",
+              "{\"timestamp\":\"2026-05-01T11:00:21Z\",\"level\":\"INFO\",\"service\":\"metrics\",\"message\":\"Latency recorded\",\"value\":120}",
+              "{\"timestamp\":\"2026-05-01T11:00:22Z\",\"level\":\"INFO\",\"service\":\"gateway\",\"message\":\"Request complete\",\"requestId\":\"r100\"}",
+              "{\"timestamp\":\"2026-05-01T11:00:23Z\",\"level\":\"INFO\",\"service\":\"scheduler\",\"message\":\"Running background job\"}",
+              "{\"timestamp\":\"2026-05-01T11:00:24Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Processing queue\"}"
+            ],
+            "after": [
+              "{\"timestamp\":\"2026-05-01T11:00:25Z\",\"level\":\"INFO\",\"service\":\"worker\",\"message\":\"Queue processed\"}",
+              "{\"timestamp\":\"2026-05-01T11:00:26Z\",\"level\":\"INFO\",\"service\":\"system\",\"message\":\"Health check OK\"}",
+              "{\"timestamp\":\"2026-05-01T11:00:27Z\",\"level\":\"INFO\",\"service\":\"system\",\"message\":\"Memory usage stable\"}",
+              "{\"timestamp\":\"2026-05-01T11:00:28Z\",\"level\":\"INFO\",\"service\":\"system\",\"message\":\"CPU usage normal\"}",
+              "{\"timestamp\":\"2026-05-01T11:00:29Z\",\"level\":\"INFO\",\"service\":\"system\",\"message\":\"Idle state\"}"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

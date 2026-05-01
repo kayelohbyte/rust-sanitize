@@ -145,8 +145,8 @@ pub use category::Category;
 pub use error::{Result, SanitizeError};
 pub use generator::{HmacGenerator, RandomGenerator, ReplacementGenerator};
 pub use log_context::{
-    extract_context, LogContextConfig, LogContextMatch, LogContextResult, DEFAULT_CONTEXT_LINES,
-    DEFAULT_KEYWORDS, DEFAULT_MAX_MATCHES,
+    extract_context, extract_context_reader, LogContextConfig, LogContextMatch, LogContextResult,
+    DEFAULT_CONTEXT_LINES, DEFAULT_KEYWORDS, DEFAULT_MAX_MATCHES,
 };
 pub use processor::archive::{
     ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress, ArchiveStats,

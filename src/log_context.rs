@@ -24,6 +24,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::{collections::VecDeque, io};
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -264,6 +265,182 @@ pub fn extract_context(content: &str, config: &LogContextConfig) -> LogContextRe
         truncated,
         matches,
     }
+}
+
+/// Streaming variant of [`extract_context`] for large inputs.
+///
+/// Reads `reader` line by line using a sliding ring buffer of
+/// `config.context_lines` lines. Memory usage is
+/// `O(context_lines × max_line_length)` regardless of total file size,
+/// making it safe for multi-gigabyte log files.
+///
+/// Semantics match [`extract_context`]: case handling, `max_matches`,
+/// `truncated`, and first-keyword-wins on a line all behave identically.
+/// "Before" and "after" context windows are clipped at file boundaries.
+///
+/// # Example
+///
+/// ```rust
+/// use sanitize_engine::log_context::{LogContextConfig, extract_context_reader};
+/// use std::io::BufReader;
+///
+/// let data = b"INFO start\nERROR disk full\nINFO retrying\n";
+/// let config = LogContextConfig::new().with_context_lines(1);
+/// let result = extract_context_reader(BufReader::new(data.as_ref()), &config).unwrap();
+///
+/// assert_eq!(result.match_count, 1);
+/// assert_eq!(result.matches[0].line_number, 2);
+/// assert_eq!(result.matches[0].before, vec!["INFO start"]);
+/// assert_eq!(result.matches[0].after,  vec!["INFO retrying"]);
+/// ```
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] if reading from `reader` fails.
+#[allow(clippy::too_many_lines)]
+pub fn extract_context_reader<R: io::BufRead>(
+    reader: R,
+    config: &LogContextConfig,
+) -> io::Result<LogContextResult> {
+    struct Pending {
+        line_number: usize,
+        keyword: String,
+        line: String,
+        before: Vec<String>,
+        after: Vec<String>,
+        remaining: usize,
+    }
+
+    let cap = config.context_lines;
+    let mut before_buf: VecDeque<String> = VecDeque::with_capacity(cap.saturating_add(1));
+    let mut pending: Vec<Pending> = Vec::new();
+    let mut matches: Vec<LogContextMatch> = Vec::new();
+    let mut truncated = false;
+    let mut total_lines: usize = 0;
+
+    // Pre-normalise keywords once (mirrors extract_context).
+    let normalised: Vec<String> = config
+        .keywords
+        .iter()
+        .map(|kw| {
+            if config.case_sensitive {
+                kw.clone()
+            } else {
+                kw.to_lowercase()
+            }
+        })
+        .collect();
+
+    let mut line_buf = String::new();
+    let mut reader = reader;
+    loop {
+        line_buf.clear();
+        let n = reader.read_line(&mut line_buf)?;
+        if n == 0 {
+            break;
+        }
+        // Strip trailing newline; preserve the rest of the line as-is.
+        let line: &str = line_buf.trim_end_matches(['\n', '\r']);
+        total_lines += 1;
+        let line_number = total_lines;
+
+        // Step 1: feed this line as "after" context to all pending matches.
+        let mut i = 0;
+        while i < pending.len() {
+            pending[i].after.push(line.to_owned());
+            pending[i].remaining -= 1;
+            if pending[i].remaining == 0 {
+                let p = pending.remove(i);
+                matches.push(LogContextMatch {
+                    line_number: p.line_number,
+                    keyword: p.keyword,
+                    line: p.line,
+                    before: p.before,
+                    after: p.after,
+                });
+            } else {
+                i += 1;
+            }
+        }
+
+        // Step 2: check if this line starts a new match.
+        if !truncated {
+            let effective_count = matches.len() + pending.len();
+            if effective_count >= config.max_matches {
+                // At the cap — check if this line would be a new match so we
+                // can set the truncated flag accurately.
+                let is_match = if config.case_sensitive {
+                    normalised.iter().any(|norm| line.contains(norm.as_str()))
+                } else {
+                    let lower = line.to_lowercase();
+                    normalised.iter().any(|norm| lower.contains(norm.as_str()))
+                };
+                if is_match {
+                    truncated = true;
+                }
+            } else {
+                let hit_idx = if config.case_sensitive {
+                    normalised
+                        .iter()
+                        .position(|norm| line.contains(norm.as_str()))
+                } else {
+                    let lower = line.to_lowercase();
+                    normalised
+                        .iter()
+                        .position(|norm| lower.contains(norm.as_str()))
+                };
+                if let Some(idx) = hit_idx {
+                    let before: Vec<String> = before_buf.iter().cloned().collect();
+                    if cap == 0 {
+                        matches.push(LogContextMatch {
+                            line_number,
+                            keyword: config.keywords[idx].clone(),
+                            line: line.to_owned(),
+                            before,
+                            after: Vec::new(),
+                        });
+                    } else {
+                        pending.push(Pending {
+                            line_number,
+                            keyword: config.keywords[idx].clone(),
+                            line: line.to_owned(),
+                            before,
+                            after: Vec::new(),
+                            remaining: cap,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Step 3: advance the before-context ring buffer.
+        if cap > 0 {
+            if before_buf.len() >= cap {
+                before_buf.pop_front();
+            }
+            before_buf.push_back(line.to_owned());
+        }
+    }
+
+    // Flush pending matches whose "after" windows were not fully filled
+    // before EOF (context clipped at end of file).
+    for p in pending {
+        matches.push(LogContextMatch {
+            line_number: p.line_number,
+            keyword: p.keyword,
+            line: p.line,
+            before: p.before,
+            after: p.after,
+        });
+    }
+
+    let match_count = matches.len();
+    Ok(LogContextResult {
+        total_lines,
+        match_count,
+        truncated,
+        matches,
+    })
 }
 
 // ---------------------------------------------------------------------------

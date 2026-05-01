@@ -92,6 +92,44 @@ sanitize config.yaml app.log --profile profile.yaml -s secrets.yaml
 # Both files get the same replacement for "hunter2"
 ```
 
+### Processing Order with `--profile`
+
+When mixing stdin, profile-matched files, archives, and plain files in a single command, the execution order depends on whether `--profile` is active:
+
+**Without `--profile`:**
+
+1. Stdin (immediately, using base scanner)
+2. All file targets in parallel (Phase 2 only)
+
+**With `--profile`:**
+
+1. **Phase 1 — serial, in command-line order** — plain files whose name matches at least one profile entry. Running these first populates the mapping store with discovered field values.
+2. **Archive discovery pre-pass** — for each archive in the input set, a second read scans for profile-matched entries so their values are also recorded in the store.
+3. **Augmented scanner is built** — base secrets patterns + all literals discovered from Phase 1 files and the archive pre-pass.
+4. **Stdin** — now processed with the fully-populated augmented scanner, so values from structured config files are replaced in piped input.
+5. **Phase 2 — parallel** — archives and plain files not matched by any profile, also using the augmented scanner.
+
+Deferring stdin until after Phase 1 and the archive pre-pass is what makes this work correctly:
+
+```bash
+# config.yaml runs first (Phase 1), discovers e.g. password: hunter2
+# stdin is processed after, so "hunter2" is replaced in error.json too
+cat error.json | sanitize config.yaml -s secrets.yaml --profile profile.yaml
+
+# Without --profile, stdin runs first (no deferral needed — no discovery happens)
+cat error.json | sanitize -s secrets.yaml
+```
+
+**Does command-line order matter?**
+
+- **Without `--profile`:** No. All file targets run in parallel, and the mapping store's first-writer-wins semantics guarantee consistent replacements regardless of which file finishes first.
+- **With `--profile`:** Phase 1 files run in command-line order. In practice, order rarely matters because each value has one canonical replacement — the order only affects which file *first* adds a given value to the store, not what the replacement is.
+
+```bash
+# Phase 2 ordering never changes results — same replacements regardless of file order
+sanitize a.log b.log c.log -s secrets.yaml   # identical result to c.log b.log a.log
+```
+
 ---
 
 ## Format Preservation
@@ -143,7 +181,7 @@ A profile file is a YAML or JSON array of profile entries. Each entry selects a 
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `processor` | Yes | — | Processor name: `"json"`, `"yaml"`, `"xml"`, `"csv"`, `"key_value"`, `"toml"`, `"env"`, `"ini"`, `"log"`. |
+| `processor` | Yes | — | Processor name: `"json"`, `"yaml"`, `"xml"`, `"csv"`, `"key_value"`, `"toml"`, `"env"`, `"ini"`, `"log"`, `"jsonl"`. |
 | `extensions` | Yes | `[]` | File extensions this profile applies to (e.g. `[".json"]`). An empty list matches nothing. |
 | `include` | No | `[]` | If non-empty, only files whose name matches at least one glob are processed. |
 | `exclude` | No | `[]` | Files whose name matches any glob are excluded from structured processing. |
