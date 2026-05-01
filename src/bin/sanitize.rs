@@ -664,6 +664,14 @@ fn prompt_cloud_providers() -> Result<Vec<CloudProvider>, String> {
     Ok(selected)
 }
 
+const ALL_FORMATS: &[GuidedFormat] = &[
+    GuidedFormat::YamlJson,
+    GuidedFormat::JsonLines,
+    GuidedFormat::Env,
+    GuidedFormat::Toml,
+    GuidedFormat::IniConf,
+];
+
 fn prompt_formats() -> Result<Vec<GuidedFormat>, String> {
     eprintln!("Structured file formats to include in profile (controls field-level redaction):");
     eprintln!("  1) YAML / JSON    — k8s manifests, docker-compose, app configs");
@@ -676,13 +684,7 @@ fn prompt_formats() -> Result<Vec<GuidedFormat>, String> {
     let raw = prompt_line("Select one or more (comma-separated, default: 6): ")?;
 
     if raw.trim().is_empty() || raw.trim() == "6" {
-        return Ok(vec![
-            GuidedFormat::YamlJson,
-            GuidedFormat::JsonLines,
-            GuidedFormat::Env,
-            GuidedFormat::Toml,
-            GuidedFormat::IniConf,
-        ]);
+        return Ok(ALL_FORMATS.to_vec());
     }
     if raw.trim() == "7" {
         return Ok(vec![]);
@@ -697,15 +699,7 @@ fn prompt_formats() -> Result<Vec<GuidedFormat>, String> {
             "3" => GuidedFormat::Env,
             "4" => GuidedFormat::Toml,
             "5" => GuidedFormat::IniConf,
-            "6" => {
-                return Ok(vec![
-                    GuidedFormat::YamlJson,
-                    GuidedFormat::JsonLines,
-                    GuidedFormat::Env,
-                    GuidedFormat::Toml,
-                    GuidedFormat::IniConf,
-                ]);
-            }
+            "6" => return Ok(ALL_FORMATS.to_vec()),
             "7" => return Ok(vec![]),
             _ => return Err(format!("invalid selection: '{token}'")),
         };
@@ -1797,6 +1791,9 @@ fn resolve_password(
     // 3. SANITIZE_PASSWORD env var.
     if let Ok(pw) = std::env::var("SANITIZE_PASSWORD") {
         if !pw.is_empty() {
+            // Remove from the environment immediately so it is not visible
+            // in /proc/self/environ or to child processes after this point.
+            std::env::remove_var("SANITIZE_PASSWORD");
             eprintln!("info: using password from SANITIZE_PASSWORD environment variable");
             return Ok(Zeroizing::new(pw));
         }
@@ -1914,7 +1911,7 @@ fn build_store(
     max_mappings: usize,
 ) -> std::result::Result<Arc<MappingStore>, String> {
     let generator: Arc<dyn ReplacementGenerator> = if deterministic {
-        let seed = match password {
+        match password {
             Some(k) => {
                 use hmac::Hmac;
                 use sha2::Sha256;
@@ -1923,7 +1920,9 @@ fn build_store(
                 let salt = b"sanitize-engine:deterministic-seed:v1";
                 pbkdf2::pbkdf2::<Hmac<Sha256>>(k.as_bytes(), salt, 600_000, buf.as_mut())
                     .expect("PBKDF2 output length is valid");
-                *buf
+                // Pass *buf directly into HmacGenerator; no named intermediate means
+                // no plain-stack copy of the derived key outlives this expression.
+                Arc::new(HmacGenerator::new(*buf))
             }
             None => {
                 return Err(
@@ -1932,8 +1931,7 @@ fn build_store(
                         .into(),
                 );
             }
-        };
-        Arc::new(HmacGenerator::new(seed))
+        }
     } else {
         Arc::new(RandomGenerator::new())
     };
@@ -2093,6 +2091,26 @@ fn has_stdin_input(cli: &Cli) -> bool {
     cli.input.is_empty() || cli.input.iter().any(|p| p.as_os_str() == "-")
 }
 
+/// Returns `true` when stdin is an OS-level pipe (FIFO), not a terminal,
+/// a regular file, or /dev/null.  This distinguishes `cat foo | sanitize`
+/// from test harnesses that pass `Stdio::null()` or redirect a plain file.
+#[cfg(unix)]
+fn stdin_is_pipe() -> bool {
+    use nix::sys::stat::fstat;
+    use std::os::unix::io::AsRawFd;
+    fstat(io::stdin().as_raw_fd())
+        .map(|s| {
+            nix::sys::stat::SFlag::from_bits_truncate(s.st_mode)
+                .contains(nix::sys::stat::SFlag::S_IFIFO)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn stdin_is_pipe() -> bool {
+    !io::stdin().is_terminal()
+}
+
 /// Returns file-path inputs, excluding explicit stdin markers ("-").
 fn file_inputs(cli: &Cli) -> Vec<&PathBuf> {
     cli.input.iter().filter(|p| p.as_os_str() != "-").collect()
@@ -2172,15 +2190,20 @@ enum InputTarget {
 }
 
 fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
-    let has_implicit_stdin = cli.input.is_empty();
     let explicit_stdin_count = cli.input.iter().filter(|p| p.as_os_str() == "-").count();
 
     if explicit_stdin_count > 1 {
         return Err("stdin marker '-' can be specified at most once".into());
     }
 
+    // Implicit stdin: no positional inputs at all, OR stdin is a pipe/redirect
+    // with no explicit '-' marker (e.g. `cat file | sanitize other.json`).
+    let has_piped_stdin = explicit_stdin_count == 0 && stdin_is_pipe();
+
     let mut units = Vec::new();
-    if has_implicit_stdin {
+
+    // No file inputs — stdin only; return immediately.
+    if cli.input.is_empty() {
         units.push(InputTarget::Stdin {
             output: cli
                 .output
@@ -2262,6 +2285,18 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
         units.push(InputTarget::File {
             input: input.clone(),
             output: planned_out,
+        });
+    }
+
+    // Piped stdin alongside file inputs: add a stdin target last so it is
+    // processed after all file targets (profile discovery benefits from this).
+    if has_piped_stdin {
+        let stdin_out = output_dir
+            .as_ref()
+            .map(|d| d.join("input-sanitized.txt"))
+            .unwrap_or_else(|| PathBuf::from("input-sanitized.txt"));
+        units.push(InputTarget::Stdin {
+            output: Some(stdin_out),
         });
     }
 

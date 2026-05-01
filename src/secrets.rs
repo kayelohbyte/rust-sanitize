@@ -438,17 +438,10 @@ pub fn parse_category(s: &str) -> Category {
 ///
 /// Called after pattern compilation so that secret values do not linger in
 /// heap memory beyond their point of use.
-fn zeroize_and_drop_entries(mut entries: Vec<SecretEntry>) {
-    for entry in &mut entries {
-        entry.pattern.zeroize();
-        entry.kind.zeroize();
-        entry.category.zeroize();
-        if let Some(ref mut l) = entry.label {
-            l.zeroize();
-        }
-    }
-    // entries drops here, running each SecretEntry::drop (which also zeroizes
-    // via the Zeroize impl), giving belt-and-suspenders coverage.
+fn zeroize_and_drop_entries(entries: Vec<SecretEntry>) {
+    // SecretEntry implements Drop with explicit zeroize() calls on every field,
+    // so dropping the Vec is sufficient — no manual loop needed.
+    drop(entries);
 }
 
 /// Convert parsed [`SecretEntry`]s into compiled [`ScanPattern`]s.
@@ -485,7 +478,10 @@ fn truncate_label(s: &str) -> String {
     if s.len() <= 32 {
         s.to_string()
     } else {
-        format!("{}…", &s[..31])
+        // Find a char boundary at or before byte 31 to avoid panicking on
+        // multi-byte UTF-8 characters (e.g. Unicode in user-supplied patterns).
+        let cut = s.char_indices().nth(31).map_or(s.len(), |(i, _)| i);
+        format!("{}…", &s[..cut])
     }
 }
 
