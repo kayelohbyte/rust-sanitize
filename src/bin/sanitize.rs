@@ -2182,7 +2182,10 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
     let mut units = Vec::new();
     if has_implicit_stdin {
         units.push(InputTarget::Stdin {
-            output: cli.output.clone(),
+            output: cli
+                .output
+                .clone()
+                .or_else(|| Some(PathBuf::from("input-sanitized.txt"))),
         });
         return Ok(units);
     }
@@ -2215,9 +2218,16 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
     for input in &cli.input {
         if input.as_os_str() == "-" {
             let stdin_output = if multi_input {
-                None
+                Some(
+                    output_dir
+                        .as_ref()
+                        .map(|d| d.join("input-sanitized.txt"))
+                        .unwrap_or_else(|| PathBuf::from("input-sanitized.txt")),
+                )
             } else {
-                cli.output.clone()
+                cli.output
+                    .clone()
+                    .or_else(|| Some(PathBuf::from("input-sanitized.txt")))
             };
             units.push(InputTarget::Stdin {
                 output: stdin_output,
@@ -2714,35 +2724,65 @@ fn process_stdin_streaming<R: io::Read>(
         }
 
         if let Some(out_path) = output_path {
-            let mut atomic_writer = AtomicFileWriter::new(out_path)
-                .map_err(|e| format!("failed to create output: {e}"))?;
+            if cli.extract_context {
+                // Buffer output so we can run log context extraction before writing.
+                let mut buf: Vec<u8> = Vec::new();
+                let stats = scanner
+                    .scan_reader_with_progress(
+                        reader,
+                        &mut buf,
+                        None,
+                        make_scan_callback(progress.clone(), label),
+                    )
+                    .map_err(|e| format!("scanner error: {e}"))?;
+                if is_interrupted() {
+                    return Err("interrupted — partial output discarded".into());
+                }
+                if stats.matches_found > 0 {
+                    had_matches = true;
+                }
+                if let Some(rb) = report_builder {
+                    rb.record_file(FileReport::from_scan_stats(
+                        "<stdin>".to_string(),
+                        &stats,
+                        "scanner",
+                    ));
+                }
+                maybe_extract_context(&buf, "<stdin>", cli, report_builder);
+                atomic_write(out_path, &buf)
+                    .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
+                info!(output = %out_path.display(), "output written");
+            } else {
+                let mut atomic_writer = AtomicFileWriter::new(out_path)
+                    .map_err(|e| format!("failed to create output: {e}"))?;
 
-            let stats = scanner
-                .scan_reader_with_progress(
-                    reader,
-                    &mut atomic_writer,
-                    None,
-                    make_scan_callback(progress.clone(), label),
-                )
-                .map_err(|e| format!("scanner error: {e}"))?;
+                let stats = scanner
+                    .scan_reader_with_progress(
+                        reader,
+                        &mut atomic_writer,
+                        None,
+                        make_scan_callback(progress.clone(), label),
+                    )
+                    .map_err(|e| format!("scanner error: {e}"))?;
 
-            if is_interrupted() {
-                return Err("interrupted — partial output discarded".into());
-            }
+                if is_interrupted() {
+                    return Err("interrupted — partial output discarded".into());
+                }
 
-            atomic_writer
-                .finish()
-                .map_err(|e| format!("failed to finalize output: {e}"))?;
+                atomic_writer
+                    .finish()
+                    .map_err(|e| format!("failed to finalize output: {e}"))?;
 
-            if stats.matches_found > 0 {
-                had_matches = true;
-            }
-            if let Some(rb) = report_builder {
-                rb.record_file(FileReport::from_scan_stats(
-                    "<stdin>".to_string(),
-                    &stats,
-                    "scanner",
-                ));
+                if stats.matches_found > 0 {
+                    had_matches = true;
+                }
+                if let Some(rb) = report_builder {
+                    rb.record_file(FileReport::from_scan_stats(
+                        "<stdin>".to_string(),
+                        &stats,
+                        "scanner",
+                    ));
+                }
             }
         } else if cli.extract_context {
             // Buffer output so we can run log context extraction before writing.
