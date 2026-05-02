@@ -131,6 +131,7 @@ pub mod atomic;
 pub mod category;
 pub mod error;
 pub mod generator;
+pub mod llm;
 pub mod log_context;
 pub mod processor;
 pub mod report;
@@ -138,12 +139,17 @@ pub mod scanner;
 pub mod secrets;
 pub mod store;
 pub mod strategy;
+pub mod strip_values;
 
 // Re-exports for convenience.
 pub use atomic::{atomic_write, AtomicFileWriter};
 pub use category::Category;
 pub use error::{Result, SanitizeError};
 pub use generator::{HmacGenerator, RandomGenerator, ReplacementGenerator};
+pub use llm::{
+    format_llm_prompt, resolve_llm_template, LlmEntry, PROMPT_PREAMBLE, TEMPLATE_REVIEW_CONFIG,
+    TEMPLATE_TROUBLESHOOT,
+};
 pub use log_context::{
     extract_context, extract_context_reader, LogContextConfig, LogContextMatch, LogContextResult,
     DEFAULT_CONTEXT_LINES, DEFAULT_KEYWORDS, DEFAULT_MAX_MATCHES,
@@ -164,3 +170,4 @@ pub use strategy::{
     EntropyMode, FakeIp, HmacHash, PreserveLength, RandomString, RandomUuid, Strategy,
     StrategyGenerator,
 };
+pub use strip_values::strip_values_from_text;
