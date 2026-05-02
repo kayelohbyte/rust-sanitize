@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-01
+
+### Added
+
+- **`--llm [TEMPLATE]` flag** — formats sanitized output as an LLM-ready prompt and writes it to stdout instead of a file. Built-in templates: `troubleshoot` (default) and `review-config`. A custom template file path can be provided instead. Sanitized content appears in `<content name="...">` blocks followed by a Sanitization Summary and (optionally) a `<notable_events>` section when used with `--extract-context`.
+
+- **Validation: `--llm` conflicts** — `--llm` cannot be combined with `--output` (the prompt is the output) or `--dry-run` (no sanitized content to include). A nonexistent or non-file custom template path is also rejected with a clear error.
+
+- **Unit tests for `--llm` helpers** — `resolve_llm_template`, `format_llm_prompt` (content blocks, sanitization summary, notable events, multiple entries), and `validate_args` for all `--llm` rejection cases.
+
+- **Integration test suite: `tests/llm_tests.rs`** — end-to-end CLI coverage for `--llm`: validation rejections, template selection, prompt structure, secret sanitization in prompt, `--extract-context` integration, and no-write guarantee.
+
+- **Integration test suite: `tests/extract_context_tests.rs`** — CLI coverage for `--extract-context` (report JSON output, `--context-lines` 0 and non-zero), `--context-keywords`, `--context-keywords-only`, and `--strip-values` (file and stdin paths).
+
+- **Unit tests for `--strip-values` helpers** — `strip_values_from_text` preserves keys, comments, blank lines, section headers, and pass-through lines without a delimiter.
+
+- **Unit tests for `validate_args`** — covers `--format`, `--log-format`, `--threads 0`, `--password` without `--encrypted-secrets`, known LLM templates, and all `--llm` rejection paths.
+
 ## [0.3.0] — 2026-04-29
 
 ### Added

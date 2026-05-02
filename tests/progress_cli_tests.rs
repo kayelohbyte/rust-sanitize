@@ -98,18 +98,35 @@ fn auto_progress_is_silent_in_non_tty_mode() {
 
 #[test]
 fn stdin_pipeline_forced_progress_keeps_stdout_clean() {
-    let (_dir, _input_path, secrets_path) = write_test_inputs();
+    let dir = tempdir().unwrap();
+    let secrets_path = dir.path().join("secrets.json");
+    fs::write(
+        &secrets_path,
+        r#"[
+  {
+    "pattern": "SUPERSECRET",
+    "kind": "literal",
+    "category": "custom:token",
+    "label": "token"
+  }
+]"#,
+    )
+    .unwrap();
+    let out_path = dir.path().join("out.txt");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_sanitize"))
         .arg("-")
         .arg("-s")
         .arg(&secrets_path)
+        .arg("-o")
+        .arg(&out_path)
         .arg("--progress")
         .arg("on")
         .env("SANITIZE_LOG", "error")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .current_dir(dir.path())
         .spawn()
         .unwrap();
 
@@ -128,9 +145,13 @@ fn stdin_pipeline_forced_progress_keeps_stdout_clean() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(!stdout.contains("SUPERSECRET"));
-    assert!(stdout.contains("prefix"));
-    assert!(stdout.contains("suffix"));
+    // stdout must be empty — sanitized content goes to the output file
+    assert!(stdout.is_empty(), "unexpected stdout: {stdout}");
+
+    let out_content = fs::read_to_string(&out_path).expect("output file not created");
+    assert!(!out_content.contains("SUPERSECRET"));
+    assert!(out_content.contains("prefix"));
+    assert!(out_content.contains("suffix"));
 
     assert!(stderr.contains("Scanning stdin"));
     assert!(stderr.contains("done"));
@@ -246,7 +267,8 @@ fn multi_input_progress_shows_done_for_every_file() {
         .arg("on")
         .arg("--threads")
         .arg("4")
-        .env("SANITIZE_LOG", "error");
+        .env("SANITIZE_LOG", "error")
+        .stdin(std::process::Stdio::null());
 
     let output = cmd.output().unwrap();
     assert!(
@@ -280,7 +302,8 @@ fn multi_input_fail_on_match_returns_exit_code_2() {
         .arg("--fail-on-match")
         .arg("--threads")
         .arg("3")
-        .env("SANITIZE_LOG", "error");
+        .env("SANITIZE_LOG", "error")
+        .stdin(std::process::Stdio::null());
 
     let output = cmd.output().unwrap();
     assert_eq!(

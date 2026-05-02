@@ -74,8 +74,8 @@ use sanitize_engine::{
     atomic_write, extract_context, extract_context_reader, ArchiveFilter, ArchiveFormat,
     ArchiveProcessor, ArchiveProgress, AtomicFileWriter, Category, FieldRule, FileReport,
     FileTypeProfile, HmacGenerator, LogContextConfig, MappingStore, ProcessorRegistry,
-    RandomGenerator, ReplacementGenerator, ReportBuilder, ReportMetadata, ScanConfig, ScanPattern,
-    ScanStats, StreamScanner, DEFAULT_MAX_ARCHIVE_DEPTH,
+    RandomGenerator, ReplacementGenerator, ReportBuilder, ReportMetadata, SanitizeReport,
+    ScanConfig, ScanPattern, ScanStats, StreamScanner, DEFAULT_MAX_ARCHIVE_DEPTH,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -102,6 +102,49 @@ const DEFAULT_MAX_STRUCTURED_FILE_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
 /// large log files should use `-o`/`--output` so the two-pass file path is
 /// taken instead.
 const MAX_CONTEXT_BUFFER_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Shared per-run collector for `--llm`: (label, sanitized_bytes) pairs in
+/// input order. Wrapped in Arc<Mutex> so it can be passed into parallel file
+/// processing paths alongside the report builder.
+type LlmCollector = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+// ---------------------------------------------------------------------------
+// LLM prompt templates
+// ---------------------------------------------------------------------------
+
+const PROMPT_PREAMBLE: &str = "\
+Sensitive values in the content below have been sanitized:
+- Structured fields (passwords, tokens, API keys) appear as __SANITIZED-<hash>__
+- Typed values (emails, IPs, hostnames, etc.) are replaced with realistic-looking
+  substitutes of the same format and length
+
+In all cases the same original value always maps to the same replacement within
+a run, so relationships and patterns in the data are preserved. Do not attempt
+to recover original values. When referencing specific values in your response,
+use the sanitized forms as shown.
+";
+
+const TEMPLATE_TROUBLESHOOT: &str = "\
+You are troubleshooting an incident based on sanitized output.
+
+{preamble}
+Analyze the following and provide:
+1. Root cause of any errors or failures
+2. The sequence of events that led to the issue
+3. Specific remediation steps
+
+";
+
+const TEMPLATE_REVIEW_CONFIG: &str = "\
+You are reviewing a sanitized configuration file.
+
+{preamble}
+Review the following and identify:
+1. Misconfigurations or invalid settings
+2. Security concerns (exposed services, weak settings, overly permissive rules)
+3. Best practice violations or missing required fields
+
+";
 
 /// Global flag set by the SIGINT/SIGTERM handler.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -169,7 +212,12 @@ EXAMPLES:\n  \
     --extract-context --context-keywords timeout,oomkilled --context-lines 20\n\n  \
   # Strip values to generate a profile template (no secrets file needed):\n  \
   sanitize gitlab.rb --strip-values -o gitlab.rb.template\n  \
-  cat config.rb | sanitize --strip-values"
+  cat config.rb | sanitize --strip-values\n\n  \
+  # Format sanitized output as an LLM prompt (print to stdout for piping):\n  \
+  sanitize app.log -s secrets.yaml --llm | pbcopy\n  \
+  sanitize config.yaml -s s.enc --encrypted-secrets -p --llm review-config\n  \
+  sanitize app.log -s s.yaml --llm --extract-context --context-lines 15\n  \
+  sanitize app.log -s s.yaml --llm /path/to/custom-template.txt"
 )]
 struct Cli {
     /// Subcommand: encrypt, decrypt, or omit for default sanitize mode.
@@ -341,11 +389,18 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = 10)]
     context_lines: usize,
 
-    /// Comma-separated list of additional keywords to search for when
-    /// `--extract-context` is set. Merged with the built-in defaults
-    /// (error, failure, warning, warn, fatal, exception, critical).
+    /// Comma-separated list of keywords to search for when `--extract-context`
+    /// is set. By default merged with the built-in list (error, failure,
+    /// warning, warn, fatal, exception, critical). Pass
+    /// `--context-keywords-only` to replace the defaults entirely.
     #[arg(long, value_name = "KEYWORDS", value_delimiter = ',')]
     context_keywords: Vec<String>,
+
+    /// When set, `--context-keywords` replaces the built-in default keywords
+    /// entirely instead of being merged with them. Has no effect if
+    /// `--context-keywords` is not also provided.
+    #[arg(long)]
+    context_keywords_only: bool,
 
     /// Strip all values from structured output, emitting only keys and
     /// structure. Useful for generating a profile template from a real
@@ -353,6 +408,17 @@ struct Cli {
     /// sanitization pipeline — no secrets file is required.
     #[arg(long)]
     strip_values: bool,
+
+    /// Format sanitized output as an LLM-ready prompt on stdout instead of
+    /// writing raw sanitized bytes. TEMPLATE chooses the instruction set:
+    ///
+    /// - `troubleshoot` (default) — root cause analysis of logs/errors
+    /// - `review-config`          — configuration review and security audit
+    ///
+    /// TEMPLATE may also be a path to a custom template file.
+    /// Combine with `--extract-context` to include notable log events.
+    #[arg(long, value_name = "TEMPLATE", default_missing_value = "troubleshoot", num_args = 0..=1)]
+    llm: Option<String>,
 }
 
 impl Cli {
@@ -1750,7 +1816,9 @@ fn run_guided() -> Result<(), (String, i32)> {
         extract_context: false,
         context_lines: 10,
         context_keywords: Vec::new(),
+        context_keywords_only: false,
         strip_values: false,
+        llm: None,
     };
 
     run_sanitize(cli, deterministic_password.or(run_password), HashMap::new())
@@ -2546,6 +2614,49 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
         );
     }
 
+    // --llm validations.
+    if let Some(ref template) = cli.llm {
+        // --llm writes the prompt to stdout; --output would be silently ignored.
+        if cli.output.is_some() {
+            return Err(
+                "--llm and --output cannot be combined: --llm writes the formatted \
+                 prompt to stdout and the sanitized bytes are not written to a file.\n\
+                 Remove --output, or omit --llm to write sanitized output normally."
+                    .into(),
+            );
+        }
+
+        // --dry-run produces no output, so the prompt content would be empty.
+        if cli.dry_run {
+            return Err(
+                "--llm and --dry-run cannot be combined: dry-run does not produce \
+                 sanitized output, so the generated prompt would have no content."
+                    .into(),
+            );
+        }
+
+        // Validate custom template path early so the error surfaces before processing.
+        let known = matches!(template.as_str(), "troubleshoot" | "review-config");
+        if !known {
+            let path = Path::new(template);
+            if !path.exists() {
+                return Err(format!(
+                    "--llm template '{}' is not a known template name and the path \
+                     does not exist.\n\
+                     Built-in templates: troubleshoot, review-config\n\
+                     To use a custom template, provide a path to an existing file.",
+                    template
+                ));
+            }
+            if !path.is_file() {
+                return Err(format!(
+                    "--llm template '{}' exists but is not a regular file.",
+                    template
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2599,6 +2710,7 @@ fn process_stdin(
     profiles: &[sanitize_engine::processor::FileTypeProfile],
     report_builder: Option<&ReportBuilder>,
     progress: Option<&SharedProgressReporter>,
+    llm_collector: Option<&LlmCollector>,
 ) -> Result<bool, String> {
     // Determine whether structured processing should be attempted.
     // Skipped entirely when --force-text is set.
@@ -2635,6 +2747,7 @@ fn process_stdin(
                 scanner,
                 report_builder,
                 progress,
+                llm_collector,
             );
         }
 
@@ -2676,7 +2789,7 @@ fn process_stdin(
                     }
                     maybe_extract_context(&output_bytes, "<stdin>", cli, report_builder);
                     if !cli.dry_run {
-                        write_output(output_path, &output_bytes)?;
+                        write_or_collect(&output_bytes, "<stdin>", output_path, llm_collector)?;
                     }
                     return Ok(had_matches);
                 }
@@ -2702,7 +2815,7 @@ fn process_stdin(
             }
             maybe_extract_context(&output_bytes, "<stdin>", cli, report_builder);
             if !cli.dry_run {
-                write_output(output_path, &output_bytes)?;
+                write_or_collect(&output_bytes, "<stdin>", output_path, llm_collector)?;
             }
             Ok(had_matches)
         });
@@ -2710,7 +2823,15 @@ fn process_stdin(
 
     // Plain text streaming from stdin.
     let reader = BufReader::new(io::stdin().lock());
-    process_stdin_streaming(reader, output_path, cli, scanner, report_builder, progress)
+    process_stdin_streaming(
+        reader,
+        output_path,
+        cli,
+        scanner,
+        report_builder,
+        progress,
+        llm_collector,
+    )
 }
 
 /// Stream stdin through the scanner, writing to output (stdout or file).
@@ -2721,6 +2842,7 @@ fn process_stdin_streaming<R: io::Read>(
     scanner: &Arc<StreamScanner>,
     report_builder: Option<&ReportBuilder>,
     progress: Option<&SharedProgressReporter>,
+    llm_collector: Option<&LlmCollector>,
 ) -> Result<bool, String> {
     let label = if cli.dry_run {
         "Scanning stdin (dry-run)"
@@ -2758,9 +2880,11 @@ fn process_stdin_streaming<R: io::Read>(
             return Ok(had_matches);
         }
 
+        // Buffer when extract-context or llm are active; streaming otherwise.
+        let needs_buffer = cli.extract_context || llm_collector.is_some();
+
         if let Some(out_path) = output_path {
-            if cli.extract_context {
-                // Buffer output so we can run log context extraction before writing.
+            if needs_buffer {
                 let mut buf: Vec<u8> = Vec::new();
                 let stats = scanner
                     .scan_reader_with_progress(
@@ -2784,9 +2908,13 @@ fn process_stdin_streaming<R: io::Read>(
                     ));
                 }
                 maybe_extract_context(&buf, "<stdin>", cli, report_builder);
-                atomic_write(out_path, &buf)
-                    .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
-                info!(output = %out_path.display(), "output written");
+                if let Some(c) = llm_collector {
+                    maybe_collect_for_llm(&buf, "<stdin>", Some(c));
+                } else {
+                    atomic_write(out_path, &buf)
+                        .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
+                    info!(output = %out_path.display(), "output written");
+                }
             } else {
                 let mut atomic_writer = AtomicFileWriter::new(out_path)
                     .map_err(|e| format!("failed to create output: {e}"))?;
@@ -2819,8 +2947,7 @@ fn process_stdin_streaming<R: io::Read>(
                     ));
                 }
             }
-        } else if cli.extract_context {
-            // Buffer output so we can run log context extraction before writing.
+        } else if needs_buffer {
             let mut buf: Vec<u8> = Vec::new();
             let stats = scanner
                 .scan_reader_with_progress(
@@ -2841,11 +2968,15 @@ fn process_stdin_streaming<R: io::Read>(
                 ));
             }
             maybe_extract_context(&buf, "<stdin>", cli, report_builder);
-            let stdout = io::stdout();
-            stdout
-                .lock()
-                .write_all(&buf)
-                .map_err(|e| format!("failed to write to stdout: {e}"))?;
+            if let Some(c) = llm_collector {
+                maybe_collect_for_llm(&buf, "<stdin>", Some(c));
+            } else {
+                let stdout = io::stdout();
+                stdout
+                    .lock()
+                    .write_all(&buf)
+                    .map_err(|e| format!("failed to write to stdout: {e}"))?;
+            }
         } else {
             let stdout = io::stdout();
             let writer = BufWriter::new(stdout.lock());
@@ -2885,6 +3016,7 @@ fn process_plain_file(
     profiles: &[sanitize_engine::processor::FileTypeProfile],
     report_builder: Option<&ReportBuilder>,
     progress: Option<&SharedProgressReporter>,
+    llm_collector: Option<&LlmCollector>,
 ) -> Result<bool, String> {
     // --- binary detection ---
     let mut sample = [0u8; 512];
@@ -3031,50 +3163,91 @@ fn process_plain_file(
             } else if let Some(out_path) = output_path {
                 let label = format!("Scanning {}", input.display());
                 let progress_label = label.clone();
+                let llm_opt = llm_collector.cloned();
                 return with_progress_scope(progress, &label, move |progress| {
-                    let reader = BufReader::new(
-                        fs::File::open(input)
-                            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-                    );
-                    let mut atomic_writer = AtomicFileWriter::new(out_path)
-                        .map_err(|e| format!("failed to create output: {e}"))?;
-                    let stats = per_file_scanner
-                        .scan_reader_with_progress(
-                            reader,
-                            &mut atomic_writer,
-                            Some(sz),
-                            make_scan_callback(progress.clone(), &progress_label),
-                        )
-                        .map_err(|e| format!("scanner error: {e}"))?;
-                    if is_interrupted() {
-                        return Err("interrupted — partial output discarded".into());
+                    if llm_opt.is_some() {
+                        // Buffer for LLM collection instead of writing to file.
+                        let reader = BufReader::new(
+                            fs::File::open(input)
+                                .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                        );
+                        let mut buf: Vec<u8> = Vec::new();
+                        let stats = per_file_scanner
+                            .scan_reader_with_progress(
+                                reader,
+                                &mut buf,
+                                Some(sz),
+                                make_scan_callback(progress.clone(), &progress_label),
+                            )
+                            .map_err(|e| format!("scanner error: {e}"))?;
+                        if is_interrupted() {
+                            return Err("interrupted — partial output discarded".into());
+                        }
+                        if stats.matches_found > 0 {
+                            had_matches = true;
+                        }
+                        if let Some(rb) = report_builder {
+                            rb.record_file(FileReport::from_scan_stats(
+                                input.display().to_string(),
+                                &stats,
+                                &method,
+                            ));
+                        }
+                        maybe_extract_context(
+                            &buf,
+                            &input.display().to_string(),
+                            cli,
+                            report_builder,
+                        );
+                        maybe_collect_for_llm(&buf, &input.display().to_string(), llm_opt.as_ref());
+                    } else {
+                        let reader = BufReader::new(
+                            fs::File::open(input)
+                                .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                        );
+                        let mut atomic_writer = AtomicFileWriter::new(out_path)
+                            .map_err(|e| format!("failed to create output: {e}"))?;
+                        let stats = per_file_scanner
+                            .scan_reader_with_progress(
+                                reader,
+                                &mut atomic_writer,
+                                Some(sz),
+                                make_scan_callback(progress.clone(), &progress_label),
+                            )
+                            .map_err(|e| format!("scanner error: {e}"))?;
+                        if is_interrupted() {
+                            return Err("interrupted — partial output discarded".into());
+                        }
+                        atomic_writer
+                            .finish()
+                            .map_err(|e| format!("failed to finalize output: {e}"))?;
+                        if stats.matches_found > 0 {
+                            had_matches = true;
+                        }
+                        if let Some(rb) = report_builder {
+                            rb.record_file(FileReport::from_scan_stats(
+                                input.display().to_string(),
+                                &stats,
+                                &method,
+                            ));
+                        }
+                        maybe_extract_context_reader(
+                            out_path,
+                            &input.display().to_string(),
+                            cli,
+                            report_builder,
+                        );
                     }
-                    atomic_writer
-                        .finish()
-                        .map_err(|e| format!("failed to finalize output: {e}"))?;
-                    if stats.matches_found > 0 {
-                        had_matches = true;
-                    }
-                    if let Some(rb) = report_builder {
-                        rb.record_file(FileReport::from_scan_stats(
-                            input.display().to_string(),
-                            &stats,
-                            &method,
-                        ));
-                    }
-                    maybe_extract_context_reader(
-                        out_path,
-                        &input.display().to_string(),
-                        cli,
-                        report_builder,
-                    );
                     Ok(had_matches)
                 });
             } else {
                 let label = format!("Scanning {}", input.display());
                 let progress_label = label.clone();
+                let llm_opt = llm_collector.cloned();
                 return with_progress_scope(progress, &label, move |progress| {
-                    if cli.extract_context && sz <= MAX_CONTEXT_BUFFER_BYTES {
+                    let needs_buffer = (cli.extract_context || llm_opt.is_some())
+                        && sz <= MAX_CONTEXT_BUFFER_BYTES;
+                    if needs_buffer {
                         let reader = BufReader::new(
                             fs::File::open(input)
                                 .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
@@ -3104,11 +3277,19 @@ fn process_plain_file(
                             cli,
                             report_builder,
                         );
-                        let stdout = io::stdout();
-                        stdout
-                            .lock()
-                            .write_all(&buf)
-                            .map_err(|e| format!("failed to write to stdout: {e}"))?;
+                        if llm_opt.is_some() {
+                            maybe_collect_for_llm(
+                                &buf,
+                                &input.display().to_string(),
+                                llm_opt.as_ref(),
+                            );
+                        } else {
+                            let stdout = io::stdout();
+                            stdout
+                                .lock()
+                                .write_all(&buf)
+                                .map_err(|e| format!("failed to write to stdout: {e}"))?;
+                        }
                     } else {
                         if cli.extract_context {
                             warn!(
@@ -3252,7 +3433,12 @@ fn process_plain_file(
                     cli,
                     report_builder,
                 );
-                write_output(output_path, &output_bytes)?;
+                write_or_collect(
+                    &output_bytes,
+                    &input.display().to_string(),
+                    output_path,
+                    llm_collector,
+                )?;
                 Ok(had_matches)
             });
         }
@@ -3299,56 +3485,93 @@ fn process_plain_file(
         // Real streaming output.
         let label = format!("Scanning {}", input.display());
         let progress_label = label.clone();
+        let llm_opt = llm_collector.cloned();
         with_progress_scope(progress, &label, move |progress| {
-            let reader = BufReader::new(
-                fs::File::open(input)
-                    .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-            );
-            let mut atomic_writer = AtomicFileWriter::new(out_path)
-                .map_err(|e| format!("failed to create output: {e}"))?;
+            if llm_opt.is_some() {
+                // Buffer for LLM collection instead of writing to file.
+                let reader = BufReader::new(
+                    fs::File::open(input)
+                        .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                );
+                let mut buf: Vec<u8> = Vec::new();
+                let progress_for_scan = progress.clone();
+                let stats = scanner
+                    .scan_reader_with_progress(
+                        reader,
+                        &mut buf,
+                        Some(file_size(input)?),
+                        make_scan_callback(progress_for_scan, &progress_label),
+                    )
+                    .map_err(|e| format!("scanner error: {e}"))?;
+                if is_interrupted() {
+                    return Err("interrupted — partial output discarded".into());
+                }
+                if stats.matches_found > 0 {
+                    had_matches = true;
+                }
+                if let Some(rb) = report_builder {
+                    rb.record_file(FileReport::from_scan_stats(
+                        input.display().to_string(),
+                        &stats,
+                        method,
+                    ));
+                }
+                maybe_extract_context(&buf, &input.display().to_string(), cli, report_builder);
+                maybe_collect_for_llm(&buf, &input.display().to_string(), llm_opt.as_ref());
+            } else {
+                let reader = BufReader::new(
+                    fs::File::open(input)
+                        .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                );
+                let mut atomic_writer = AtomicFileWriter::new(out_path)
+                    .map_err(|e| format!("failed to create output: {e}"))?;
 
-            let progress_for_scan = progress.clone();
-            let stats = scanner
-                .scan_reader_with_progress(
-                    reader,
-                    &mut atomic_writer,
-                    Some(file_size(input)?),
-                    make_scan_callback(progress_for_scan, &progress_label),
-                )
-                .map_err(|e| format!("scanner error: {e}"))?;
+                let progress_for_scan = progress.clone();
+                let stats = scanner
+                    .scan_reader_with_progress(
+                        reader,
+                        &mut atomic_writer,
+                        Some(file_size(input)?),
+                        make_scan_callback(progress_for_scan, &progress_label),
+                    )
+                    .map_err(|e| format!("scanner error: {e}"))?;
 
-            if is_interrupted() {
-                return Err("interrupted — partial output discarded".into());
+                if is_interrupted() {
+                    return Err("interrupted — partial output discarded".into());
+                }
+
+                atomic_writer
+                    .finish()
+                    .map_err(|e| format!("failed to finalize output: {e}"))?;
+
+                if stats.matches_found > 0 {
+                    had_matches = true;
+                }
+                if let Some(rb) = report_builder {
+                    rb.record_file(FileReport::from_scan_stats(
+                        input.display().to_string(),
+                        &stats,
+                        method,
+                    ));
+                }
+                maybe_extract_context_reader(
+                    out_path,
+                    &input.display().to_string(),
+                    cli,
+                    report_builder,
+                );
             }
-
-            atomic_writer
-                .finish()
-                .map_err(|e| format!("failed to finalize output: {e}"))?;
-
-            if stats.matches_found > 0 {
-                had_matches = true;
-            }
-            if let Some(rb) = report_builder {
-                rb.record_file(FileReport::from_scan_stats(
-                    input.display().to_string(),
-                    &stats,
-                    method,
-                ));
-            }
-            maybe_extract_context_reader(
-                out_path,
-                &input.display().to_string(),
-                cli,
-                report_builder,
-            );
             Ok(had_matches)
         })
     } else {
         let label = format!("Scanning {}", input.display());
         let progress_label = label.clone();
+        let llm_opt = llm_collector.cloned();
         with_progress_scope(progress, &label, move |progress| {
             let sz = file_size(input)?;
-            if cli.extract_context && sz <= MAX_CONTEXT_BUFFER_BYTES {
+            let needs_buffer =
+                (cli.extract_context || llm_opt.is_some()) && sz <= MAX_CONTEXT_BUFFER_BYTES;
+            if needs_buffer {
                 let reader = BufReader::new(
                     fs::File::open(input)
                         .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
@@ -3374,11 +3597,15 @@ fn process_plain_file(
                     ));
                 }
                 maybe_extract_context(&buf, &input.display().to_string(), cli, report_builder);
-                let stdout = io::stdout();
-                stdout
-                    .lock()
-                    .write_all(&buf)
-                    .map_err(|e| format!("failed to write to stdout: {e}"))?;
+                if llm_opt.is_some() {
+                    maybe_collect_for_llm(&buf, &input.display().to_string(), llm_opt.as_ref());
+                } else {
+                    let stdout = io::stdout();
+                    stdout
+                        .lock()
+                        .write_all(&buf)
+                        .map_err(|e| format!("failed to write to stdout: {e}"))?;
+                }
             } else {
                 if cli.extract_context {
                     warn!(
@@ -3885,7 +4112,11 @@ fn maybe_extract_context(
     let text = String::from_utf8_lossy(bytes);
     let mut config = LogContextConfig::new().with_context_lines(cli.context_lines);
     if !cli.context_keywords.is_empty() {
-        config = config.with_extra_keywords(cli.context_keywords.iter().cloned());
+        config = if cli.context_keywords_only {
+            config.with_keywords(cli.context_keywords.iter().cloned())
+        } else {
+            config.with_extra_keywords(cli.context_keywords.iter().cloned())
+        };
     }
     rb.set_file_log_context(report_path, extract_context(&text, &config));
 }
@@ -3907,7 +4138,11 @@ fn maybe_extract_context_reader(
     let Some(rb) = report_builder else { return };
     let mut config = LogContextConfig::new().with_context_lines(cli.context_lines);
     if !cli.context_keywords.is_empty() {
-        config = config.with_extra_keywords(cli.context_keywords.iter().cloned());
+        config = if cli.context_keywords_only {
+            config.with_keywords(cli.context_keywords.iter().cloned())
+        } else {
+            config.with_extra_keywords(cli.context_keywords.iter().cloned())
+        };
     }
     let file = match fs::File::open(out_path) {
         Ok(f) => f,
@@ -3954,6 +4189,115 @@ fn strip_values_from_text(content: &str, delimiter: &str, comment_prefix: &str) 
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// LLM prompt helpers
+// ---------------------------------------------------------------------------
+
+/// Expand a template name to its instruction text (with preamble substituted).
+///
+/// Accepts `"troubleshoot"`, `"review-config"`, or a filesystem path to a
+/// custom template file. Custom templates receive no automatic substitution —
+/// the raw file content is used as-is.
+fn resolve_llm_template(template_name: &str) -> Result<String, String> {
+    match template_name {
+        "troubleshoot" => Ok(TEMPLATE_TROUBLESHOOT.replace("{preamble}", PROMPT_PREAMBLE)),
+        "review-config" => Ok(TEMPLATE_REVIEW_CONFIG.replace("{preamble}", PROMPT_PREAMBLE)),
+        path => fs::read_to_string(path)
+            .map_err(|e| format!("failed to read LLM template '{}': {e}", path)),
+    }
+}
+
+/// Build the final LLM prompt string from a template, collected content, and
+/// an optional report for the sanitization summary and log context.
+fn format_llm_prompt(
+    template_name: &str,
+    entries: &[(String, Vec<u8>)],
+    report: Option<&SanitizeReport>,
+) -> Result<String, String> {
+    let mut out = resolve_llm_template(template_name)?;
+
+    if let Some(r) = report {
+        let total_replacements: u64 = r.files.iter().map(|f| f.replacements).sum();
+        out.push_str(&format!(
+            "## Sanitization Summary\n\
+             - Files processed: {}\n\
+             - Total replacements: {total_replacements}\n\n",
+            r.files.len()
+        ));
+    }
+
+    for (label, bytes) in entries {
+        let content = String::from_utf8_lossy(bytes);
+        out.push_str(&format!(
+            "<content name=\"{}\">\n{}\n</content>\n\n",
+            label, content
+        ));
+    }
+
+    if let Some(r) = report {
+        let notable: Vec<_> = r
+            .files
+            .iter()
+            .filter_map(|f| f.log_context.as_ref().map(|ctx| (&f.path, ctx)))
+            .filter(|(_, ctx)| ctx.match_count > 0)
+            .collect();
+
+        if !notable.is_empty() {
+            out.push_str("<notable_events>\n");
+            let mut any_truncated = false;
+            for (path, ctx) in &notable {
+                out.push_str(&format!("# {path}\n"));
+                for m in &ctx.matches {
+                    for line in &m.before {
+                        out.push_str(&format!("  {line}\n"));
+                    }
+                    out.push_str(&format!(">>> [{}] {}\n", m.keyword, m.line));
+                    for line in &m.after {
+                        out.push_str(&format!("  {line}\n"));
+                    }
+                    out.push('\n');
+                }
+                if ctx.truncated {
+                    any_truncated = true;
+                }
+            }
+            if any_truncated {
+                out.push_str(
+                    "(notable events truncated — use --context-lines or --report for full context)\n",
+                );
+            }
+            out.push_str("</notable_events>\n");
+        }
+    }
+
+    Ok(out)
+}
+
+/// Push `(label, bytes)` onto the collector when `--llm` is active.
+fn maybe_collect_for_llm(bytes: &[u8], label: &str, collector: Option<&LlmCollector>) {
+    if let Some(c) = collector {
+        if let Ok(mut guard) = c.lock() {
+            guard.push((label.to_string(), bytes.to_vec()));
+        }
+    }
+}
+
+/// Write `data` to the output path (or stdout) unless a collector is present,
+/// in which case the bytes are collected for the LLM prompt instead.
+fn write_or_collect(
+    data: &[u8],
+    label: &str,
+    output_path: Option<&Path>,
+    collector: Option<&LlmCollector>,
+) -> Result<(), String> {
+    if let Some(c) = collector {
+        maybe_collect_for_llm(data, label, Some(c));
+        Ok(())
+    } else {
+        write_output(output_path, data)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4286,7 +4630,9 @@ fn run_sanitize(
     };
 
     // --- build report builder -----------------------------------------------
-    let report_enabled = cli.report.is_some();
+    // Force report building when --llm is active so we can include the
+    // sanitization summary in the generated prompt.
+    let report_enabled = cli.report.is_some() || cli.llm.is_some();
     let report_builder = if report_enabled {
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -4308,6 +4654,13 @@ fn run_sanitize(
             threads: cli.threads,
             secrets_file: cli.secrets_file.as_ref().map(|p| p.display().to_string()),
         }))
+    } else {
+        None
+    };
+
+    // --- LLM collector (only allocated when --llm is active) ----------------
+    let llm_collector: Option<LlmCollector> = if cli.llm.is_some() {
+        Some(Arc::new(Mutex::new(Vec::new())))
     } else {
         None
     };
@@ -4375,6 +4728,7 @@ fn run_sanitize(
                 &profiles,
                 report_builder.as_ref(),
                 progress_reporter.as_ref(),
+                llm_collector.as_ref(),
             )
             .map_err(|e| (e, 1))?;
             had_matches |= result;
@@ -4423,6 +4777,7 @@ fn run_sanitize(
             &profiles,
             report_builder.as_ref(),
             progress_reporter.as_ref(),
+            llm_collector.as_ref(),
         )
         .map_err(|e| (e, 1))?;
         had_matches |= result;
@@ -4499,6 +4854,7 @@ fn run_sanitize(
                 &profiles,
                 report_builder.as_ref(),
                 progress_reporter.as_ref(),
+                llm_collector.as_ref(),
             )
             .map_err(|e| (e, 1))?;
             had_matches |= result;
@@ -4551,6 +4907,7 @@ fn run_sanitize(
                         &profiles,
                         report_builder.as_ref(),
                         progress_reporter.as_ref(),
+                        llm_collector.as_ref(),
                     )
                     .map_err(|e| (e, 1))
                 }
@@ -4596,6 +4953,7 @@ fn run_sanitize(
                         &profiles,
                         report_builder.as_ref(),
                         progress_reporter.as_ref(),
+                        llm_collector.as_ref(),
                     )
                     .map_err(|e| (e, 1))
                 }
@@ -4633,28 +4991,48 @@ fn run_sanitize(
         }
     }
 
-    // --- write report -------------------------------------------------------
+    // --- write report / LLM prompt -----------------------------------------
     if let Some(builder) = report_builder {
         let report = builder.finish();
-        let json = report
-            .to_json_pretty()
-            .map_err(|e| (format!("failed to serialize report: {e}"), 1))?;
 
-        match cli.report.as_ref().unwrap() {
-            Some(path) if path.to_string_lossy() == "-" => {
-                println!("{json}");
-            }
-            Some(path) => {
-                atomic_write(path, json.as_bytes()).map_err(|e| {
-                    (
-                        format!("failed to write report to {}: {e}", path.display()),
-                        1,
-                    )
-                })?;
-                info!(report = %path.display(), "report written");
-            }
-            None => {
-                eprintln!("{json}");
+        // --- LLM prompt (--llm) ---
+        if let Some(ref template_name) = cli.llm {
+            let entries = llm_collector
+                .as_ref()
+                .and_then(|c| c.lock().ok())
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            let prompt =
+                format_llm_prompt(template_name, &entries, Some(&report)).map_err(|e| (e, 1))?;
+            let stdout = io::stdout();
+            stdout
+                .lock()
+                .write_all(prompt.as_bytes())
+                .map_err(|e| (format!("failed to write LLM prompt: {e}"), 1))?;
+        }
+
+        // --- JSON report (--report) ---
+        if cli.report.is_some() {
+            let json = report
+                .to_json_pretty()
+                .map_err(|e| (format!("failed to serialize report: {e}"), 1))?;
+
+            match cli.report.as_ref().unwrap() {
+                Some(path) if path.to_string_lossy() == "-" => {
+                    println!("{json}");
+                }
+                Some(path) => {
+                    atomic_write(path, json.as_bytes()).map_err(|e| {
+                        (
+                            format!("failed to write report to {}: {e}", path.display()),
+                            1,
+                        )
+                    })?;
+                    info!(report = %path.display(), "report written");
+                }
+                None => {
+                    eprintln!("{json}");
+                }
             }
         }
     }
@@ -5246,6 +5624,294 @@ mod tests {
                 .iter()
                 .any(|e| e.label.as_deref() == Some("container_id_short")),
             "balanced preset should not include container_id_short"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_args: additional cases
+    // -----------------------------------------------------------------------
+
+    fn real_file_cli() -> Cli {
+        let mut cli = Cli::try_parse_from(["sanitize", "placeholder"]).unwrap();
+        cli.input = vec![std::env::current_dir().unwrap().join("Cargo.toml")];
+        cli
+    }
+
+    #[test]
+    fn validate_args_rejects_invalid_format() {
+        let mut cli = real_file_cli();
+        cli.format = Some("notaformat".into());
+        let err = validate_args(&cli).unwrap_err();
+        assert!(err.contains("invalid --format"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_args_rejects_invalid_log_format() {
+        let mut cli = real_file_cli();
+        cli.log_format = "xml".into();
+        let err = validate_args(&cli).unwrap_err();
+        assert!(err.contains("invalid --log-format"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_args_rejects_zero_threads() {
+        let mut cli = real_file_cli();
+        cli.threads = Some(0);
+        let err = validate_args(&cli).unwrap_err();
+        assert!(err.contains("--threads must be"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_args_rejects_password_without_encrypted_secrets() {
+        let mut cli = real_file_cli();
+        cli.password = true;
+        let err = validate_args(&cli).unwrap_err();
+        assert!(err.contains("--encrypted-secrets is not set"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_args_rejects_llm_with_output() {
+        let mut cli = real_file_cli();
+        cli.llm = Some("troubleshoot".into());
+        cli.output = Some(PathBuf::from("/tmp/out.txt"));
+        let err = validate_args(&cli).unwrap_err();
+        assert!(
+            err.contains("--llm and --output cannot be combined"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_args_rejects_llm_with_dry_run() {
+        let mut cli = real_file_cli();
+        cli.llm = Some("troubleshoot".into());
+        cli.dry_run = true;
+        let err = validate_args(&cli).unwrap_err();
+        assert!(
+            err.contains("--llm and --dry-run cannot be combined"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_args_rejects_llm_with_nonexistent_template_path() {
+        let mut cli = real_file_cli();
+        cli.llm = Some("/nonexistent/template.txt".into());
+        let err = validate_args(&cli).unwrap_err();
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_args_accepts_known_llm_templates() {
+        for name in ["troubleshoot", "review-config"] {
+            let mut cli = real_file_cli();
+            cli.llm = Some(name.into());
+            assert!(
+                validate_args(&cli).is_ok(),
+                "built-in template '{}' should be accepted",
+                name
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_llm_template
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_llm_template_troubleshoot_embeds_preamble_and_instructions() {
+        let t = resolve_llm_template("troubleshoot").unwrap();
+        assert!(t.contains("sanitized"), "preamble should be embedded");
+        assert!(
+            t.contains("Root cause"),
+            "should request root cause analysis"
+        );
+        assert!(
+            t.contains("remediation"),
+            "should request remediation steps"
+        );
+    }
+
+    #[test]
+    fn resolve_llm_template_review_config_embeds_preamble_and_instructions() {
+        let t = resolve_llm_template("review-config").unwrap();
+        assert!(t.contains("sanitized"), "preamble should be embedded");
+        assert!(
+            t.contains("Misconfigurations"),
+            "should request misconfiguration review"
+        );
+        assert!(
+            t.contains("Security concerns"),
+            "should request security review"
+        );
+    }
+
+    #[test]
+    fn resolve_llm_template_nonexistent_path_returns_error() {
+        let err = resolve_llm_template("/nonexistent/template.txt").unwrap_err();
+        assert!(err.contains("failed to read"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_llm_template_custom_file_returns_raw_content() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("custom.txt");
+        fs::write(&p, "MY CUSTOM INSTRUCTIONS\n").unwrap();
+        let t = resolve_llm_template(p.to_str().unwrap()).unwrap();
+        assert_eq!(t, "MY CUSTOM INSTRUCTIONS\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // format_llm_prompt
+    // -----------------------------------------------------------------------
+
+    fn make_test_report(replacements: u64) -> sanitize_engine::SanitizeReport {
+        let builder = ReportBuilder::new(ReportMetadata {
+            version: "0.0.0".into(),
+            timestamp: "test".into(),
+            deterministic: false,
+            dry_run: false,
+            strict: false,
+            chunk_size: 1024,
+            threads: None,
+            secrets_file: None,
+        });
+        builder.record_file(FileReport::from_scan_stats(
+            "test.log",
+            &ScanStats {
+                matches_found: replacements,
+                replacements_applied: replacements,
+                ..Default::default()
+            },
+            "scanner",
+        ));
+        builder.finish()
+    }
+
+    #[test]
+    fn format_llm_prompt_includes_content_block() {
+        let entries = vec![("app.log".to_string(), b"sanitized line\n".to_vec())];
+        let prompt = format_llm_prompt("troubleshoot", &entries, None).unwrap();
+        assert!(
+            prompt.contains("<content name=\"app.log\">"),
+            "got:\n{prompt}"
+        );
+        assert!(prompt.contains("sanitized line"), "got:\n{prompt}");
+        assert!(prompt.contains("</content>"), "got:\n{prompt}");
+    }
+
+    #[test]
+    fn format_llm_prompt_includes_sanitization_summary() {
+        let report = make_test_report(7);
+        let entries: Vec<(String, Vec<u8>)> = vec![];
+        let prompt = format_llm_prompt("troubleshoot", &entries, Some(&report)).unwrap();
+        assert!(prompt.contains("## Sanitization Summary"), "got:\n{prompt}");
+        assert!(prompt.contains("Files processed: 1"), "got:\n{prompt}");
+        assert!(prompt.contains("Total replacements: 7"), "got:\n{prompt}");
+    }
+
+    #[test]
+    fn format_llm_prompt_includes_notable_events_when_present() {
+        use sanitize_engine::LogContextConfig;
+        let builder = ReportBuilder::new(ReportMetadata {
+            version: "0.0.0".into(),
+            timestamp: "test".into(),
+            deterministic: false,
+            dry_run: false,
+            strict: false,
+            chunk_size: 1024,
+            threads: None,
+            secrets_file: None,
+        });
+        builder.record_file(FileReport::from_scan_stats(
+            "app.log",
+            &ScanStats::default(),
+            "scanner",
+        ));
+        let ctx = extract_context(
+            "INFO start\nERROR disk full\nINFO done",
+            &LogContextConfig::new().with_context_lines(1),
+        );
+        builder.set_file_log_context("app.log", ctx);
+        let report = builder.finish();
+
+        let entries: Vec<(String, Vec<u8>)> = vec![];
+        let prompt = format_llm_prompt("troubleshoot", &entries, Some(&report)).unwrap();
+        assert!(prompt.contains("<notable_events>"), "got:\n{prompt}");
+        assert!(prompt.contains("# app.log"), "got:\n{prompt}");
+        assert!(prompt.contains(">>> [error]"), "got:\n{prompt}");
+        assert!(prompt.contains("ERROR disk full"), "got:\n{prompt}");
+        assert!(prompt.contains("</notable_events>"), "got:\n{prompt}");
+    }
+
+    #[test]
+    fn format_llm_prompt_omits_notable_events_when_no_matches() {
+        let report = make_test_report(0);
+        let entries: Vec<(String, Vec<u8>)> = vec![];
+        let prompt = format_llm_prompt("troubleshoot", &entries, Some(&report)).unwrap();
+        assert!(
+            !prompt.contains("<notable_events>"),
+            "should omit section when no keyword matches"
+        );
+    }
+
+    #[test]
+    fn format_llm_prompt_multiple_content_blocks_in_order() {
+        let entries = vec![
+            ("first.log".to_string(), b"first content".to_vec()),
+            ("second.log".to_string(), b"second content".to_vec()),
+        ];
+        let prompt = format_llm_prompt("troubleshoot", &entries, None).unwrap();
+        let first_pos = prompt.find("first.log").unwrap();
+        let second_pos = prompt.find("second.log").unwrap();
+        assert!(
+            first_pos < second_pos,
+            "entries should appear in insertion order"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_values_from_text
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_values_removes_values_preserves_keys() {
+        let out = strip_values_from_text("host = localhost\nport = 5432\n", "=", "#");
+        assert!(out.contains("host =\n"), "key should remain, got:\n{out}");
+        assert!(out.contains("port =\n"), "key should remain, got:\n{out}");
+        assert!(!out.contains("localhost"), "value should be stripped");
+        assert!(!out.contains("5432"), "value should be stripped");
+    }
+
+    #[test]
+    fn strip_values_preserves_comments_and_blank_lines() {
+        let input = "# a comment\n\nkey = value\n";
+        let out = strip_values_from_text(input, "=", "#");
+        assert!(out.contains("# a comment\n"), "comment should be preserved");
+        assert!(!out.contains("value"), "value should be stripped");
+        // blank line preserved as a newline in output
+        assert!(
+            out.contains("\n\n") || out.starts_with('\n'),
+            "blank line should be preserved"
+        );
+    }
+
+    #[test]
+    fn strip_values_preserves_section_headers() {
+        let out = strip_values_from_text("[database]\nhost = localhost\n", "=", "#");
+        assert!(
+            out.contains("[database]\n"),
+            "section header should be preserved"
+        );
+        assert!(!out.contains("localhost"), "value should be stripped");
+    }
+
+    #[test]
+    fn strip_values_no_delimiter_line_passes_through() {
+        let out = strip_values_from_text("just a bare line\n", "=", "#");
+        assert!(
+            out.contains("just a bare line\n"),
+            "lines without delimiter should pass through"
         );
     }
 }

@@ -239,7 +239,8 @@ Notes:
 | `--progress-interval-ms <MS>` | | Minimum interval between progress refreshes (default: `200`). |
 | `--extract-context` | | After sanitizing, scan the output for error/warning/failure keywords and embed matching lines with surrounding context in the JSON report. Each file entry in `files[]` gets its own `log_context` object. Requires `--report`. Has no effect without `--report`. For stdout paths larger than 256 MiB the flag is silently skipped (use file output and the two-pass reader path instead). |
 | `--context-lines <N>` | | Lines of context to capture before and after each keyword match when `--extract-context` is set. Default: `10`. |
-| `--context-keywords <KEYWORDS>` | | Comma-separated list of additional keywords to scan for. Merged with the built-in defaults (`error`, `failure`, `warning`, `warn`, `fatal`, `exception`, `critical`). Example: `--context-keywords timeout,oomkilled,backoff`. |
+| `--context-keywords <KEYWORDS>` | | Comma-separated list of keywords to scan for when `--extract-context` is set. Merged with the built-in defaults (`error`, `failure`, `warning`, `warn`, `fatal`, `exception`, `critical`) unless `--context-keywords-only` is also passed. Example: `--context-keywords timeout,oomkilled,backoff`. |
+| `--context-keywords-only` | | When set, `--context-keywords` replaces the built-in default keyword list entirely instead of being merged with it. Has no effect without `--context-keywords`. |
 | `--force-text` | | Bypass all structured processors (JSON, YAML, XML, TOML, etc.) and run only the streaming scanner on every file. Use when you want a guarantee that every byte is pattern-scanned regardless of file type. |
 | `--strip-values` | | Strip all values from structured output, emitting only keys and structure. Useful for generating a profile template from a real config file without exposing any values. Bypasses the sanitization pipeline — no secrets file is required. |
 | `-h, --help` | `-h` | Print help. |
@@ -713,11 +714,9 @@ sanitize app.log -s secrets.yaml --report report.json \
 # Pipe stdin and capture context (output to file required when input > 256 MiB):
 cat app.log | sanitize -s secrets.yaml --report - --extract-context
 
-# Only keywords you care about (replaces defaults):
-# Use --context-keywords with the full list you want; to override defaults entirely,
-# pass your list and omit the built-in terms you want to exclude.
+# Only keywords you care about (replaces defaults entirely):
 sanitize app.log -s secrets.yaml --report report.json \
-  --extract-context --context-keywords fatal,critical
+  --extract-context --context-keywords fatal,critical --context-keywords-only
 ```
 
 **Report JSON — `log_context` shape** (present per file when `--extract-context` is used):
