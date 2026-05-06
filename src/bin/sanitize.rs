@@ -76,7 +76,7 @@ use sanitize_engine::{
     AtomicFileWriter, Category, FieldRule, FileReport, FileTypeProfile, HmacGenerator, LlmEntry,
     LogContextConfig, MappingStore, ProcessorRegistry, RandomGenerator, ReplacementGenerator,
     ReportBuilder, ReportMetadata, ScanConfig, ScanPattern, ScanStats, StreamScanner,
-    DEFAULT_MAX_ARCHIVE_DEPTH,
+    DEFAULT_CONTEXT_LINES, DEFAULT_MAX_ARCHIVE_DEPTH, DEFAULT_MAX_MATCHES,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -114,6 +114,23 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 /// Default UI refresh interval for live progress rendering.
 const DEFAULT_PROGRESS_INTERVAL_MS: u64 = 200;
+
+/// All format names accepted by `--format`. Must stay in sync with the
+/// format-parsing logic in `ProcessorRegistry`.
+const VALID_FORMATS: &[&str] = &[
+    "text",
+    "json",
+    "yaml",
+    "yml",
+    "xml",
+    "csv",
+    "tsv",
+    "key-value",
+    "toml",
+    "env",
+    "ini",
+    "log",
+];
 
 /// Check whether a graceful shutdown has been requested.
 fn is_interrupted() -> bool {
@@ -365,12 +382,42 @@ struct Cli {
     #[arg(long)]
     context_keywords_only: bool,
 
+    /// Maximum number of keyword matches to capture per file when
+    /// `--extract-context` is set. Matches beyond this limit are silently
+    /// dropped and `truncated` is set to `true` in the report. Default: 50.
+    #[arg(long, value_name = "N", default_value_t = 50)]
+    max_context_matches: usize,
+
+    /// Use case-sensitive keyword matching when `--extract-context` is set.
+    /// By default matching is case-insensitive (`ERROR`, `error`, and `Error`
+    /// all match the keyword `error`).
+    #[arg(long)]
+    context_case_sensitive: bool,
+
     /// Strip all values from structured output, emitting only keys and
     /// structure. Useful for generating a profile template from a real
     /// config file without exposing any secret values. Bypasses the
     /// sanitization pipeline — no secrets file is required.
     #[arg(long)]
     strip_values: bool,
+
+    /// Key-value delimiter used by `--strip-values` (default: `=`).
+    #[arg(
+        long,
+        value_name = "DELIM",
+        default_value = "=",
+        requires = "strip_values"
+    )]
+    strip_delimiter: String,
+
+    /// Comment-line prefix used by `--strip-values` (default: `#`).
+    #[arg(
+        long,
+        value_name = "PREFIX",
+        default_value = "#",
+        requires = "strip_values"
+    )]
+    strip_comment_prefix: String,
 
     /// Format sanitized output as an LLM-ready prompt on stdout instead of
     /// writing raw sanitized bytes. TEMPLATE chooses the instruction set:
@@ -382,6 +429,42 @@ struct Cli {
     /// Combine with `--extract-context` to include notable log events.
     #[arg(long, value_name = "TEMPLATE", default_missing_value = "troubleshoot", num_args = 0..=1)]
     llm: Option<String>,
+
+    /// Use built-in balanced detection patterns without requiring a secrets
+    /// file. Covers the most common high-value secrets: API keys (AWS, GCP,
+    /// GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab,
+    /// SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM
+    /// headers, password/secret key=value pairs, and credential URLs.
+    ///
+    /// Cannot be combined with `--secrets-file`.
+    #[arg(long, conflicts_with = "secrets_file")]
+    default: bool,
+
+    /// Load built-in secrets patterns and structured field profiles for one or
+    /// more applications. Comma-separated list of app names.
+    ///
+    /// Example: `--app gitlab`  `--app gitlab,nginx,postgresql`
+    ///
+    /// Can be combined with `--default` (app patterns are merged on top of the
+    /// balanced base), `--secrets-file` (additive), and `--profile` (profiles
+    /// are merged).
+    ///
+    /// Run `sanitize apps` to list available app names and descriptions.
+    #[arg(long, value_delimiter = ',', value_name = "APPS")]
+    app: Vec<String>,
+
+    /// Allow a specific value through unchanged. Repeatable.
+    ///
+    /// Matched values are not replaced and not recorded in the mapping store,
+    /// so they will also pass through in any other files processed in the same
+    /// run. Supports exact strings and `*` glob patterns.
+    ///
+    /// Examples: `--allow localhost`  `--allow "*.internal"`  `--allow "192.168.1.*"`
+    ///
+    /// Allowlist entries can also be placed in the secrets file as
+    /// `kind: allow` entries.
+    #[arg(long = "allow", value_name = "PATTERN")]
+    allow: Vec<String>,
 }
 
 impl Cli {
@@ -421,6 +504,28 @@ EXAMPLES:\n  \
   sanitize decrypt secrets.json.enc secrets.json --password \"my-password\"\n  \
   sanitize decrypt secrets.enc out.yaml --password-file /run/secrets/pw")]
     Decrypt(DecryptArgs),
+
+    /// Manage app bundles: list, add, remove, or show the user apps directory.
+    ///
+    /// Run `sanitize apps` with no subcommand to list all available bundles.
+    #[command(name = "apps")]
+    Apps(AppsArgs),
+
+    /// Test which values match your allowlist patterns.
+    ///
+    /// Prints each value with a ✓ (matched) or ✗ (no match) and shows which
+    /// pattern matched. Useful for verifying glob patterns before committing
+    /// to a full sanitization run.
+    #[command(
+        name = "allow-test",
+        after_help = "\
+EXAMPLES:\n  \
+  sanitize allow-test --allow '*.internal' db.internal github.com\n  \
+  sanitize allow-test --allow localhost --allow '*.internal' --allow '192.168.1.*' db.internal 192.168.1.5 8.8.8.8\n  \
+  echo -e 'db.internal\\ngithub.com\\n192.168.1.5' | sanitize allow-test --allow '*.internal' --allow '192.168.1.*'\n  \
+  sanitize allow-test --allow '*.internal' db.internal --json"
+    )]
+    AllowTest(AllowTestArgs),
 
     /// Interactive guided setup for logs-focused secrets templates.
     #[command(after_help = "\
@@ -537,6 +642,90 @@ struct TemplateArgs {
     /// Overwrite the output file if it already exists.
     #[arg(long)]
     overwrite: bool,
+}
+
+#[derive(Parser, Debug)]
+struct AllowTestArgs {
+    /// Allowlist patterns to test. Supports exact strings and * glob wildcards.
+    /// Repeatable.
+    #[arg(long = "allow", value_name = "PATTERN", required = true)]
+    allow: Vec<String>,
+
+    /// Values to test against the patterns. If omitted, values are read from
+    /// stdin one per line.
+    #[arg(value_name = "VALUE")]
+    values: Vec<String>,
+
+    /// Output results as JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser, Debug)]
+struct AppsArgs {
+    #[command(subcommand)]
+    command: Option<AppsSubCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum AppsSubCommand {
+    /// Install a custom app bundle from local YAML files.
+    ///
+    /// Copies the supplied profile and/or secrets files into the user apps
+    /// directory so the bundle is available via --app <name>.
+    #[command(after_help = "\
+EXAMPLES:\n  \
+  sanitize apps add elastic --profile elastic.profile.yaml --secrets elastic.secrets.yaml\n  \
+  sanitize apps add myapp --profile myapp.profile.yaml\n  \
+  sanitize apps add myapp --secrets myapp.secrets.yaml --overwrite")]
+    Add(AppsAddArgs),
+
+    /// Remove a custom app bundle from the user apps directory.
+    ///
+    /// Built-in bundles cannot be removed.
+    #[command(after_help = "\
+EXAMPLES:\n  \
+  sanitize apps remove elastic --yes\n  \
+  sanitize apps remove myapp -y")]
+    Remove(AppsRemoveArgs),
+
+    /// Print the user apps directory path.
+    ///
+    /// Custom app bundles are stored here. You can also drop directories
+    /// manually instead of using `sanitize apps add`.
+    Dir,
+}
+
+#[derive(Parser, Debug)]
+struct AppsAddArgs {
+    /// Name for the new app bundle (used with --app <name>).
+    ///
+    /// Only letters, digits, hyphens, and underscores are allowed.
+    #[arg(value_name = "NAME")]
+    name: String,
+
+    /// Path to a profile YAML file (Vec<FileTypeProfile>).
+    #[arg(long, value_name = "FILE")]
+    profile: Option<PathBuf>,
+
+    /// Path to a secrets YAML file (Vec<SecretEntry>).
+    #[arg(long, value_name = "FILE")]
+    secrets: Option<PathBuf>,
+
+    /// Overwrite an existing custom app bundle with the same name.
+    #[arg(long)]
+    overwrite: bool,
+}
+
+#[derive(Parser, Debug)]
+struct AppsRemoveArgs {
+    /// Name of the custom app bundle to remove.
+    #[arg(value_name = "NAME")]
+    name: String,
+
+    /// Confirm removal without an interactive prompt.
+    #[arg(long, short = 'y')]
+    yes: bool,
 }
 
 fn parse_template_preset(s: &str) -> Result<TemplatePreset, String> {
@@ -758,11 +947,17 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
         ),
         // IPv4 addresses — pods, services, client IPs in logs.
         make_regex_entry(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "ipv4", "ipv4"),
-        // IPv6 addresses.
+        // IPv6 — full form: 2001:0db8:85a3:0000:0000:8a2e:0370:7334
         make_regex_entry(
-            r"\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b",
+            r"\b(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}\b",
             "ipv6",
+            "ipv6_full",
+        ),
+        // IPv6 — compressed form: fe80::1, ::1, 2001:db8::1, ::ffff:10.0.0.1
+        make_regex_entry(
+            r"\b(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{0,4}\b|\b::(?:[0-9A-Fa-f]{1,4}:){0,5}[0-9A-Fa-f]{1,4}\b",
             "ipv6",
+            "ipv6_compressed",
         ),
         // UUIDs — request IDs, pod IDs, resource IDs.
         make_regex_entry(
@@ -777,7 +972,13 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
             "jwt",
         ),
         // URLs including query strings (may contain tokens or credentials).
-        make_regex_entry(r#"https?://[^\s"'<>]+"#, "url", "url"),
+        make_regex_entry(r#"https?://[^\s"'<>;]+"#, "url", "url"),
+        // Non-HTTP URLs with embedded credentials: postgres://user:pass@host, redis://:pass@host.
+        make_regex_entry(
+            r#"[a-z][a-z0-9+.-]+://[^:@\s]{1,128}:[^@\s]{1,128}@[^\s"'<>]+"#,
+            "url",
+            "credential_url",
+        ),
         // PEM / private key headers — appears in certs, k8s secrets, CI vars.
         // Near-zero false positives.
         make_regex_entry(
@@ -786,9 +987,9 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
             "private_key_header",
         ),
         // Generic secret key=value in any text format.
-        // Matches: api_key=..., client_secret: ..., secret_key="...", etc.
+        // Matches: api_key=..., client_secret: ..., access_token: ..., etc.
         make_regex_entry(
-            r#"(?i)(?:api_key|api_secret|client_secret|private_key|secret_key|auth_key|signing_key)[\s:="']+[A-Za-z0-9._~+/=-]{16,}"#,
+            r#"(?i)(?:api_key|api_secret|access_token|client_secret|private_key|secret_key|auth_key|signing_key)[\s:="']+[A-Za-z0-9._~+/=-]{16,}"#,
             "auth_token",
             "secret_kv",
         ),
@@ -812,11 +1013,12 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
             "mac_address",
             "mac_address",
         ),
-        // GitHub personal access tokens (classic and fine-grained).
+        // GitHub tokens — personal access (ghp_), OAuth (gho_), user-to-server (ghu_),
+        // server-to-server/Actions (ghs_), refresh (ghr_).
         make_regex_entry(
-            r"\bghp_[A-Za-z0-9]{36}\b",
+            r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}\b",
             "auth_token",
-            "github_pat_classic",
+            "github_token",
         ),
         make_regex_entry(
             r"\bgithub_pat_[A-Za-z0-9_]{82}\b",
@@ -825,6 +1027,51 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
         ),
         // GCP API keys — AIza prefix, near-zero false positives.
         make_regex_entry(r"\bAIza[A-Za-z0-9_-]{35}\b", "auth_token", "gcp_api_key"),
+        // AWS Access Key IDs — specific prefixes, near-zero false positives.
+        // Applies to all workspace types; AWS credentials appear in any log or config.
+        make_regex_entry(
+            r"\b(?:AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}\b",
+            "auth_token",
+            "aws_access_key_id",
+        ),
+        // OpenAI API keys — old format (sk-...) and new project-scoped (sk-proj-...).
+        make_regex_entry(
+            r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{40,}\b",
+            "auth_token",
+            "openai_api_key",
+        ),
+        // Anthropic API keys.
+        make_regex_entry(
+            r"\bsk-ant-[A-Za-z0-9_-]{93,}\b",
+            "auth_token",
+            "anthropic_api_key",
+        ),
+        // Slack tokens — bot (xoxb-), user (xoxp-), workspace (xoxa-/xoxr-).
+        make_regex_entry(
+            r"\bxox[bpars]-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*\b",
+            "auth_token",
+            "slack_token",
+        ),
+        // npm access tokens.
+        make_regex_entry(r"\bnpm_[A-Za-z0-9]{36}\b", "auth_token", "npm_token"),
+        // HuggingFace access tokens.
+        make_regex_entry(r"\bhf_[A-Za-z0-9]{34}\b", "auth_token", "huggingface_token"),
+        // Stripe secret/publishable/restricted keys — live and test.
+        make_regex_entry(
+            r"\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{24,}\b",
+            "auth_token",
+            "stripe_key",
+        ),
+        // GitLab personal/project/group access tokens.
+        make_regex_entry(r"\bglpat-[A-Za-z0-9_-]{20}\b", "auth_token", "gitlab_token"),
+        // SendGrid API keys — two-segment dot-separated format.
+        make_regex_entry(
+            r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b",
+            "auth_token",
+            "sendgrid_api_key",
+        ),
+        // Twilio Account SIDs — AC prefix + 32 hex chars.
+        make_regex_entry(r"\bAC[a-f0-9]{32}\b", "auth_token", "twilio_account_sid"),
     ];
 
     // Hostname regex is intentionally NOT in the base set — it matches any
@@ -855,13 +1102,25 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
             | GuidedPreset::Kubernetes
             | GuidedPreset::Database
     ) {
+        // Catches "Bearer <token>" regardless of surrounding context, including
+        // "Authorization: Bearer <token>" HTTP headers.
         entries.push(make_regex_entry(
-            r"(?i)\b(?:bearer|authorization)[\s:]+[A-Za-z0-9._~+/=-]{16,}\b",
+            r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}\b",
             "auth_token",
             "bearer_token",
         ));
+        // Catches "authorization: <direct_value>" in configs/env where the value
+        // is not prefixed with "Bearer".
         entries.push(make_regex_entry(
-            r"\b[A-Za-z0-9_\-]{20,}\b",
+            r#"(?i)\bauthorization[\s:="']+[A-Za-z0-9._~+/=-]{16,}\b"#,
+            "auth_token",
+            "authorization_kv",
+        ));
+        // 32-char minimum filters most legitimate log identifiers (class names,
+        // method names, log fields) while still catching real tokens. 20 chars
+        // was too low and fired on common words and identifiers in stack traces.
+        entries.push(make_regex_entry(
+            r"\b[A-Za-z0-9_\-]{32,}\b",
             "custom:high_entropy_token",
             "high_entropy_token",
         ));
@@ -948,10 +1207,12 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
             "aws_arn",
             "aws_arn",
         ));
+        // Access key ID is already in the base set; the AWS provider block adds
+        // the secret access key (too noisy without the KV context anchor).
         entries.push(make_regex_entry(
-            r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+            r#"(?i)(?:aws_secret_access_key|aws_secret_key|aws_secret)[\s:="']+[A-Za-z0-9/+=]{40}\b"#,
             "auth_token",
-            "aws_access_key_id",
+            "aws_secret_access_key",
         ));
         // AWS account IDs in ARNs are already covered; standalone 12-digit
         // numbers are too noisy to match globally.
@@ -1432,6 +1693,314 @@ fn template_body_aws() -> &'static str {
 "#
 }
 
+fn run_allow_test(args: &AllowTestArgs) -> Result<(), (String, i32)> {
+    use sanitize_engine::allowlist::AllowlistMatcher;
+
+    let (matcher, warnings) = AllowlistMatcher::new(args.allow.clone());
+    for w in &warnings {
+        eprintln!("warning: {w}");
+    }
+
+    // Collect values from positional args or stdin (one per line).
+    let values: Vec<String> = if args.values.is_empty() {
+        let mut buf = String::new();
+        io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| (format!("failed to read stdin: {e}"), 1))?;
+        buf.lines()
+            .map(|l| l.to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    } else {
+        args.values.clone()
+    };
+
+    if values.is_empty() {
+        return Err((
+            "no values to test — provide values as arguments or via stdin".into(),
+            1,
+        ));
+    }
+
+    #[derive(serde::Serialize)]
+    struct MatchResult<'a> {
+        value: &'a str,
+        allowed: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pattern: Option<&'a str>,
+    }
+
+    let results: Vec<MatchResult> = values
+        .iter()
+        .map(|v| {
+            let pattern = matcher.match_pattern(v);
+            MatchResult {
+                value: v,
+                allowed: pattern.is_some(),
+                pattern,
+            }
+        })
+        .collect();
+
+    if args.json {
+        let allowed = results.iter().filter(|r| r.allowed).count();
+        #[derive(serde::Serialize)]
+        struct Output<'a> {
+            results: Vec<MatchResult<'a>>,
+            summary: Summary,
+        }
+        #[derive(serde::Serialize)]
+        struct Summary {
+            total: usize,
+            allowed: usize,
+            blocked: usize,
+        }
+        let out = Output {
+            summary: Summary {
+                total: results.len(),
+                allowed,
+                blocked: results.len() - allowed,
+            },
+            results,
+        };
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    } else {
+        for r in &results {
+            if r.allowed {
+                println!("✓  {:<40}  → {}", r.value, r.pattern.unwrap_or(""));
+            } else {
+                println!("✗  {:<40}  (no match)", r.value);
+            }
+        }
+        let allowed = results.iter().filter(|r| r.allowed).count();
+        println!("\n{}/{} values allowed", allowed, results.len());
+    }
+
+    Ok(())
+}
+
+fn validate_app_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("app name cannot be empty".into());
+    }
+    if !name.chars().next().unwrap().is_ascii_alphanumeric() {
+        return Err(format!(
+            "app name '{name}' must start with a letter or digit"
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
+    {
+        return Err(format!(
+            "app name '{name}' contains invalid character '{bad}'; \
+             only letters, digits, hyphens, and underscores are allowed"
+        ));
+    }
+    Ok(())
+}
+
+fn run_apps(args: &AppsArgs) -> Result<(), (String, i32)> {
+    match &args.command {
+        None => run_apps_list(),
+        Some(AppsSubCommand::Add(a)) => run_apps_add(a),
+        Some(AppsSubCommand::Remove(a)) => run_apps_remove(a),
+        Some(AppsSubCommand::Dir) => run_apps_dir(),
+    }
+}
+
+fn run_apps_list() -> Result<(), (String, i32)> {
+    println!("Built-in app bundles (use with --app <name>):\n");
+    for app in BUILTIN_APPS {
+        println!("  {:<18} {}", app.name, app.description);
+    }
+
+    let apps_dir = user_apps_dir();
+    let dir_display = apps_dir
+        .as_ref()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|| "~/.config/sanitize/apps".into());
+
+    if let Some(ref dir) = apps_dir {
+        if dir.is_dir() {
+            let mut user_apps: Vec<(String, String)> = fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                        .map(|e| {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            let desc = read_app_description(&e.path());
+                            (name, desc)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            user_apps.sort_by(|a, b| a.0.cmp(&b.0));
+
+            if !user_apps.is_empty() {
+                println!("\nUser-defined apps (from {dir_display}):\n");
+                for (name, desc) in &user_apps {
+                    if desc.is_empty() {
+                        println!("  {name}");
+                    } else {
+                        println!("  {:<18} {}", name, desc);
+                    }
+                }
+            }
+        }
+    }
+
+    println!("\nCombine multiple apps:  sanitize file.zip --app gitlab,nginx,postgresql");
+    println!("Manage custom apps:     sanitize apps add <name> --profile p.yaml --secrets s.yaml");
+    println!("                        sanitize apps remove <name> --yes");
+    println!("                        sanitize apps dir");
+    Ok(())
+}
+
+fn run_apps_add(args: &AppsAddArgs) -> Result<(), (String, i32)> {
+    validate_app_name(&args.name).map_err(|e| (e, 1))?;
+
+    if args.profile.is_none() && args.secrets.is_none() {
+        return Err((
+            "at least one of --profile or --secrets must be provided".into(),
+            1,
+        ));
+    }
+
+    let apps_dir = user_apps_dir().ok_or_else(|| {
+        (
+            "cannot determine user apps directory: HOME is not set".into(),
+            1,
+        )
+    })?;
+
+    let target_dir = apps_dir.join(&args.name);
+
+    if target_dir.exists() && !args.overwrite {
+        return Err((
+            format!(
+                "app '{}' already exists at {}.\nUse --overwrite to replace it.",
+                args.name,
+                target_dir.display()
+            ),
+            1,
+        ));
+    }
+
+    // Validate files parse correctly before touching the filesystem.
+    if let Some(ref path) = args.profile {
+        let _profiles: Vec<FileTypeProfile> =
+            parse_yaml_file(path).map_err(|e| (format!("--profile: {e}"), 1))?;
+    }
+    if let Some(ref path) = args.secrets {
+        let _secrets: Vec<SecretEntry> =
+            parse_yaml_file(path).map_err(|e| (format!("--secrets: {e}"), 1))?;
+    }
+
+    fs::create_dir_all(&target_dir)
+        .map_err(|e| (format!("failed to create {}: {e}", target_dir.display()), 1))?;
+
+    if let Some(ref src) = args.profile {
+        let dst = target_dir.join("profile.yaml");
+        fs::copy(src, &dst).map_err(|e| {
+            (
+                format!("failed to copy profile to {}: {e}", dst.display()),
+                1,
+            )
+        })?;
+    }
+    if let Some(ref src) = args.secrets {
+        let dst = target_dir.join("secrets.yaml");
+        fs::copy(src, &dst).map_err(|e| {
+            (
+                format!("failed to copy secrets to {}: {e}", dst.display()),
+                1,
+            )
+        })?;
+    }
+
+    println!("Installed app '{}' → {}", args.name, target_dir.display());
+    if args.profile.is_some() {
+        println!("  profile.yaml  ✓");
+    }
+    if args.secrets.is_some() {
+        println!("  secrets.yaml  ✓");
+    }
+    println!("\nUse it with:  sanitize <file> --app {}", args.name);
+    Ok(())
+}
+
+fn run_apps_remove(args: &AppsRemoveArgs) -> Result<(), (String, i32)> {
+    validate_app_name(&args.name).map_err(|e| (e, 1))?;
+
+    // Refuse to remove a built-in.
+    if BUILTIN_APPS.iter().any(|a| a.name == args.name.as_str()) {
+        return Err((
+            format!(
+                "'{}' is a built-in app bundle and cannot be removed",
+                args.name
+            ),
+            1,
+        ));
+    }
+
+    let apps_dir = user_apps_dir().ok_or_else(|| {
+        (
+            "cannot determine user apps directory: HOME is not set".into(),
+            1,
+        )
+    })?;
+
+    let target_dir = apps_dir.join(&args.name);
+
+    if !target_dir.is_dir() {
+        return Err((
+            format!(
+                "no custom app '{}' found at {}",
+                args.name,
+                target_dir.display()
+            ),
+            1,
+        ));
+    }
+
+    if !args.yes {
+        return Err((
+            format!(
+                "this will permanently delete {}\nRe-run with --yes to confirm.",
+                target_dir.display()
+            ),
+            1,
+        ));
+    }
+
+    fs::remove_dir_all(&target_dir)
+        .map_err(|e| (format!("failed to remove {}: {e}", target_dir.display()), 1))?;
+
+    println!("Removed app '{}'  ({})", args.name, target_dir.display());
+    Ok(())
+}
+
+fn run_apps_dir() -> Result<(), (String, i32)> {
+    let apps_dir = user_apps_dir().ok_or_else(|| {
+        (
+            "cannot determine user apps directory: HOME is not set".into(),
+            1,
+        )
+    })?;
+
+    println!("{}", apps_dir.display());
+
+    if !apps_dir.exists() {
+        eprintln!(
+            "note: directory does not exist yet — it will be created automatically by `sanitize apps add`"
+        );
+    }
+
+    Ok(())
+}
+
 fn run_template(args: &TemplateArgs) -> Result<(), (String, i32)> {
     let preset = parse_template_preset(&args.preset).map_err(|e| (e, 1))?;
 
@@ -1777,11 +2346,18 @@ fn run_guided() -> Result<(), (String, i32)> {
         no_progress: false,
         progress_interval_ms: DEFAULT_PROGRESS_INTERVAL_MS,
         extract_context: false,
-        context_lines: 10,
+        context_lines: DEFAULT_CONTEXT_LINES,
         context_keywords: Vec::new(),
         context_keywords_only: false,
+        max_context_matches: DEFAULT_MAX_MATCHES,
+        context_case_sensitive: false,
         strip_values: false,
+        strip_delimiter: "=".to_string(),
+        strip_comment_prefix: "#".to_string(),
         llm: None,
+        default: false,
+        app: vec![],
+        allow: vec![],
     };
 
     run_sanitize(cli, deterministic_password.or(run_password), HashMap::new())
@@ -1940,6 +2516,7 @@ fn build_store(
     deterministic: bool,
     password: Option<&str>,
     max_mappings: usize,
+    allowlist: Option<Arc<sanitize_engine::allowlist::AllowlistMatcher>>,
 ) -> std::result::Result<Arc<MappingStore>, String> {
     let generator: Arc<dyn ReplacementGenerator> = if deterministic {
         match password {
@@ -1971,38 +2548,239 @@ fn build_store(
     } else {
         Some(max_mappings)
     };
-    Ok(Arc::new(MappingStore::new(generator, capacity)))
+    Ok(Arc::new(match allowlist {
+        Some(al) => MappingStore::new_with_allowlist(generator, capacity, al),
+        None => MappingStore::new(generator, capacity),
+    }))
 }
+
+/// Compile the built-in balanced detection patterns used by `--default`.
+///
+/// Patterns are derived from `build_guided_entries` with `GuidedPreset::Balanced`
+/// and no cloud providers, domains, or format overrides.
+fn build_default_patterns() -> Vec<ScanPattern> {
+    let opts = GuidedOptions {
+        preset: GuidedPreset::Balanced,
+        domains: vec![],
+        providers: vec![],
+        exclude_noise_ids: false,
+        formats: vec![],
+    };
+    let entries = build_guided_entries(&opts);
+    let (patterns, errors) = entries_to_patterns(&entries);
+    if !errors.is_empty() {
+        // Built-in patterns are known-good; log but don't abort.
+        for (i, e) in &errors {
+            warn!(entry = i, error = %e, "built-in default pattern failed to compile");
+        }
+    }
+    patterns
+}
+
+// ---------------------------------------------------------------------------
+// Built-in app bundles
+// ---------------------------------------------------------------------------
+//
+// Each app lives in  src/bin/apps/<name>/
+//   secrets.yaml  — Vec<SecretEntry>  (optional; omit when the app has none)
+//   profile.yaml  — Vec<FileTypeProfile> (optional)
+//
+// User-defined apps follow the same two-file convention in a directory
+// specified by the SANITIZE_APPS_DIR environment variable, falling back to
+// ~/.config/sanitize/apps  (XDG-compatible).
+//
+// The first YAML comment line (# ...) in either file is shown as the
+// description in  `sanitize apps`.
+
+/// Compiled content loaded from an app bundle directory.
+struct AppBundle {
+    secrets: Vec<SecretEntry>,
+    profiles: Vec<FileTypeProfile>,
+}
+
+struct BuiltinApp {
+    name: &'static str,
+    description: &'static str,
+    /// Vec<SecretEntry> YAML; None when the app has no unique secrets patterns.
+    secrets_yaml: Option<&'static str>,
+    /// Vec<FileTypeProfile> YAML; None when the app has no profile rules.
+    profile_yaml: Option<&'static str>,
+}
+
+const BUILTIN_APPS: &[BuiltinApp] = &[
+    BuiltinApp {
+        name: "docker-compose",
+        description: "Docker Compose — compose.yml environment variables, image credentials",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/docker-compose/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "django",
+        description: "Django — .env files, SECRET_KEY, database credentials, third-party API keys",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/django/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "gitlab",
+        description: "GitLab — CI/CD logs, runner output, .gitlab-ci.yml variables",
+        secrets_yaml: Some(include_str!("../../apps/gitlab/secrets.yaml")),
+        profile_yaml: Some(include_str!("../../apps/gitlab/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "kubernetes",
+        description: "Kubernetes — kubeconfig credentials, Secret manifests, Helm values",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/kubernetes/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "nginx",
+        description: "Nginx — nginx.conf virtual hosts, proxy upstreams, access/error logs",
+        secrets_yaml: Some(include_str!("../../apps/nginx/secrets.yaml")),
+        profile_yaml: Some(include_str!("../../apps/nginx/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "postgresql",
+        description: "PostgreSQL — postgresql.conf, connection strings, pg logs",
+        secrets_yaml: Some(include_str!("../../apps/postgresql/secrets.yaml")),
+        profile_yaml: Some(include_str!("../../apps/postgresql/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "rails",
+        description: "Ruby on Rails — database.yml, .env, config/secrets.yml",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/rails/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "spring-boot",
+        description:
+            "Spring Boot — application.yml, application.properties, datasource credentials",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/spring-boot/profile.yaml")),
+    },
+];
+
+/// Return a sorted list of all built-in app names.
+fn builtin_app_names() -> Vec<&'static str> {
+    BUILTIN_APPS.iter().map(|a| a.name).collect()
+}
+
+/// Resolve the user-defined apps directory.
+///
+/// Checks `SANITIZE_APPS_DIR` first, then falls back to
+/// `~/.config/sanitize/apps` (XDG base directory convention).
+fn user_apps_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("SANITIZE_APPS_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    std::env::var("HOME").ok().map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join("sanitize")
+            .join("apps")
+    })
+}
+
+/// Parse a YAML file as `T`, returning a clear error on failure.
+fn parse_yaml_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    serde_yaml_ng::from_str(&content)
+        .map_err(|e| format!("failed to parse {}: {e}", path.display()))
+}
+
+/// Read the first `# description` comment line from a YAML file, if present.
+fn read_app_description(app_dir: &Path) -> String {
+    for filename in &["secrets.yaml", "profile.yaml"] {
+        let path = app_dir.join(filename);
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Some(line) = content.lines().next() {
+                if let Some(rest) = line.strip_prefix('#') {
+                    let desc = rest.trim().to_string();
+                    if !desc.is_empty() {
+                        return desc;
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Load an app bundle by name.
+///
+/// Resolution order:
+///   1. User apps directory (`SANITIZE_APPS_DIR` or `~/.config/sanitize/apps/<name>/`)
+///   2. Built-in apps embedded in the binary
+fn load_app_bundle(name: &str) -> Result<AppBundle, String> {
+    // 1. User-defined app takes precedence over built-in.
+    if let Some(apps_dir) = user_apps_dir() {
+        let app_dir = apps_dir.join(name);
+        if app_dir.is_dir() {
+            let secrets_path = app_dir.join("secrets.yaml");
+            let profile_path = app_dir.join("profile.yaml");
+
+            let secrets: Vec<SecretEntry> = if secrets_path.exists() {
+                parse_yaml_file(&secrets_path)?
+            } else {
+                vec![]
+            };
+            let profiles: Vec<FileTypeProfile> = if profile_path.exists() {
+                parse_yaml_file(&profile_path)?
+            } else {
+                vec![]
+            };
+            return Ok(AppBundle { secrets, profiles });
+        }
+    }
+
+    // 2. Built-in app.
+    let entry = BUILTIN_APPS
+        .iter()
+        .find(|a| a.name == name)
+        .ok_or_else(|| {
+            format!(
+                "unknown app '{}'. Built-in apps: {}. \
+                 Add a custom app at $SANITIZE_APPS_DIR/{} (secrets.yaml / profile.yaml).",
+                name,
+                builtin_app_names().join(", "),
+                name,
+            )
+        })?;
+
+    let secrets: Vec<SecretEntry> = match entry.secrets_yaml {
+        Some(yaml) => serde_yaml_ng::from_str(yaml)
+            .map_err(|e| format!("failed to parse built-in secrets for '{}': {e}", name))?,
+        None => vec![],
+    };
+    let profiles: Vec<FileTypeProfile> = match entry.profile_yaml {
+        Some(yaml) => serde_yaml_ng::from_str(yaml)
+            .map_err(|e| format!("failed to parse built-in profile for '{}': {e}", name))?,
+        None => vec![],
+    };
+
+    Ok(AppBundle { secrets, profiles })
+}
+
+// ---------------------------------------------------------------------------
+// Augmented scanner (Phase 2)
+// ---------------------------------------------------------------------------
 
 /// Build an augmented scanner after the profile pass (Phase 1).
 ///
-/// Re-parses the secrets file (if any) to get base patterns, then adds a
-/// literal `ScanPattern` for every original value recorded in `store` during
-/// Phase 1. This allows the scanner to catch those same values verbatim in
-/// plain-text files processed in Phase 2.
+/// Takes the pre-compiled base patterns (from all sources — secrets file,
+/// `--default`, `--app`) and adds a literal `ScanPattern` for every original
+/// value recorded in `store` during Phase 1. This allows the scanner to catch
+/// those same values verbatim in plain-text files processed in Phase 2.
 ///
 /// Values shorter than 4 bytes are skipped to avoid false positives.
 fn build_augmented_scanner(
-    secrets_raw_bytes: Option<&[u8]>,
-    password: Option<&str>,
-    allow_plaintext: bool,
+    base_patterns: &[ScanPattern],
     store: &Arc<MappingStore>,
     scan_config: ScanConfig,
 ) -> std::result::Result<Arc<StreamScanner>, (String, i32)> {
-    // Re-compile base patterns from the secrets file (if one was provided).
-    let mut patterns: Vec<ScanPattern> = if let Some(raw) = secrets_raw_bytes {
-        let ((base, _warnings), _encrypted) =
-            sanitize_engine::secrets::load_secrets_auto(raw, password, None, allow_plaintext)
-                .map_err(|e| {
-                    (
-                        format!("failed to reload secrets for augmented scanner: {e}"),
-                        1,
-                    )
-                })?;
-        base
-    } else {
-        vec![]
-    };
+    let mut patterns = base_patterns.to_vec();
 
     // Harvest original values recorded by the profile processor in Phase 1.
     let mut discovered = 0usize;
@@ -2497,25 +3275,11 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
     }
 
     if let Some(ref fmt) = cli.format {
-        let valid = [
-            "text",
-            "json",
-            "yaml",
-            "yml",
-            "xml",
-            "csv",
-            "tsv",
-            "key-value",
-            "toml",
-            "env",
-            "ini",
-            "log",
-        ];
-        if !valid.contains(&fmt.as_str()) {
+        if !VALID_FORMATS.contains(&fmt.as_str()) {
             return Err(format!(
                 "invalid --format '{}': must be one of: {}",
                 fmt,
-                valid.join(", ")
+                VALID_FORMATS.join(", ")
             ));
         }
     }
@@ -2575,6 +3339,22 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
              password inputs to use a plaintext file."
                 .into(),
         );
+    }
+
+    for app in &cli.app {
+        let is_builtin = BUILTIN_APPS.iter().any(|a| a.name == app.as_str());
+        let is_user = user_apps_dir()
+            .map(|d| d.join(app).is_dir())
+            .unwrap_or(false);
+        if !is_builtin && !is_user {
+            return Err(format!(
+                "unknown --app '{}'. Built-in apps: {}. \
+                 Add a custom app at $SANITIZE_APPS_DIR/{} (secrets.yaml / profile.yaml).",
+                app,
+                builtin_app_names().join(", "),
+                app,
+            ));
+        }
     }
 
     // --llm validations.
@@ -4059,6 +4839,22 @@ fn write_output(output_path: Option<&Path>, data: &[u8]) -> Result<(), String> {
 // Log context extraction helper
 // ---------------------------------------------------------------------------
 
+/// Build a `LogContextConfig` from the relevant CLI flags.
+fn build_log_context_config(cli: &Cli) -> LogContextConfig {
+    let mut config = LogContextConfig::new()
+        .with_context_lines(cli.context_lines)
+        .with_max_matches(cli.max_context_matches)
+        .case_sensitive(cli.context_case_sensitive);
+    if !cli.context_keywords.is_empty() {
+        config = if cli.context_keywords_only {
+            config.with_keywords(cli.context_keywords.iter().cloned())
+        } else {
+            config.with_extra_keywords(cli.context_keywords.iter().cloned())
+        };
+    }
+    config
+}
+
 /// If `--extract-context` is set and a report builder is present, run log
 /// context extraction on `bytes` and attach the result to the file entry
 /// identified by `report_path`.
@@ -4073,15 +4869,10 @@ fn maybe_extract_context(
     }
     let Some(rb) = report_builder else { return };
     let text = String::from_utf8_lossy(bytes);
-    let mut config = LogContextConfig::new().with_context_lines(cli.context_lines);
-    if !cli.context_keywords.is_empty() {
-        config = if cli.context_keywords_only {
-            config.with_keywords(cli.context_keywords.iter().cloned())
-        } else {
-            config.with_extra_keywords(cli.context_keywords.iter().cloned())
-        };
-    }
-    rb.set_file_log_context(report_path, extract_context(&text, &config));
+    rb.set_file_log_context(
+        report_path,
+        extract_context(&text, &build_log_context_config(cli)),
+    );
 }
 
 /// Streaming variant: re-opens `out_path` (the committed output file) and runs
@@ -4099,14 +4890,7 @@ fn maybe_extract_context_reader(
         return;
     }
     let Some(rb) = report_builder else { return };
-    let mut config = LogContextConfig::new().with_context_lines(cli.context_lines);
-    if !cli.context_keywords.is_empty() {
-        config = if cli.context_keywords_only {
-            config.with_keywords(cli.context_keywords.iter().cloned())
-        } else {
-            config.with_extra_keywords(cli.context_keywords.iter().cloned())
-        };
-    }
+    let config = build_log_context_config(cli);
     let file = match fs::File::open(out_path) {
         Ok(f) => f,
         Err(e) => {
@@ -4297,8 +5081,10 @@ fn run() -> Result<(), (String, i32)> {
     match &cli.command {
         Some(SubCommand::Encrypt(args)) => return run_encrypt(args),
         Some(SubCommand::Decrypt(args)) => return run_decrypt(args),
+        Some(SubCommand::Apps(args)) => return run_apps(args),
         Some(SubCommand::Guided) => return run_guided(),
         Some(SubCommand::Template(args)) => return run_template(args),
+        Some(SubCommand::AllowTest(args)) => return run_allow_test(args),
         None => {} // fall through to default sanitize mode
     }
 
@@ -4366,39 +5152,26 @@ fn run_sanitize(
 
     // --- build core components ----------------------------------------------
     let scan_config = build_scan_config(cli.chunk_size).map_err(|e| (e, 1))?;
-    let store = build_store(
-        cli.deterministic,
-        effective_password.as_ref().map(|s| s.as_str()),
-        cli.max_mappings,
-    )
-    .map_err(|e| (e, 1))?;
     let registry = Arc::new(ProcessorRegistry::with_builtins());
 
     // --- load field-path profiles (--profile) --------------------------------
-    let profiles: Vec<sanitize_engine::processor::FileTypeProfile> =
+    let file_profiles: Vec<sanitize_engine::processor::FileTypeProfile> =
         if let Some(ref profile_path) = cli.profile {
             load_profiles(profile_path).map_err(|e| (e, 1))?
         } else {
             vec![]
         };
 
-    if !profiles.is_empty() {
-        info!(count = profiles.len(), "loaded field-path profiles");
-        for p in &profiles {
-            if registry.get(&p.processor).is_none() {
-                eprintln!(
-                    "Warning: profile processor '{}' is not registered. \
-                     Known processors: {}",
-                    p.processor,
-                    registry.names().join(", ")
-                );
-            }
-        }
-    }
+    // --- compile base patterns from all sources --------------------------------
+    // All sources (--secrets-file, --default, --app) contribute to a single
+    // Vec<ScanPattern> that is reused by both the initial scanner and the
+    // Phase 2 augmented scanner (which appends profile-discovered literals).
+    let mut base_patterns: Vec<ScanPattern> = vec![];
+    // Allow patterns accumulate from secrets file + --allow CLI values and are
+    // used to build the AllowlistMatcher before constructing the store.
+    let mut all_allow_patterns: Vec<String> = cli.allow.clone();
 
-    // --- load secrets and build scanner -------------------------------------
-    // Keep raw_bytes in scope so Phase 2 can re-parse and build an augmented
-    // scanner that includes literals discovered during the profile pass (Phase 1).
+    // 1. From --secrets-file (plaintext or encrypted).
     let secrets_raw_bytes: Option<Vec<u8>> = if let Some(ref secrets_path) = cli.secrets_file {
         if secrets_path.exists() {
             Some(fs::read(secrets_path).map_err(|e| {
@@ -4411,7 +5184,6 @@ fn run_sanitize(
                 )
             })?)
         } else if cli.deterministic {
-            // File doesn't exist yet — will be created after processing.
             None
         } else {
             return Err((
@@ -4423,14 +5195,15 @@ fn run_sanitize(
         None
     };
 
-    let scanner = if let Some(ref raw_bytes) = secrets_raw_bytes {
-        let ((patterns, warnings), was_encrypted) = sanitize_engine::secrets::load_secrets_auto(
-            raw_bytes,
-            effective_password.as_ref().map(|s| s.as_str()),
-            None,
-            !cli.encrypted_secrets,
-        )
-        .map_err(|e| (format!("failed to load secrets: {e}"), 1))?;
+    if let Some(ref raw_bytes) = secrets_raw_bytes {
+        let (((patterns, warnings), allow_from_secrets), was_encrypted) =
+            sanitize_engine::secrets::load_secrets_auto(
+                raw_bytes,
+                effective_password.as_ref().map(|s| s.as_str()),
+                None,
+                !cli.encrypted_secrets,
+            )
+            .map_err(|e| (format!("failed to load secrets: {e}"), 1))?;
 
         let secrets_display = cli
             .secrets_file
@@ -4457,28 +5230,110 @@ fn run_sanitize(
                 ));
             }
         }
+        base_patterns.extend(patterns);
+        all_allow_patterns.extend(allow_from_secrets);
+    }
 
-        let scanner = StreamScanner::new(patterns, Arc::clone(&store), scan_config.clone())
-            .map_err(|e| (format!("failed to create scanner: {e}"), 1))?;
+    // Build allowlist from secrets file + --allow CLI values, then store.
+    let allowlist: Option<Arc<sanitize_engine::allowlist::AllowlistMatcher>> =
+        if all_allow_patterns.is_empty() {
+            None
+        } else {
+            let (matcher, al_warnings) =
+                sanitize_engine::allowlist::AllowlistMatcher::new(all_allow_patterns);
+            for w in &al_warnings {
+                warn!(warning = %w, "allowlist pattern warning");
+            }
+            let matcher = Arc::new(matcher);
+            info!(patterns = matcher.seen_count(), "allowlist loaded");
+            Some(matcher)
+        };
+    let store = build_store(
+        cli.deterministic,
+        effective_password.as_ref().map(|s| s.as_str()),
+        cli.max_mappings,
+        allowlist,
+    )
+    .map_err(|e| (e, 1))?;
 
-        let secrets_display = cli
-            .secrets_file
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
+    // 2. From --default or implicitly when --app is used without --secrets-file.
+    //    --app is designed to be zero-setup: users don't need to also add
+    //    --default to get email, IP, JWT, and common token patterns.
+    let load_defaults = cli.default || (!cli.app.is_empty() && cli.secrets_file.is_none());
+    if load_defaults {
+        let default_patterns = build_default_patterns();
+        if cli.default {
+            info!(
+                patterns = default_patterns.len(),
+                "loaded built-in balanced patterns (--default)"
+            );
+        } else {
+            info!(
+                patterns = default_patterns.len(),
+                "loaded built-in balanced patterns (auto, via --app)"
+            );
+        }
+        base_patterns.extend(default_patterns);
+    }
+
+    // 3. From --app bundles (secrets + collect profiles for merging below).
+    let mut app_profiles: Vec<FileTypeProfile> = vec![];
+    for app_name in &cli.app {
+        let bundle = load_app_bundle(app_name).map_err(|e| (e, 1))?;
+        let (app_patterns, app_errors) = entries_to_patterns(&bundle.secrets);
+        if !app_errors.is_empty() {
+            for (i, e) in &app_errors {
+                warn!(app = %app_name, entry = i, error = %e, "app bundle pattern warning");
+            }
+        }
         info!(
-            patterns = scanner.pattern_count(),
-            secrets_file = %secrets_display,
-            "patterns loaded"
+            app = %app_name,
+            patterns = app_patterns.len(),
+            profiles = bundle.profiles.len(),
+            "loaded app bundle"
         );
-        Arc::new(scanner)
-    } else {
-        warn!("no --secrets-file provided; only structured processing will apply");
-        Arc::new(
-            StreamScanner::new(vec![], Arc::clone(&store), scan_config.clone())
-                .map_err(|e| (format!("failed to create scanner: {e}"), 1))?,
-        )
+        base_patterns.extend(app_patterns);
+        app_profiles.extend(bundle.profiles);
+    }
+
+    if base_patterns.is_empty() && app_profiles.is_empty() {
+        warn!("no --secrets-file, --default, or --app provided; only structured processing will apply");
+    }
+
+    let scanner = StreamScanner::new(
+        base_patterns.clone(),
+        Arc::clone(&store),
+        scan_config.clone(),
+    )
+    .map_err(|e| (format!("failed to create scanner: {e}"), 1))?;
+
+    if !base_patterns.is_empty() {
+        info!(patterns = scanner.pattern_count(), "scanner ready");
+    }
+    let scanner = Arc::new(scanner);
+
+    // --- merge profiles (--app bundles first, then --profile file) -----------
+    // App profiles are prepended so that the user's --profile rules take
+    // precedence when both match the same file.
+    let profiles: Vec<sanitize_engine::processor::FileTypeProfile> = {
+        let mut merged = app_profiles;
+        merged.extend(file_profiles);
+        merged
     };
+
+    if !profiles.is_empty() {
+        info!(count = profiles.len(), "loaded field-path profiles");
+        for p in &profiles {
+            if registry.get(&p.processor).is_none() {
+                eprintln!(
+                    "Warning: profile processor '{}' is not registered. \
+                     Known processors: {}",
+                    p.processor,
+                    registry.names().join(", ")
+                );
+            }
+        }
+    }
 
     // --- build report builder -----------------------------------------------
     // Force report building when --llm is active so we can include the
@@ -4503,7 +5358,11 @@ fn run_sanitize(
             strict: cli.strict,
             chunk_size: cli.chunk_size,
             threads: cli.threads,
-            secrets_file: cli.secrets_file.as_ref().map(|p| p.display().to_string()),
+            secrets_file: if cli.default {
+                Some("<built-in:balanced>".into())
+            } else {
+                cli.secrets_file.as_ref().map(|p| p.display().to_string())
+            },
         }))
     } else {
         None
@@ -4541,7 +5400,8 @@ fn run_sanitize(
                     (text, Some(output.as_path()))
                 }
             };
-            let stripped = strip_values_from_text(&content, "=", "#");
+            let stripped =
+                strip_values_from_text(&content, &cli.strip_delimiter, &cli.strip_comment_prefix);
             write_output(output_path, stripped.as_bytes()).map_err(|e| (e, 1))?;
         }
         return Ok(());
@@ -4681,13 +5541,7 @@ fn run_sanitize(
 
     // Build augmented scanner: base secrets patterns + literals discovered in
     // Phase 1 (plain files) and the archive discovery pre-pass above.
-    let augmented_scanner = build_augmented_scanner(
-        secrets_raw_bytes.as_deref(),
-        effective_password.as_ref().map(|s| s.as_str()),
-        !cli.encrypted_secrets,
-        &store,
-        scan_config,
-    )?;
+    let augmented_scanner = build_augmented_scanner(&base_patterns, &store, scan_config)?;
 
     // When --profile is active, stdin was deferred until here so it benefits
     // from the fully-populated augmented scanner.
@@ -5563,5 +6417,44 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn cli_parses_default_flag() {
+        let cli = Cli::try_parse_from(["sanitize", "--default", "app.log"]).unwrap();
+        assert!(cli.default);
+        assert!(cli.secrets_file.is_none());
+    }
+
+    #[test]
+    fn cli_default_conflicts_with_secrets_file() {
+        // clap enforces conflicts_with at parse time.
+        let result = Cli::try_parse_from(["sanitize", "--default", "--secrets-file", "s.yaml"]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("cannot be used with"),
+            "expected conflict error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_default_patterns_returns_nonempty_set() {
+        let patterns = build_default_patterns();
+        assert!(
+            !patterns.is_empty(),
+            "built-in balanced patterns should not be empty"
+        );
+        // Verify a few known labels are present.
+        let labels: Vec<_> = patterns.iter().map(|p| p.label()).collect();
+        assert!(labels.contains(&"email"), "expected email pattern");
+        assert!(
+            labels.contains(&"github_token"),
+            "expected github_token pattern"
+        );
+        assert!(
+            labels.contains(&"stripe_key"),
+            "expected stripe_key pattern"
+        );
     }
 }

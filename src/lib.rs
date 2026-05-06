@@ -127,6 +127,7 @@
     clippy::similar_names
 )]
 
+pub mod allowlist;
 pub mod atomic;
 pub mod category;
 pub mod error;

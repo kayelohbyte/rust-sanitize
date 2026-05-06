@@ -1,0 +1,49 @@
+# Docker Compose — compose.yml environment variables, image credentials
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  include: ["docker-compose.yml", "docker-compose.yaml",
+            "compose.yml", "compose.yaml",
+            "docker-compose.*.yml", "docker-compose.*.yaml"]
+  fields:
+    - pattern: "*.POSTGRES_PASSWORD"
+      category: custom:password
+      label: compose_postgres_password
+    - pattern: "*.POSTGRES_USER"
+      category: name
+      label: compose_postgres_user
+    - pattern: "*.MYSQL_ROOT_PASSWORD"
+      category: custom:password
+      label: compose_mysql_root_password
+    - pattern: "*.MYSQL_PASSWORD"
+      category: custom:password
+      label: compose_mysql_password
+    - pattern: "*.MYSQL_USER"
+      category: name
+      label: compose_mysql_user
+    - pattern: "*.MONGO_INITDB_ROOT_PASSWORD"
+      category: custom:password
+      label: compose_mongo_root_password
+    - pattern: "*.MONGO_INITDB_ROOT_USERNAME"
+      category: name
+      label: compose_mongo_root_user
+    - pattern: "*.REDIS_PASSWORD"
+      category: custom:password
+      label: compose_redis_password
+    - pattern: "*.environment.*PASSWORD"
+      category: custom:password
+      label: compose_env_password
+    - pattern: "*.environment.*SECRET"
+      category: auth_token
+      label: compose_env_secret
+    - pattern: "*.environment.*TOKEN"
+      category: auth_token
+      label: compose_env_token
+    - pattern: "*.environment.*_KEY"
+      category: auth_token
+      label: compose_env_key
+    - pattern: "*.registries.*.password"
+      category: custom:password
+      label: compose_registry_password
+    - pattern: "*.registries.*.username"
+      category: name
+      label: compose_registry_username

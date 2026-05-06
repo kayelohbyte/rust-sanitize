@@ -1,0 +1,77 @@
+# Spring Boot — application.yml, application.properties, datasource credentials
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  include: ["application.yaml", "application.yml", "application-*.yaml", "application-*.yml",
+            "bootstrap.yaml", "bootstrap.yml"]
+  fields:
+    - pattern: "*.datasource.password"
+      category: custom:password
+      label: spring_datasource_password
+    - pattern: "*.datasource.username"
+      category: name
+      label: spring_datasource_username
+    - pattern: "*.datasource.url"
+      category: url
+      label: spring_datasource_url
+    - pattern: "*.datasource.hikari.password"
+      category: custom:password
+      label: spring_hikari_password
+    - pattern: "*.security.oauth2.client.registration.*.client-secret"
+      category: auth_token
+      label: spring_oauth_client_secret
+    - pattern: "*.security.oauth2.client.registration.*.client-id"
+      category: auth_token
+      label: spring_oauth_client_id
+    - pattern: "*.mail.password"
+      category: custom:password
+      label: spring_mail_password
+    - pattern: "*.mail.username"
+      category: name
+      label: spring_mail_username
+    - pattern: "*.redis.password"
+      category: custom:password
+      label: spring_redis_password
+    - pattern: "*.management.server.ssl.key-store-password"
+      category: custom:password
+      label: spring_ssl_keystore_password
+    - pattern: "*.jwt.secret"
+      category: auth_token
+      label: spring_jwt_secret
+    - pattern: "*.jwt.signing-key"
+      category: auth_token
+      label: spring_jwt_signing_key
+    - pattern: "*.api-key"
+      category: auth_token
+      label: spring_api_key
+    - pattern: "*.secret-key"
+      category: auth_token
+      label: spring_secret_key
+
+- processor: key-value
+  extensions: [".properties"]
+  include: ["application.properties", "application-*.properties", "bootstrap.properties"]
+  fields:
+    - pattern: "spring.datasource.password"
+      category: custom:password
+      label: spring_datasource_password
+    - pattern: "spring.datasource.username"
+      category: name
+      label: spring_datasource_username
+    - pattern: "spring.datasource.url"
+      category: url
+      label: spring_datasource_url
+    - pattern: "spring.security.oauth2.client.registration.*.client-secret"
+      category: auth_token
+      label: spring_oauth_client_secret
+    - pattern: "spring.mail.password"
+      category: custom:password
+      label: spring_mail_password
+    - pattern: "spring.mail.username"
+      category: name
+      label: spring_mail_username
+    - pattern: "spring.redis.password"
+      category: custom:password
+      label: spring_redis_password
+    - pattern: "*.jwt.secret"
+      category: auth_token
+      label: spring_jwt_secret

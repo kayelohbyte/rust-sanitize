@@ -16,3 +16,7 @@ test.sanitized.zip
 profile.yaml
 secrets.yaml
 test.yaml
+
+# Built-in app configs are intentionally tracked
+!apps/**/profile.yaml
+!apps/**/secrets.yaml

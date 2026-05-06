@@ -1,0 +1,57 @@
+# Kubernetes — kubeconfig credentials, Secret manifests, Helm values
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  include: ["kubeconfig", "*.kubeconfig", "config", "kube-config.yaml", "kube-config.yml"]
+  fields:
+    - pattern: "*.user.token"
+      category: auth_token
+      label: k8s_service_account_token
+    - pattern: "*.user.client-key-data"
+      category: auth_token
+      label: k8s_client_key_data
+    - pattern: "*.user.client-certificate-data"
+      category: auth_token
+      label: k8s_client_cert_data
+    - pattern: "*.user.username"
+      category: name
+      label: k8s_username
+    - pattern: "*.user.password"
+      category: custom:password
+      label: k8s_password
+    - pattern: "*.cluster.certificate-authority-data"
+      category: auth_token
+      label: k8s_ca_cert_data
+    - pattern: "*.cluster.server"
+      category: url
+      label: k8s_api_server_url
+
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  include: ["*secret*.yaml", "*secret*.yml", "*-secret.yaml", "*-secret.yml"]
+  fields:
+    - pattern: "data.*"
+      category: auth_token
+      label: k8s_secret_data
+    - pattern: "stringData.*"
+      category: auth_token
+      label: k8s_secret_string_data
+
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  include: ["values.yaml", "values.yml", "values-*.yaml", "values-*.yml"]
+  fields:
+    - pattern: "*.password"
+      category: custom:password
+      label: helm_password
+    - pattern: "*.secret"
+      category: auth_token
+      label: helm_secret
+    - pattern: "*.secretKey"
+      category: auth_token
+      label: helm_secret_key
+    - pattern: "*.apiKey"
+      category: auth_token
+      label: helm_api_key
+    - pattern: "*.privateKey"
+      category: auth_token
+      label: helm_private_key

@@ -1,0 +1,54 @@
+# Django — .env files, SECRET_KEY, database credentials, third-party API keys
+- processor: env
+  extensions: [".env"]
+  include: [".env", ".env.local", ".env.production", ".env.staging",
+            ".env.development", ".env.test", "*.env"]
+  fields:
+    - pattern: "SECRET_KEY"
+      category: auth_token
+      label: django_secret_key
+    - pattern: "DATABASE_URL"
+      category: url
+      label: django_db_url
+    - pattern: "CELERY_BROKER_URL"
+      category: url
+      label: django_broker_url
+    - pattern: "REDIS_URL"
+      category: url
+      label: django_redis_url
+    - pattern: "EMAIL_HOST_PASSWORD"
+      category: custom:password
+      label: django_email_password
+    - pattern: "EMAIL_HOST_USER"
+      category: name
+      label: django_email_user
+    - pattern: "*PASSWORD"
+      category: custom:password
+      label: env_password
+    - pattern: "*SECRET"
+      category: auth_token
+      label: env_secret
+    - pattern: "*_KEY"
+      category: auth_token
+      label: env_key
+    - pattern: "*TOKEN"
+      category: auth_token
+      label: env_token
+    - pattern: "*PRIVATE_KEY"
+      category: auth_token
+      label: env_private_key
+    - pattern: "AWS_ACCESS_KEY_ID"
+      category: auth_token
+      label: aws_access_key_id
+    - pattern: "AWS_SECRET_ACCESS_KEY"
+      category: auth_token
+      label: aws_secret_access_key
+    - pattern: "STRIPE_SECRET_KEY"
+      category: auth_token
+      label: stripe_secret_key
+    - pattern: "SENDGRID_API_KEY"
+      category: auth_token
+      label: sendgrid_api_key
+    - pattern: "TWILIO_AUTH_TOKEN"
+      category: auth_token
+      label: twilio_auth_token

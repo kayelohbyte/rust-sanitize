@@ -80,9 +80,74 @@ jobs:
           path: |
             ${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.*
 
+  build-mcp:
+    name: Build MCP ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            binary: sanitize-mcp
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            binary: sanitize-mcp
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            binary: sanitize-mcp
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            binary: sanitize-mcp.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Compile
+        run: >
+          deno compile
+          --allow-run --allow-env --allow-read --allow-write
+          --target ${{ matrix.target }}
+          --output ${{ matrix.binary }}
+          mcp/src/index.ts
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        run: tar czf sanitize-mcp-${{ github.ref_name }}-${{ matrix.target }}.tar.gz ${{ matrix.binary }}
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path "${{ matrix.binary }}" -DestinationPath "sanitize-mcp-${{ github.ref_name }}-${{ matrix.target }}.zip"
+
+      - name: Generate checksum (Unix)
+        if: runner.os != 'Windows'
+        run: sha256sum sanitize-mcp-${{ github.ref_name }}-${{ matrix.target }}.* > sanitize-mcp-${{ github.ref_name }}-${{ matrix.target }}.sha256
+
+      - name: Generate checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "sanitize-mcp-${{ github.ref_name }}-${{ matrix.target }}.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  sanitize-mcp-${{ github.ref_name }}-${{ matrix.target }}.zip" | Out-File -Encoding utf8 "sanitize-mcp-${{ github.ref_name }}-${{ matrix.target }}.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-${{ matrix.target }}
+          path: sanitize-mcp-${{ github.ref_name }}-${{ matrix.target }}.*
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, build-mcp]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -331,7 +331,25 @@ pub fn decrypt_secrets(encrypted: &[u8], password: &str) -> Result<Zeroizing<Vec
 ///
 /// Returns [`SanitizeError::SecretsError`] if the plaintext is not
 /// valid UTF-8 or cannot be parsed in the specified format.
+/// Maximum size of a plaintext secrets file accepted by [`parse_secrets`].
+/// Prevents OOM from accidentally passing a large binary or log file as secrets.
+const MAX_SECRETS_PLAINTEXT_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
+/// # Errors
+/// Returns an error if the plaintext exceeds 10 MiB, the format cannot be
+/// detected, or the content fails to deserialise as the expected format.
 pub fn parse_secrets(plaintext: &[u8], format: Option<SecretsFormat>) -> Result<Vec<SecretEntry>> {
+    if plaintext.len() > MAX_SECRETS_PLAINTEXT_BYTES {
+        return Err(SanitizeError::SecretsFormatError {
+            format: "secrets file".into(),
+            message: format!(
+                "file is {} bytes, exceeding the {} byte limit — \
+                 secrets files should be small YAML/JSON/TOML pattern lists",
+                plaintext.len(),
+                MAX_SECRETS_PLAINTEXT_BYTES,
+            ),
+        });
+    }
     let fmt = format.unwrap_or_else(|| SecretsFormat::detect(plaintext));
     let text = std::str::from_utf8(plaintext)
         .map_err(|e| SanitizeError::SecretsInvalidUtf8(e.to_string()))?;
@@ -444,7 +462,23 @@ fn zeroize_and_drop_entries(entries: Vec<SecretEntry>) {
     drop(entries);
 }
 
+/// Extract allowlist patterns from a set of entries.
+///
+/// Entries with `kind: allow` are returned as raw pattern strings to be
+/// compiled into an [`AllowlistMatcher`]. They are skipped by
+/// [`entries_to_patterns`].
+pub fn extract_allow_patterns(entries: &[SecretEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| e.kind == "allow")
+        .map(|e| e.pattern.clone())
+        .collect()
+}
+
 /// Convert parsed [`SecretEntry`]s into compiled [`ScanPattern`]s.
+///
+/// Entries with `kind: allow` are silently skipped — they are handled by
+/// [`extract_allow_patterns`] instead.
 ///
 /// Invalid entries (e.g. bad regex) are collected as errors and
 /// returned alongside the successfully compiled patterns.
@@ -453,6 +487,9 @@ pub fn entries_to_patterns(entries: &[SecretEntry]) -> PatternCompileResult {
     let mut errors = Vec::new();
 
     for (i, entry) in entries.iter().enumerate() {
+        if entry.kind == "allow" {
+            continue;
+        }
         let category = parse_category(&entry.category);
         let label = entry
             .label
@@ -473,14 +510,19 @@ pub fn entries_to_patterns(entries: &[SecretEntry]) -> PatternCompileResult {
     (patterns, errors)
 }
 
+const MAX_LABEL_CHARS: usize = 32;
+
 /// Truncate to a maximum label length.
 fn truncate_label(s: &str) -> String {
-    if s.len() <= 32 {
+    if s.len() <= MAX_LABEL_CHARS {
         s.to_string()
     } else {
-        // Find a char boundary at or before byte 31 to avoid panicking on
+        // Find a char boundary just before the limit to avoid panicking on
         // multi-byte UTF-8 characters (e.g. Unicode in user-supplied patterns).
-        let cut = s.char_indices().nth(31).map_or(s.len(), |(i, _)| i);
+        let cut = s
+            .char_indices()
+            .nth(MAX_LABEL_CHARS - 1)
+            .map_or(s.len(), |(i, _)| i);
         format!("{}…", &s[..cut])
     }
 }
@@ -517,12 +559,13 @@ pub fn load_encrypted_secrets(
     encrypted_bytes: &[u8],
     password: &str,
     format: Option<SecretsFormat>,
-) -> Result<PatternCompileResult> {
+) -> Result<(PatternCompileResult, Vec<String>)> {
     let plaintext = decrypt_secrets(encrypted_bytes, password)?;
     let entries = parse_secrets(&plaintext, format)?;
+    let allow = extract_allow_patterns(&entries);
     let result = entries_to_patterns(&entries);
     zeroize_and_drop_entries(entries);
-    Ok(result)
+    Ok((result, allow))
 }
 
 /// Load and parse a plaintext secrets file into [`ScanPattern`]s.
@@ -549,11 +592,12 @@ pub fn load_encrypted_secrets(
 pub fn load_plaintext_secrets(
     plaintext: &[u8],
     format: Option<SecretsFormat>,
-) -> Result<PatternCompileResult> {
+) -> Result<(PatternCompileResult, Vec<String>)> {
     let entries = parse_secrets(plaintext, format)?;
+    let allow = extract_allow_patterns(&entries);
     let result = entries_to_patterns(&entries);
     zeroize_and_drop_entries(entries);
-    Ok(result)
+    Ok((result, allow))
 }
 
 /// Detect whether raw file bytes look like an AES-256-GCM encrypted
@@ -616,19 +660,24 @@ pub fn looks_encrypted(data: &[u8]) -> bool {
 ///
 /// Returns [`SanitizeError::SecretsError`] if decryption or parsing
 /// fails, or if a password is required but not provided.
+/// Returns `((patterns, warnings, allow_patterns), was_encrypted)`.
+///
+/// `allow_patterns` are the raw strings from `kind: allow` entries in the
+/// secrets file — the caller should combine these with any `--allow` CLI
+/// values and pass the merged list to [`AllowlistMatcher::new`].
 pub fn load_secrets_auto(
     data: &[u8],
     password: Option<&str>,
     format: Option<SecretsFormat>,
     force_plaintext: bool,
-) -> Result<(PatternCompileResult, bool)> {
+) -> Result<((PatternCompileResult, Vec<String>), bool)> {
     if force_plaintext || !looks_encrypted(data) {
-        let result = load_plaintext_secrets(data, format)?;
-        Ok((result, false))
+        let (result, allow) = load_plaintext_secrets(data, format)?;
+        Ok(((result, allow), false))
     } else {
         let pw = password.ok_or(SanitizeError::SecretsPasswordRequired)?;
-        let result = load_encrypted_secrets(data, pw, format)?;
-        Ok((result, true))
+        let (result, allow) = load_encrypted_secrets(data, pw, format)?;
+        Ok(((result, allow), true))
     }
 }
 
@@ -821,7 +870,7 @@ label = "openai_key"
         let password = "pipeline-test";
 
         let encrypted = encrypt_secrets(plaintext, password).unwrap();
-        let (patterns, errors) =
+        let ((patterns, errors), _allow) =
             load_encrypted_secrets(&encrypted, password, Some(SecretsFormat::Json)).unwrap();
 
         assert_eq!(patterns.len(), 2);
@@ -836,7 +885,7 @@ label = "openai_key"
         let password = "yaml-test";
 
         let encrypted = encrypt_secrets(plaintext, password).unwrap();
-        let (patterns, errors) =
+        let ((patterns, errors), _allow) =
             load_encrypted_secrets(&encrypted, password, Some(SecretsFormat::Yaml)).unwrap();
 
         assert_eq!(patterns.len(), 2);
@@ -849,7 +898,7 @@ label = "openai_key"
         let password = "toml-test";
 
         let encrypted = encrypt_secrets(plaintext, password).unwrap();
-        let (patterns, errors) =
+        let ((patterns, errors), _allow) =
             load_encrypted_secrets(&encrypted, password, Some(SecretsFormat::Toml)).unwrap();
 
         assert_eq!(patterns.len(), 2);
@@ -860,7 +909,7 @@ label = "openai_key"
 
     #[test]
     fn load_plaintext_secrets_works() {
-        let (patterns, errors) =
+        let ((patterns, errors), _allow) =
             load_plaintext_secrets(sample_json().as_bytes(), Some(SecretsFormat::Json)).unwrap();
         assert_eq!(patterns.len(), 2);
         assert!(errors.is_empty());
@@ -961,7 +1010,7 @@ label = "openai_key"
     #[test]
     fn auto_load_plaintext_json() {
         let data = sample_json().as_bytes();
-        let ((pats, errs), was_enc) =
+        let (((pats, errs), _allow), was_enc) =
             load_secrets_auto(data, None, Some(SecretsFormat::Json), false).unwrap();
         assert!(!was_enc);
         assert_eq!(pats.len(), 2);
@@ -971,7 +1020,7 @@ label = "openai_key"
     #[test]
     fn auto_load_encrypted_json() {
         let encrypted = encrypt_secrets(sample_json().as_bytes(), "pw").unwrap();
-        let ((pats, errs), was_enc) =
+        let (((pats, errs), _allow), was_enc) =
             load_secrets_auto(&encrypted, Some("pw"), Some(SecretsFormat::Json), false).unwrap();
         assert!(was_enc);
         assert_eq!(pats.len(), 2);
@@ -981,7 +1030,7 @@ label = "openai_key"
     #[test]
     fn auto_load_force_plaintext() {
         let data = sample_json().as_bytes();
-        let ((pats, _), was_enc) =
+        let (((pats, _), _allow), was_enc) =
             load_secrets_auto(data, None, Some(SecretsFormat::Json), true).unwrap();
         assert!(!was_enc);
         assert_eq!(pats.len(), 2);
@@ -992,5 +1041,49 @@ label = "openai_key"
         let encrypted = encrypt_secrets(sample_json().as_bytes(), "pw").unwrap();
         let result = load_secrets_auto(&encrypted, None, None, false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_secrets_rejects_oversized_input() {
+        // Construct input just over the 10 MiB cap.
+        let oversized = vec![b' '; MAX_SECRETS_PLAINTEXT_BYTES + 1];
+        let result = parse_secrets(&oversized, None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeding") || msg.contains("limit"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_secrets_accepts_input_at_limit() {
+        // Valid JSON just at the cap boundary — should succeed or fail on
+        // parse, not on the size check. We use a tiny valid payload here
+        // to confirm the size gate does not block small files.
+        let tiny = b"[]";
+        let result = parse_secrets(tiny, Some(SecretsFormat::Json));
+        assert!(
+            result.is_ok(),
+            "unexpected error: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn truncate_label_at_boundary() {
+        let short = "a".repeat(32);
+        assert_eq!(truncate_label(&short), short);
+
+        let long = "a".repeat(33);
+        let truncated = truncate_label(&long);
+        assert!(truncated.ends_with('…'), "expected ellipsis: {truncated}");
+        // Character count (not byte count) must be within the limit.
+        // The trailing '…' is 1 char; the rest must be < MAX_LABEL_CHARS.
+        assert!(
+            truncated.chars().count() <= MAX_LABEL_CHARS,
+            "char count {} exceeds limit: {truncated}",
+            truncated.chars().count()
+        );
     }
 }

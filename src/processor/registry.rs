@@ -36,7 +36,9 @@ impl ProcessorRegistry {
     #[must_use]
     pub fn with_builtins() -> Self {
         let mut reg = Self::new();
-        reg.register(Arc::new(super::key_value::KeyValueProcessor));
+        let kv: Arc<dyn Processor> = Arc::new(super::key_value::KeyValueProcessor);
+        reg.processors.insert("key_value".into(), Arc::clone(&kv));
+        reg.processors.insert("key-value".into(), kv);
         reg.register(Arc::new(super::json_proc::JsonProcessor));
         reg.register(Arc::new(super::jsonl_proc::JsonLinesProcessor));
         reg.register(Arc::new(super::yaml_proc::YamlProcessor));

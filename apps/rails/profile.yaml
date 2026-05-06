@@ -1,0 +1,73 @@
+# Ruby on Rails — database.yml, .env, config/secrets.yml
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  include: ["database.yml", "database.yaml"]
+  fields:
+    - pattern: "*.password"
+      category: custom:password
+      label: rails_db_password
+    - pattern: "*.username"
+      category: name
+      label: rails_db_username
+    - pattern: "*.host"
+      category: hostname
+      label: rails_db_host
+    - pattern: "*.url"
+      category: url
+      label: rails_db_url
+
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  include: ["secrets.yml", "secrets.yaml"]
+  fields:
+    - pattern: "*.secret_key_base"
+      category: auth_token
+      label: rails_secret_key_base
+    - pattern: "*.secret_token"
+      category: auth_token
+      label: rails_secret_token
+    - pattern: "*.devise_secret_key"
+      category: auth_token
+      label: rails_devise_secret
+    - pattern: "*.aws_access_key_id"
+      category: auth_token
+      label: aws_access_key_id
+    - pattern: "*.aws_secret_access_key"
+      category: auth_token
+      label: aws_secret_access_key
+    - pattern: "*.stripe_secret_key"
+      category: auth_token
+      label: stripe_secret_key
+
+- processor: env
+  extensions: [".env"]
+  include: [".env", ".env.local", ".env.production", ".env.staging",
+            ".env.development", ".env.test", "*.env"]
+  fields:
+    - pattern: "SECRET_KEY_BASE"
+      category: auth_token
+      label: rails_secret_key_base
+    - pattern: "DATABASE_URL"
+      category: url
+      label: rails_db_url
+    - pattern: "REDIS_URL"
+      category: url
+      label: rails_redis_url
+    - pattern: "*PASSWORD"
+      category: custom:password
+      label: env_password
+    - pattern: "*SECRET"
+      category: auth_token
+      label: env_secret
+    - pattern: "*_KEY"
+      category: auth_token
+      label: env_key
+    - pattern: "*TOKEN"
+      category: auth_token
+      label: env_token
+    - pattern: "AWS_ACCESS_KEY_ID"
+      category: auth_token
+      label: aws_access_key_id
+    - pattern: "AWS_SECRET_ACCESS_KEY"
+      category: auth_token
+      label: aws_secret_access_key

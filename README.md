@@ -162,6 +162,96 @@ A second prompt sets the **replacement strictness** (`Balanced` or `Aggressive`)
 
 For a full step-by-step breakdown of prompts and the exact categories/patterns generated, see the `sanitize guided` section in [docs/cli-reference.md](docs/cli-reference.md).
 
+### Quick Start — Built-in Patterns (`--default`, `--app`, `--allow`)
+
+**`--default`** — scan without writing a secrets file. Covers the most common high-value secrets: API keys (AWS, GCP, GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab, SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM headers, password/secret key=value pairs, and credential URLs.
+
+```bash
+# No secrets file required:
+sanitize data.log --default
+
+# Dry-run to see what would be replaced:
+sanitize data.log --default -n
+
+# Fail CI if anything is detected:
+sanitize config.yaml --default --fail-on-match
+```
+
+`--default` cannot be combined with `--secrets-file`. Use `--secrets-file` when you need custom patterns on top.
+
+**`--app`** — load a built-in bundle for a specific application. Each bundle provides both a secrets pattern set and a structured field profile so field-level sanitization works out of the box.
+
+Built-in bundles: `docker-compose`, `django`, `gitlab`, `kubernetes`, `nginx`, `postgresql`, `rails`, `spring-boot`.
+
+```bash
+# List available bundles (built-in and user-defined):
+sanitize apps
+
+# Sanitize a GitLab config file using the gitlab bundle:
+sanitize /etc/gitlab/gitlab.rb --app gitlab
+
+# Sanitize nginx virtual host configs:
+sanitize /etc/nginx/sites-enabled/ --app nginx
+
+# Combine multiple bundles in one run:
+sanitize gitlab.rb nginx.conf --app gitlab,nginx
+
+# Add a custom secrets file on top of an app bundle:
+sanitize gitlab.rb --app gitlab -s extra-secrets.yaml
+```
+
+**Installing custom app bundles** — add your own bundles with `sanitize apps add`:
+
+```bash
+# Install from a profile and a secrets file:
+sanitize apps add elastic \
+  --profile elastic.profile.yaml \
+  --secrets elastic.secrets.yaml
+
+# Use it immediately:
+sanitize app.log --app elastic
+
+# Show where bundles are stored:
+sanitize apps dir
+
+# Remove a custom bundle:
+sanitize apps remove elastic --yes
+```
+
+The first `# comment` line of either YAML file becomes the description shown in `sanitize apps`. User-defined bundles take precedence over built-ins with the same name, so you can also override a built-in by installing a custom bundle under the same name.
+
+**`--allow`** — suppress specific values from replacement. Allowed values pass through unchanged and are not recorded in the mapping store, so they will not propagate to other files in the same run.
+
+```bash
+# Exact match — never replace "localhost":
+sanitize data.log -s secrets.yaml --allow localhost
+
+# Glob — pass through all .internal hostnames:
+sanitize data.log -s secrets.yaml --allow "*.internal"
+
+# Multiple patterns:
+sanitize data.log -s secrets.yaml \
+  --allow localhost \
+  --allow "*.internal" \
+  --allow "192.168.1.*"
+```
+
+For project-stable allowlist entries, add them directly to your secrets file using `kind: allow`:
+
+```yaml
+# secrets.yaml
+- pattern: "*.internal"
+  kind: allow
+
+- pattern: "192.168.1.*"
+  kind: allow
+
+- pattern: "alice@corp\\.com"
+  kind: regex
+  category: email
+  label: alice_email
+```
+
 ### Quick Start — Stdin Pipes
 
 You can pipe data directly into `sanitize`:
@@ -290,6 +380,69 @@ let again = store.get_or_insert(&Category::Email, "alice@corp.com").unwrap();
 assert_eq!(sanitized, again);
 ```
 
+### As an MCP server
+
+Download the `sanitize-mcp` binary for your platform from the [Releases](https://github.com/kayelohbyte/rust-sanitize/releases) page (no Deno or Node required — the runtime is embedded).
+
+Add it to your MCP client config. Example for Claude Desktop (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "sanitize": {
+      "command": "/usr/local/bin/sanitize-mcp",
+      "env": {
+        "SANITIZE_BIN": "/usr/local/bin/sanitize"
+      }
+    }
+  }
+}
+```
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SANITIZE_BIN` | `sanitize` | Path to the `sanitize` binary |
+| `SANITIZE_MCP_MAX_CONTENT_BYTES` | `524288` (512 KB) | Per-call content size limit |
+| `SANITIZE_SECRETS_DIR` | _(unset)_ | Root directory for per-namespace secrets. Each subdirectory is a namespace and may contain `secrets.yaml` (or `.enc`), `profile.yaml`, and an optional `.password` file (`0600`/`0400` permissions enforced). |
+
+**Available tools:**
+
+| Tool | Key parameters | Description |
+|------|----------------|-------------|
+| `sanitize` | `content`, `secrets_file`, `patterns`, `seed`, `format`, `namespace`, `use_default`, `app`, `allow`, `extract_context`, `context_keywords`, `max_context_matches`, `context_lines`, `context_case_sensitive` | Sanitize sensitive values in text. Namespace takes priority over inline patterns/secrets file. Returns plain text or a `{ content, report }` object when `extract_context` is true. |
+| `scan` | `content`, `secrets_file`, `patterns`, `format`, `namespace`, `use_default`, `app`, `allow` | Scan text for sensitive values and return a structured match report without modifying content. |
+| `strip_config_values` | `content`, `delimiter`, `comment_prefix` | Strip values from a key/value config file, preserving keys, comments, and structure. |
+| `test_allowlist` | `patterns`, `values` | Test which values match a set of allowlist patterns. Returns per-value match results with the matched pattern and a summary count. Use this to verify `--allow` globs before running a full sanitization. |
+| `list_processors` | _(none)_ | Return the list of valid processor names for use in `format` parameters and profile YAML `processor` fields. |
+| `list_templates` | _(none)_ | List built-in LLM prompt templates. |
+
+**Namespace-based secrets (multi-tenant / MSP)**
+
+Set `SANITIZE_SECRETS_DIR` to a directory and create one subdirectory per customer or software type:
+
+```
+/var/sanitize/secrets/
+  acme-corp/
+    secrets.yaml        # or secrets.yaml.enc
+    profile.yaml        # optional structured-field profile
+    .password           # optional; must be chmod 0600
+  widgets-inc/
+    secrets.yaml.enc
+    .password
+```
+
+Pass `namespace: "acme-corp"` in `sanitize` or `scan` tool calls. The server loads only that namespace's secrets and profile, keeping pattern sets isolated and avoiding false positives across tenants.
+
+Alternatively, run from source with [Deno](https://deno.land) 2.x:
+
+```bash
+SANITIZE_BIN=/usr/local/bin/sanitize \
+  deno run --allow-run --allow-env --allow-read --allow-write \
+  mcp/src/index.ts
+```
+
 ### Requirements
 
 - Rust 1.74 or later (stable toolchain)
@@ -394,6 +547,44 @@ sanitize data.csv -s s.enc --password -d
 
 ```bash
 sanitize config.yaml -s s.enc -P /run/secrets/pw --fail-on-match
+```
+
+**Extract context from sanitized output (error/warning snippets for LLM sharing):**
+
+```bash
+sanitize app.log -s secrets.yaml --report report.json --extract-context
+sanitize app.log -s secrets.yaml --report report.json --extract-context --context-lines 20
+sanitize app.log -s secrets.yaml --report report.json --extract-context --max-context-matches 200
+sanitize app.log -s secrets.yaml --report report.json --extract-context --context-keywords timeout,oomkilled --context-case-sensitive
+```
+
+**Generate an LLM-ready prompt (sanitized content + structured summary):**
+
+```bash
+# Built-in troubleshoot template (default):
+sanitize app.log -s secrets.yaml --llm
+
+# Built-in review-config template:
+sanitize app.log -s secrets.yaml --llm review-config
+
+# Custom template file:
+sanitize app.log -s secrets.yaml --llm /path/to/prompt-template.txt
+
+# Combine with --extract-context to include notable events:
+sanitize app.log -s secrets.yaml --report /tmp/r.json --extract-context --llm troubleshoot
+```
+
+**Strip values from a config file (reveal structure without exposing secrets):**
+
+```bash
+# Default key=value format (delimiter is =):
+sanitize config.ini --strip-values -o config-stripped.ini
+
+# Colon-delimited (YAML-style, nginx-style):
+sanitize nginx.conf --strip-values --strip-delimiter : -o nginx-stripped.conf
+
+# C-style comments (// prefix):
+sanitize app.conf --strip-values --strip-comment-prefix // -o app-stripped.conf
 ```
 
 See [docs/cli-reference.md](docs/cli-reference.md) for the complete set of examples including archive processing, stdin pipes, dry-run, plaintext secrets, and custom chunk sizes.

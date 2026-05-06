@@ -56,6 +56,30 @@ use crate::processor::registry::ProcessorRegistry;
 use crate::scanner::{ScanStats, StreamScanner};
 use crate::store::MappingStore;
 
+/// Strip path components from a zip entry name that could cause the output
+/// archive to be extracted outside the intended directory by a naive consumer.
+///
+/// Removes: leading `/`, `./`, and any `../` sequences. The result is always
+/// a relative path with no upward traversal. An empty result is replaced with
+/// `"_"` to avoid writing an entry with a blank name.
+fn sanitize_zip_entry_name(name: &str) -> String {
+    // Normalise backslashes (Windows zips) to forward slashes.
+    let name = name.replace('\\', "/");
+    // Strip leading slashes and dots.
+    let name = name.trim_start_matches('/');
+    // Resolve each segment, dropping `.` and `..`.
+    let safe: Vec<&str> = name
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .collect();
+    let result = safe.join("/");
+    if result.is_empty() {
+        "_".to_string()
+    } else {
+        result
+    }
+}
+
 use glob::MatchOptions;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -769,7 +793,7 @@ impl ArchiveProcessor {
             if entry.is_dir() {
                 continue;
             }
-            let name = entry.name().to_string();
+            let name = sanitize_zip_entry_name(entry.name());
             let Some(profile) = self.find_profile(&name) else {
                 continue;
             };
@@ -997,7 +1021,7 @@ impl ArchiveProcessor {
                 total_uncompressed_size = total_uncompressed_size.saturating_add(size);
             }
             metas.push(ZipMeta {
-                name: entry.name().to_string(),
+                name: sanitize_zip_entry_name(entry.name()),
                 is_dir,
                 compression: entry.compression(),
                 last_modified: entry.last_modified(),
@@ -1759,5 +1783,51 @@ mod tests {
         let stats = proc.process_zip(reader, &mut writer).unwrap();
 
         assert_eq!(stats.files_processed, 0);
+    }
+
+    // sanitize_zip_entry_name
+
+    #[test]
+    fn zip_entry_name_clean_passthrough() {
+        assert_eq!(sanitize_zip_entry_name("logs/app.log"), "logs/app.log");
+        assert_eq!(sanitize_zip_entry_name("config.yaml"), "config.yaml");
+        assert_eq!(sanitize_zip_entry_name("a/b/c.txt"), "a/b/c.txt");
+    }
+
+    #[test]
+    fn zip_entry_name_strips_leading_slash() {
+        assert_eq!(sanitize_zip_entry_name("/etc/passwd"), "etc/passwd");
+        assert_eq!(sanitize_zip_entry_name("///etc/passwd"), "etc/passwd");
+    }
+
+    #[test]
+    fn zip_entry_name_strips_dotdot() {
+        assert_eq!(sanitize_zip_entry_name("../etc/passwd"), "etc/passwd");
+        assert_eq!(sanitize_zip_entry_name("a/../../etc/passwd"), "a/etc/passwd");
+        assert_eq!(sanitize_zip_entry_name("../../root/.ssh/id_rsa"), "root/.ssh/id_rsa");
+    }
+
+    #[test]
+    fn zip_entry_name_strips_leading_dot_slash() {
+        assert_eq!(sanitize_zip_entry_name("./config.yaml"), "config.yaml");
+        assert_eq!(sanitize_zip_entry_name("././config.yaml"), "config.yaml");
+    }
+
+    #[test]
+    fn zip_entry_name_backslash_normalised() {
+        assert_eq!(sanitize_zip_entry_name("a\\b\\c.txt"), "a/b/c.txt");
+        assert_eq!(sanitize_zip_entry_name("..\\etc\\passwd"), "etc/passwd");
+    }
+
+    #[test]
+    fn zip_entry_name_empty_result_replaced() {
+        assert_eq!(sanitize_zip_entry_name("../.."), "_");
+        assert_eq!(sanitize_zip_entry_name(""), "_");
+        assert_eq!(sanitize_zip_entry_name("/"), "_");
+    }
+
+    #[test]
+    fn zip_entry_name_absolute_dotdot_combo() {
+        assert_eq!(sanitize_zip_entry_name("/../etc/passwd"), "etc/passwd");
     }
 }

@@ -25,6 +25,7 @@
 //!
 //! An optional `capacity_limit` can be set to prevent unbounded growth.
 
+use crate::allowlist::AllowlistMatcher;
 use crate::category::Category;
 use crate::error::{Result, SanitizeError};
 use crate::generator::ReplacementGenerator;
@@ -93,6 +94,9 @@ pub struct MappingStore {
     len: AtomicUsize,
     /// Optional upper bound on the number of mappings.
     capacity_limit: Option<usize>,
+    /// Optional allowlist — matched values pass through unchanged and are
+    /// not recorded in the forward map.
+    allowlist: Option<Arc<AllowlistMatcher>>,
 }
 
 impl MappingStore {
@@ -111,7 +115,30 @@ impl MappingStore {
             generator,
             len: AtomicUsize::new(0),
             capacity_limit,
+            allowlist: None,
         }
+    }
+
+    /// Create a new store with an allowlist. Values matching the allowlist
+    /// are returned unchanged and never recorded in the forward map.
+    #[must_use]
+    pub fn new_with_allowlist(
+        generator: Arc<dyn ReplacementGenerator>,
+        capacity_limit: Option<usize>,
+        allowlist: Arc<AllowlistMatcher>,
+    ) -> Self {
+        Self {
+            forward: DashMap::with_capacity(1024),
+            generator,
+            len: AtomicUsize::new(0),
+            capacity_limit,
+            allowlist: Some(allowlist),
+        }
+    }
+
+    /// Return the allowlist attached to this store, if any.
+    pub fn allowlist(&self) -> Option<&Arc<AllowlistMatcher>> {
+        self.allowlist.as_ref()
     }
 
     // ---------------- Core API ----------------
@@ -134,6 +161,13 @@ impl MappingStore {
     /// Returns [`SanitizeError::CapacityExceeded`] if the store has
     /// reached its configured capacity limit.
     pub fn get_or_insert(&self, category: &Category, original: &str) -> Result<CompactString> {
+        // Allowlist check: return the original value unchanged without recording it.
+        if let Some(al) = &self.allowlist {
+            if al.is_allowed(original) {
+                return Ok(CompactString::new(original));
+            }
+        }
+
         // Fast path: already mapped (lock-free read).
         // Zeroizing<String> ensures this temporary key is overwritten on drop.
         let key = ForwardKey {

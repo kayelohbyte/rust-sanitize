@@ -1,0 +1,8 @@
+# .gitlab-ci.yml — redact CI/CD variables whose names indicate secrets
+- processor: yaml
+  extensions: [".yml", ".yaml"]
+  include: [".gitlab-ci.yml", "gitlab-ci.yml", "*/.gitlab-ci.yml"]
+  fields:
+    - pattern: "variables.*"
+      category: auth_token
+      label: ci_variable

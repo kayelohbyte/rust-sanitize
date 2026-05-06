@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-05
+
+### Added
+
+- **`--default` flag** — scan without a secrets file using built-in balanced patterns. Covers API keys (AWS, GCP, GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab, SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM headers, password/secret key=value pairs, and credential URLs. Cannot be combined with `--secrets-file`.
+
+- **`--app <APPS>` flag** — load built-in app bundles (comma-separated). Each bundle provides app-specific secrets patterns and a structured field profile. Additive with `--default`, `--secrets-file`, and `--profile`. Eight built-in bundles: `docker-compose`, `django`, `gitlab`, `kubernetes`, `nginx`, `postgresql`, `rails`, `spring-boot`.
+
+- **`--allow <PATTERN>` flag** — suppress specific values from replacement (repeatable). Matched values pass through unchanged and are not recorded in the mapping store, so they will not propagate to other files in the same run. Supports exact strings and `*` glob wildcards (`*.internal`, `192.168.1.*`).
+
+- **`kind: allow` in secrets files** — allowlist entries can be placed in the secrets file alongside `kind: regex` and `kind: literal` entries. Patterns support the same `*` glob syntax as `--allow`. Entries from the secrets file and `--allow` flags are merged at runtime.
+
+- **`sanitize apps` subcommands** — `sanitize apps` now dispatches to four sub-subcommands:
+  - `sanitize apps` (no subcommand) — list built-in and user-defined bundles.
+  - `sanitize apps add <NAME> [--profile FILE] [--secrets FILE] [--overwrite]` — install a custom app bundle from local YAML files. Both files are validated before anything is written to disk.
+  - `sanitize apps remove <NAME> [--yes]` — remove a custom app bundle. Built-in bundles are protected. Requires `--yes` to confirm.
+  - `sanitize apps dir` — print the user apps directory (`$SANITIZE_APPS_DIR` or `~/.config/sanitize/apps`).
+
+- **`sanitize allow-test` subcommand** — test allowlist patterns against values before a full run. Accepts `--allow` patterns, positional values or stdin (one per line), and `--json` for machine-readable output. Shows which pattern matched each value and a summary count.
+
+- **`sanitize template` subcommand** — generate a starter secrets template YAML for a preset use case (`generic`, `web`, `k8s`, `database`, `aws`). Output defaults to `secrets.template.<preset>.yaml`.
+
+- **`AllowlistMatcher`** — new public type in `sanitize_engine::allowlist`. Compiles `*`-glob and exact patterns; `is_allowed()` and `match_pattern()` methods; atomic seen-counter; regex-character warning on construction.
+
+- **`AllowlistMatcher::match_pattern`** — returns the first matching pattern string (not just a bool), used by `allow-test` to show which pattern matched.
+
+- **`MappingStore::new_with_allowlist`** — constructs a store with an injected `AllowlistMatcher`. Allowlist check happens inside `get_or_insert` before any replacement is recorded, so allowed values never enter the forward map or Phase 2 augmentation.
+
+- **MCP: `use_default`, `app`, `allow` parameters** — `sanitize` and `scan` tools now expose all three new flags. `use_default` is validated in TypeScript before spawning the subprocess (conflicts with `secrets_file`, `namespace`, and `patterns` are caught early with a clear error message).
+
+- **MCP: `test_allowlist` tool** — accepts `patterns: string[]` and `values: string[]`, delegates to `sanitize allow-test --json`, and returns structured match results.
+
+- **`--strip-delimiter <DELIM>` flag** — sets the delimiter used to split key/value lines when `--strip-values` is active. Default: `=`. Use `--strip-delimiter :` for YAML-style or nginx-style configs. Requires `--strip-values`.
+
+- **`--strip-comment-prefix <PREFIX>` flag** — sets the line prefix that marks a comment when `--strip-values` is active. Default: `#`. Requires `--strip-values`.
+
+- **`--max-context-matches <N>` flag** — caps keyword matches captured per file when `--extract-context` is active. Default: `50`.
+
+- **`--context-case-sensitive` flag** — makes keyword matching case-sensitive when `--extract-context` is active.
+
+- **MCP server (`mcp/`)** — Deno-based MCP server wrapping the `sanitize` binary as a subprocess. Ships as a standalone binary for Linux x64, macOS x64, macOS arm64, and Windows. Tools: `sanitize`, `scan`, `strip_config_values`, `test_allowlist`, `list_processors`, `list_templates`.
+
+- **MCP: `namespace` parameter** — per-namespace secrets resolution from `$SANITIZE_SECRETS_DIR/<namespace>/`.
+
+- **Test suites** — `tests/allow_test_cli_tests.rs` (11 tests), `tests/apps_cli_tests.rs` (19 tests), `tests/strip_values_cli_tests.rs` (6 tests); new unit tests for `AllowlistMatcher::match_pattern`, glob edge cases, `sanitize_zip_entry_name`, `parse_secrets` size cap, and `truncate_label` boundary.
+
+### Fixed
+
+- **Zip entry name traversal** — zip entry names are now sanitised on read: leading `/`, `./`, and `../` segments are stripped. A crafted archive with entry names like `../../etc/passwd` would previously propagate those names into the output zip; they are now normalised to safe relative paths.
+
+- **Secrets file size cap** — `parse_secrets` now rejects inputs larger than 10 MiB before attempting deserialization, preventing OOM from accidentally passing a large binary or log file as a secrets file.
+
+### Changed
+
+- **`sanitize apps` is now a subcommand group** — previously `sanitize apps` was a bare list command. It now accepts `add`, `remove`, and `dir` sub-subcommands. The bare `sanitize apps` (no subcommand) still lists bundles.
+
+- **`validate_app_name` error messages** — now name the specific invalid character rather than giving a generic character-class description.
+
+- **`truncate_label` magic number replaced** — `31`/`32` replaced with `MAX_LABEL_CHARS = 32` constant.
+
 ## [0.4.0] — 2026-05-01
 
 ### Added
@@ -173,5 +233,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **290+ tests** including unit, integration, property-based (proptest), and
   4 fuzz targets.
 
+[Unreleased]: https://github.com/kayelohbyte/rust-sanitize/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/kayelohbyte/rust-sanitize/releases/tag/v0.4.0
+[0.3.0]: https://github.com/kayelohbyte/rust-sanitize/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kayelohbyte/rust-sanitize/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kayelohbyte/rust-sanitize/releases/tag/v0.1.0

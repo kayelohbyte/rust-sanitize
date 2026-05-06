@@ -6,6 +6,12 @@
 sanitize [OPTIONS] [INPUT]...
 command | sanitize [OPTIONS]
 sanitize guided
+sanitize apps
+sanitize apps add <NAME> [OPTIONS]
+sanitize apps remove <NAME> [OPTIONS]
+sanitize apps dir
+sanitize allow-test --allow <PATTERN>... [VALUE]...
+sanitize template [OPTIONS]
 sanitize encrypt [OPTIONS] <INPUT> <OUTPUT>
 sanitize decrypt [OPTIONS] <INPUT> <OUTPUT>
 ```
@@ -207,6 +213,224 @@ Notes:
 - GCP patterns currently use `custom:gcp_*` categories (no built-in GCP formatter yet).
 - The generated profile file contains no secrets and is safe to commit to version control.
 
+### `sanitize apps`
+
+Manage app bundles: list available bundles, install custom ones, remove them, or show the storage directory.
+
+```
+sanitize apps
+sanitize apps add <NAME> [OPTIONS]
+sanitize apps remove <NAME> [OPTIONS]
+sanitize apps dir
+```
+
+#### `sanitize apps` (list)
+
+Prints built-in and user-defined bundles. Use the name with `--app` to load the bundle.
+
+```bash
+sanitize apps
+# Built-in app bundles (use with --app <name>):
+#
+#   docker-compose     Docker Compose — compose.yml environment variables...
+#   django             Django — .env files, SECRET_KEY, database credentials...
+#   gitlab             GitLab — CI/CD logs, runner output, .gitlab-ci.yml variables
+#   kubernetes         Kubernetes — kubeconfig credentials, Secret manifests...
+#   nginx              Nginx — nginx.conf virtual hosts, proxy upstreams...
+#   postgresql         PostgreSQL — postgresql.conf, connection strings, pg logs
+#   rails              Ruby on Rails — database.yml, .env, config/secrets.yml
+#   spring-boot        Spring Boot — application.yml, application.properties...
+
+# Use a single bundle:
+sanitize config.rb --app gitlab -s secrets.yaml
+
+# Combine multiple bundles in one run:
+sanitize nginx.conf gitlab.rb --app nginx,gitlab
+
+# Combine a bundle with a custom secrets file and profile:
+sanitize config.rb app.log --app gitlab -s extra-secrets.yaml --profile custom.profile.yaml
+```
+
+Each app bundle includes:
+- A set of secrets patterns compiled into the scanner alongside any `--secrets-file` patterns.
+- A structured field profile merged with any `--profile` you supply.
+
+#### `sanitize apps add`
+
+Install a custom app bundle from local YAML files. At least one of `--profile` or `--secrets` must be supplied. Both files are validated before anything is written to disk.
+
+```
+sanitize apps add <NAME> [--profile FILE] [--secrets FILE] [--overwrite]
+```
+
+| Flag | Description |
+|------|-------------|
+| `<NAME>` | Bundle name (letters, digits, hyphens, underscores; must start with a letter or digit). |
+| `--profile <FILE>` | Path to a profile YAML file (`Vec<FileTypeProfile>`). |
+| `--secrets <FILE>` | Path to a secrets YAML file (`Vec<SecretEntry>`). |
+| `--overwrite` | Replace an existing custom bundle with the same name. |
+
+```bash
+# Install from a profile and a secrets file:
+sanitize apps add elastic \
+  --profile elastic.profile.yaml \
+  --secrets elastic.secrets.yaml
+
+# Profile only (no scanner patterns):
+sanitize apps add myapp --profile myapp.profile.yaml
+
+# Secrets only (no structured field rules):
+sanitize apps add myapp --secrets myapp.secrets.yaml
+
+# Replace an existing custom bundle:
+sanitize apps add elastic --profile elastic.profile.yaml --overwrite
+
+# Use it immediately after installing:
+sanitize app.log --app elastic
+```
+
+The bundle is stored under the user apps directory (see `sanitize apps dir`). The first `# comment` line of either YAML file becomes the description shown in `sanitize apps`.
+
+#### `sanitize apps remove`
+
+Remove a custom app bundle. Built-in bundles cannot be removed.
+
+```
+sanitize apps remove <NAME> [--yes]
+```
+
+| Flag | Description |
+|------|-------------|
+| `<NAME>` | Name of the custom bundle to remove. |
+| `--yes` / `-y` | Confirm removal. Required — the command refuses to delete without it. |
+
+```bash
+# Remove a custom bundle (--yes required):
+sanitize apps remove elastic --yes
+
+# Short form:
+sanitize apps remove elastic -y
+```
+
+#### `sanitize apps dir`
+
+Print the path to the user apps directory. Bundles are stored one subdirectory per app name.
+
+```bash
+sanitize apps dir
+# /Users/alice/.config/sanitize/apps
+
+# Override the location with an environment variable:
+SANITIZE_APPS_DIR=/opt/sanitize/apps sanitize apps dir
+```
+
+You can also drop bundle directories manually without using `sanitize apps add`:
+
+```
+~/.config/sanitize/apps/
+  elastic/
+    secrets.yaml      # Vec<SecretEntry>
+    profile.yaml      # Vec<FileTypeProfile> (optional)
+  myapp/
+    profile.yaml
+```
+
+The directory name is the app name. `SANITIZE_APPS_DIR` overrides the default location. User-defined bundles take precedence over built-in bundles with the same name.
+
+### `sanitize allow-test`
+
+Test which values match your allowlist patterns before committing to a full sanitization run.
+
+```
+sanitize allow-test --allow <PATTERN>... [VALUE]...
+```
+
+| Flag / Argument | Description |
+|-----------------|-------------|
+| `--allow <PATTERN>` | Allowlist pattern to test (repeatable). Supports exact strings and `*` glob wildcards. |
+| `[VALUE]...` | Values to test. If omitted, values are read from stdin one per line. |
+| `--json` | Output results as JSON instead of human-readable text. |
+| `-h, --help` | Print help. |
+
+Each value is printed with `✓` (matched — would pass through unchanged) or `✗` (no match — would be replaced), and the matching pattern is shown alongside hits.
+
+```bash
+# Test a glob pattern against specific values:
+sanitize allow-test --allow '*.internal' db.internal github.com staging.db.internal
+
+# ✓  db.internal                               → *.internal
+# ✗  github.com                                (no match)
+# ✓  staging.db.internal                       → *.internal
+#
+# 2/3 values allowed
+
+# Test multiple patterns at once:
+sanitize allow-test \
+  --allow localhost \
+  --allow '*.internal' \
+  --allow '192.168.1.*' \
+  db.internal 192.168.1.5 8.8.8.8
+
+# Feed values from a file (one per line):
+cut -f3 app.log | sort -u | sanitize allow-test --allow '*.internal' --allow localhost
+
+# Machine-readable output for scripting:
+sanitize allow-test --allow '*.internal' db.internal github.com --json
+```
+
+JSON output shape:
+
+```json
+{
+  "results": [
+    { "value": "db.internal",  "allowed": true,  "pattern": "*.internal" },
+    { "value": "github.com",   "allowed": false }
+  ],
+  "summary": { "total": 2, "allowed": 1, "blocked": 1 }
+}
+```
+
+### `sanitize template`
+
+Generate a starter secrets-template YAML file for a given use case.
+
+```
+sanitize template [OPTIONS]
+```
+
+| Flag / Argument | Description |
+|-----------------|-------------|
+| `--preset <PRESET>` | Which template to generate. Choices: `generic` (default), `web`, `k8s`, `database`, `aws`. |
+| `-o, --output <FILE>` | Output path (default: `secrets.template.yaml`). |
+| `--overwrite` | Overwrite the output file if it already exists. |
+| `-h, --help` | Print help. |
+
+**Presets:**
+
+| Preset | Contents |
+|--------|----------|
+| `generic` | Common secrets: tokens, emails, IPs, hostnames — a good starting point for most log types. |
+| `web` | Web-app logs: JWTs, session IDs, OAuth tokens, emails, URLs. |
+| `k8s` | Kubernetes configs: service-account tokens, namespaces, container IDs. |
+| `database` | Database configs: passwords, connection strings (postgres/mysql/mongo/redis), usernames. |
+| `aws` | AWS: access key IDs (`AKIA`/`ASIA`), secret access keys, ARNs, account IDs, EC2 instance IDs. |
+
+Templates contain commented-out examples and inline guidance so you can uncomment and adapt the entries you need.
+
+```bash
+# Generic template → secrets.template.yaml (default):
+sanitize template
+
+# Web-app template → secrets.template.yaml:
+sanitize template --preset web
+
+# Kubernetes template to a custom path:
+sanitize template --preset k8s -o k8s-secrets.yaml
+
+# AWS template, overwrite if already exists:
+sanitize template --preset aws --overwrite
+```
+
 ### Default Mode — Sanitize
 
 | Flag / Argument | Short | Description |
@@ -231,6 +455,9 @@ Notes:
 | `--max-structured-size <BYTES>` | | Maximum structured file size in bytes before falling back to streaming (default: `268435456` = 256 MiB). |
 | `--max-archive-depth <N>` | | Maximum nesting depth for recursive archive processing (default: `3`, max: `10`). Each nesting level may buffer up to 256 MiB. |
 | `--profile <FILE>` | | Path to a file-type profile (JSON or YAML). Enables structured field-level sanitization for matched files. See [Structured Processing](structured-processing.md). |
+| `--default` | | Use built-in balanced detection patterns without a secrets file. Covers API keys (AWS, GCP, GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab, SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM headers, password/secret key=value pairs, and credential URLs. Cannot be combined with `--secrets-file`. |
+| `--app <APPS>` | | Load built-in secrets patterns and structured field profiles for one or more applications. Comma-separated app names (e.g. `--app gitlab` or `--app gitlab,nginx`). Additive with `--default`, `--secrets-file`, and `--profile`. Run `sanitize apps` to list available app names. |
+| `--allow <PATTERN>` | | Allow a specific value through unchanged (repeatable). Matched values are not replaced and not recorded in the mapping store — they will pass through in every file processed in the same run. Supports exact strings and `*` glob patterns. Examples: `--allow localhost`, `--allow "*.internal"`, `--allow "192.168.1.*"`. Allowlist entries can also be placed in the secrets file as `kind: allow` entries. |
 | `--only <PATTERN>` | | Keep only archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--only` flags accumulate. Combined with `--exclude`: `--only` narrows first, then `--exclude` removes. Only affects archive inputs; ignored for plain files. |
 | `--exclude <PATTERN>` | | Remove archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--exclude` flags accumulate. |
 | `--log-format <FMT>` | | Log output format: `human` (default) or `json`. |
@@ -241,8 +468,12 @@ Notes:
 | `--context-lines <N>` | | Lines of context to capture before and after each keyword match when `--extract-context` is set. Default: `10`. |
 | `--context-keywords <KEYWORDS>` | | Comma-separated list of keywords to scan for when `--extract-context` is set. Merged with the built-in defaults (`error`, `failure`, `warning`, `warn`, `fatal`, `exception`, `critical`) unless `--context-keywords-only` is also passed. Example: `--context-keywords timeout,oomkilled,backoff`. |
 | `--context-keywords-only` | | When set, `--context-keywords` replaces the built-in default keyword list entirely instead of being merged with it. Has no effect without `--context-keywords`. |
+| `--max-context-matches <N>` | | Maximum number of keyword matches to capture per file when `--extract-context` is set. Default: `50`. Once this cap is hit, `truncated: true` is set in `log_context` and the rest of the file is skipped. Increase this (not `--context-lines`) when you are missing events. |
+| `--context-case-sensitive` | | Make keyword matching case-sensitive when `--extract-context` is set. By default keywords are matched case-insensitively (`error` matches `ERROR`, `Error`, etc.). |
 | `--force-text` | | Bypass all structured processors (JSON, YAML, XML, TOML, etc.) and run only the streaming scanner on every file. Use when you want a guarantee that every byte is pattern-scanned regardless of file type. |
 | `--strip-values` | | Strip all values from structured output, emitting only keys and structure. Useful for generating a profile template from a real config file without exposing any values. Bypasses the sanitization pipeline — no secrets file is required. |
+| `--strip-delimiter <DELIM>` | | Delimiter string used to split key/value lines when `--strip-values` is set. Default: `=`. Use `--strip-delimiter :` for YAML-style or nginx-style config files. Requires `--strip-values`. |
+| `--strip-comment-prefix <PREFIX>` | | Line prefix that marks a comment when `--strip-values` is set. Comment lines are preserved verbatim. Default: `#`. Use `--strip-comment-prefix //` for C-style or nginx-style comment lines. Requires `--strip-values`. |
 | `-h, --help` | `-h` | Print help. |
 | `-V, --version` | `-V` | Print version. |
 
@@ -493,6 +724,45 @@ sanitize config.yaml -s s.enc --encrypted-secrets -P /run/secrets/pw --fail-on-m
 
 # Read password from a file:
 sanitize data.log -s s.enc --encrypted-secrets -P /run/secrets/pw
+
+# Extract context from sanitized output (capture surrounding lines for each error/warning):
+sanitize app.log -s secrets.yaml --report report.json --extract-context
+
+# Increase captured context window from default 10 to 20 lines:
+sanitize app.log -s secrets.yaml --report report.json --extract-context --context-lines 20
+
+# Increase match cap (default 50) to capture more events before truncation:
+sanitize app.log -s secrets.yaml --report report.json --extract-context --max-context-matches 200
+
+# Case-sensitive keyword matching (default is case-insensitive):
+sanitize app.log -s secrets.yaml --report report.json --extract-context --context-case-sensitive
+
+# Custom keywords merged with defaults:
+sanitize app.log -s secrets.yaml --report report.json --extract-context --context-keywords timeout,oomkilled,backoff
+
+# Use only custom keywords, suppress built-in defaults:
+sanitize app.log -s secrets.yaml --report report.json --extract-context --context-keywords "timeout,oomkilled" --context-keywords-only
+
+# Strip values from a key=value config file (default delimiter is =):
+sanitize config.ini -s secrets.yaml --strip-values -o config-stripped.ini
+
+# Strip values using a colon delimiter (e.g. YAML-style or nginx-style configs):
+sanitize nginx.conf -s secrets.yaml --strip-values --strip-delimiter : -o nginx-stripped.conf
+
+# Strip values with C-style comment lines (// prefix):
+sanitize app.conf -s secrets.yaml --strip-values --strip-comment-prefix // -o app-stripped.conf
+
+# Generate a sanitized LLM-ready prompt with built-in troubleshoot template:
+sanitize app.log -s secrets.yaml --llm
+
+# Use a specific LLM template:
+sanitize app.log -s secrets.yaml --llm review-config
+
+# Use a custom template file:
+sanitize app.log -s secrets.yaml --llm /path/to/my-template.txt
+
+# Combine LLM output with context extraction for notable events:
+sanitize app.log -s secrets.yaml --report /tmp/report.json --extract-context --llm troubleshoot
 ```
 
 ### `sanitize encrypt`
@@ -545,10 +815,10 @@ Compatibility formats: JSON and TOML remain fully supported for existing workflo
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `pattern` | Yes | — | The string to match. Interpreted as a regex or literal depending on `kind`. |
-| `kind` | No | `"literal"` | `"regex"` for regular expression matching, or `"literal"` for exact string matching. |
-| `category` | No | `"custom:secret"` | Controls replacement format. Built-in values: `email`, `name`, `phone`, `ipv4`, `ipv6`, `credit_card`, `ssn`, `hostname`, `mac_address`, `container_id`, `uuid`, `jwt`, `auth_token`, `file_path`, `windows_sid`, `url`, `aws_arn`, `azure_resource_id`. Use `custom:<tag>` for arbitrary categories. |
-| `label` | No | Truncated `pattern` | Human-readable label for reporting and statistics. |
+| `pattern` | Yes | — | The string to match. Interpreted as a regex or literal depending on `kind`. For `kind: allow` entries, `*` is treated as a glob wildcard. |
+| `kind` | No | `"literal"` | `"regex"` for regular expression matching, `"literal"` for exact string matching, or `"allow"` to pass the value through unchanged (see below). |
+| `category` | No | `"custom:secret"` | Controls replacement format. Built-in values: `email`, `name`, `phone`, `ipv4`, `ipv6`, `credit_card`, `ssn`, `hostname`, `mac_address`, `container_id`, `uuid`, `jwt`, `auth_token`, `file_path`, `windows_sid`, `url`, `aws_arn`, `azure_resource_id`. Use `custom:<tag>` for arbitrary categories. Ignored for `kind: allow` entries. |
+| `label` | No | Truncated `pattern` | Human-readable label for reporting and statistics. Ignored for `kind: allow` entries. |
 
 ### YAML format (canonical)
 
@@ -563,6 +833,43 @@ Compatibility formats: JSON and TOML remain fully supported for existing workflo
   category: "custom:api_key"
   label: openai_key
 ```
+
+### Allowlist entries (`kind: allow`)
+
+Use `kind: allow` to suppress specific values from sanitization. A value matching an allow entry passes through the output unchanged and is **not** recorded in the mapping store — so it will not be propagated as a discovered literal in Phase 2.
+
+`pattern` supports exact strings and `*` glob wildcards (same as `--allow`). `category` and `label` are ignored.
+
+```yaml
+# Exact match — the literal string "localhost" is never replaced:
+- pattern: "localhost"
+  kind: allow
+
+# Glob — any hostname ending with ".internal" passes through:
+- pattern: "*.internal"
+  kind: allow
+
+# Glob — any IP in the 192.168.1.0/24 range passes through:
+- pattern: "192.168.1.*"
+  kind: allow
+
+# Prefix+suffix glob — internal test accounts are not redacted:
+- pattern: "user-*@corp.com"
+  kind: allow
+```
+
+`kind: allow` entries can be freely mixed with `kind: regex` and `kind: literal` entries in the same file. They are filtered out before the scanner is built, so they have no effect on pattern matching — only on the replacement gate inside the mapping store.
+
+Equivalent via CLI (for ad-hoc runs without editing the secrets file):
+
+```bash
+sanitize data.log -s secrets.yaml \
+  --allow localhost \
+  --allow "*.internal" \
+  --allow "192.168.1.*"
+```
+
+Both sources are merged: patterns from `kind: allow` entries in the secrets file are combined with `--allow` values from the command line.
 
 ### JSON format (compatibility)
 
@@ -747,7 +1054,7 @@ sanitize app.log -s secrets.yaml --report report.json \
 }
 ```
 
-`log_context` is omitted entirely from a file entry when `--extract-context` was not used. `truncated: true` means `max_matches` (default 50) was hit before the end of the file; increase `--context-lines` is not the right knob here — truncation is about total match count, not window size.
+`log_context` is omitted entirely from a file entry when `--extract-context` was not used. `truncated: true` means `--max-context-matches` (default 50) was hit before the end of the file — increase `--max-context-matches`, not `--context-lines`. Truncation is about total match count, not window size.
 
 **Read password from a file (avoids shell history and /proc exposure):**
 

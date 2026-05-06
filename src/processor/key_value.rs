@@ -27,6 +27,9 @@
 //! |                       |         | delimiter alongside a `=`-delimited file.    |
 //! | `comment_prefix`      | `"#"`   | Lines starting with this (after whitespace)  |
 //! |                  |         | are treated as comments and preserved as-is. |
+//! | `value_strip_suffix`  | *(none)*| Strip this suffix from value before          |
+//! |                       |         | sanitizing and re-append it afterwards.      |
+//! |                       |         | Use `";"` for nginx-style `key value;` files.|
 //!
 //! # Heredoc / Sub-processor Support
 //!
@@ -85,7 +88,7 @@ impl Processor for KeyValueProcessor {
     }
 
     fn can_handle(&self, _content: &[u8], profile: &FileTypeProfile) -> bool {
-        profile.processor == "key_value"
+        matches!(profile.processor.as_str(), "key_value" | "key-value")
     }
 
     fn process(
@@ -111,6 +114,10 @@ impl Processor for KeyValueProcessor {
             .options
             .get("secondary_delimiter")
             .map(|s| s.as_str());
+        let value_strip_suffix = profile
+            .options
+            .get("value_strip_suffix")
+            .map(|s| s.as_str());
 
         let mut output = String::with_capacity(text.len());
         let mut state = LineState::Normal;
@@ -123,6 +130,7 @@ impl Processor for KeyValueProcessor {
                 delimiter,
                 comment_prefix,
                 secondary_delimiter,
+                value_strip_suffix,
                 profile,
                 store,
             )?;
@@ -146,7 +154,7 @@ impl Processor for KeyValueProcessor {
 // Per-line processing (extracted to stay within clippy line limit)
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn process_line(
     line: &str,
     state: &mut LineState,
@@ -154,6 +162,7 @@ fn process_line(
     delimiter: &str,
     comment_prefix: &str,
     secondary_delimiter: Option<&str>,
+    value_strip_suffix: Option<&str>,
     profile: &FileTypeProfile,
     store: &MappingStore,
 ) -> Result<()> {
@@ -184,10 +193,16 @@ fn process_line(
                 output.push('\n');
                 return Ok(());
             }
-            if let Some(delim_pos) = line.find(delimiter) {
-                let raw_key = &line[..delim_pos];
-                let after_delim = &line[delim_pos + delimiter.len()..];
-                let key = raw_key.trim();
+            // Search for the delimiter in the indent-stripped line so that
+            // indented directives (e.g. nginx `    proxy_pass URL;`) are found
+            // even when the delimiter is a space character.
+            let line_body = line.trim_start();
+            let indent_len = line.len() - line_body.len();
+            if let Some(delim_pos) = line_body.find(delimiter) {
+                // raw_key preserves leading indent for faithful output reconstruction.
+                let raw_key = &line[..indent_len + delim_pos];
+                let after_delim = &line_body[delim_pos + delimiter.len()..];
+                let key = line_body[..delim_pos].trim();
                 if let Some(rule) = find_matching_rule(key, profile) {
                     if rule.sub_processor.is_some() {
                         if let Some((marker, _)) = detect_heredoc(after_delim) {
@@ -215,15 +230,33 @@ fn process_line(
                     }
                     let raw_value = after_delim.trim();
                     let (quote_char, inner) = detect_quotes(raw_value);
-                    let replaced = replace_value(inner, rule, store)?;
-                    emit_replaced(
-                        raw_key,
-                        delimiter,
-                        after_delim,
-                        quote_char,
-                        &replaced,
-                        output,
-                    );
+                    let (sanitize_inner, suffix) = match value_strip_suffix {
+                        Some(sfx) if inner.ends_with(sfx) => {
+                            (&inner[..inner.len() - sfx.len()], sfx)
+                        }
+                        _ => (inner, ""),
+                    };
+                    let replaced = replace_value(sanitize_inner, rule, store)?;
+                    if suffix.is_empty() {
+                        emit_replaced(
+                            raw_key,
+                            delimiter,
+                            after_delim,
+                            quote_char,
+                            &replaced,
+                            output,
+                        );
+                    } else {
+                        emit_replaced_with_suffix(
+                            raw_key,
+                            delimiter,
+                            after_delim,
+                            quote_char,
+                            &replaced,
+                            suffix,
+                            output,
+                        );
+                    }
                     return Ok(());
                 }
             }

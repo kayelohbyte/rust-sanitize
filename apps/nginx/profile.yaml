@@ -1,0 +1,33 @@
+# nginx — nginx.conf, virtual host configs, proxy upstreams, server names
+- processor: key-value
+  extensions: [".conf"]
+  include: ["nginx.conf", "*.conf"]
+  options:
+    delimiter: " "
+    comment_prefix: "#"
+    value_strip_suffix: ";"
+  fields:
+    - pattern: "server_name"
+      category: hostname
+      label: nginx_server_name
+    - pattern: "proxy_pass"
+      category: url
+      label: nginx_proxy_pass
+    - pattern: "fastcgi_pass"
+      category: url
+      label: nginx_fastcgi_pass
+    - pattern: "uwsgi_pass"
+      category: url
+      label: nginx_uwsgi_pass
+    - pattern: "grpc_pass"
+      category: url
+      label: nginx_grpc_pass
+    - pattern: "ssl_certificate_key"
+      category: hostname
+      label: nginx_ssl_key_path
+    - pattern: "ssl_certificate"
+      category: hostname
+      label: nginx_ssl_cert_path
+    - pattern: "auth_basic_user_file"
+      category: hostname
+      label: nginx_htpasswd_path

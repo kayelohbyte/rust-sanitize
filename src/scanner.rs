@@ -828,7 +828,7 @@ impl StreamScanner {
         config: ScanConfig,
         extra_patterns: Vec<ScanPattern>,
     ) -> Result<(Self, Vec<(usize, SanitizeError)>)> {
-        let (mut patterns, warnings) =
+        let ((mut patterns, warnings), _allow) =
             crate::secrets::load_encrypted_secrets(encrypted_bytes, password, format)?;
         patterns.extend(extra_patterns);
         let scanner = Self::new(patterns, store, config)?;
@@ -850,7 +850,8 @@ impl StreamScanner {
         config: ScanConfig,
         extra_patterns: Vec<ScanPattern>,
     ) -> Result<(Self, Vec<(usize, SanitizeError)>)> {
-        let (mut patterns, warnings) = crate::secrets::load_plaintext_secrets(plaintext, format)?;
+        let ((mut patterns, warnings), _allow) =
+            crate::secrets::load_plaintext_secrets(plaintext, format)?;
         patterns.extend(extra_patterns);
         let scanner = Self::new(patterns, store, config)?;
         Ok((scanner, warnings))
