@@ -1,0 +1,44 @@
+# MongoDB — mongod.conf TLS/KMIP credentials, .env connection strings
+- processor: yaml
+  extensions: [".conf", ".yaml", ".yml"]
+  include: ["mongod.conf", "mongos.conf", "mongodb.conf"]
+  fields:
+    - pattern: "net.tls.certificateKeyFilePassword"
+      category: custom:password
+      label: mongo_tls_key_password
+    - pattern: "security.kmip.clientCertificatePassword"
+      category: custom:password
+      label: mongo_kmip_cert_password
+    - pattern: "*.password"
+      category: custom:password
+      label: mongo_password
+
+- processor: env
+  extensions: [".env"]
+  include: [".env", ".env.local", ".env.production", ".env.staging",
+            ".env.development", ".env.test", "*.env"]
+  fields:
+    - pattern: "MONGODB_URI"
+      category: url
+      label: mongodb_uri
+    - pattern: "MONGO_URI"
+      category: url
+      label: mongo_uri
+    - pattern: "MONGODB_PASSWORD"
+      category: custom:password
+      label: mongodb_password
+    - pattern: "MONGO_PASSWORD"
+      category: custom:password
+      label: mongo_password
+    - pattern: "MONGODB_ROOT_PASSWORD"
+      category: custom:password
+      label: mongodb_root_password
+    - pattern: "MONGODB_USERNAME"
+      category: name
+      label: mongodb_username
+    - pattern: "MONGO_USERNAME"
+      category: name
+      label: mongo_username
+    - pattern: "MONGO_INITDB_ROOT_PASSWORD"
+      category: custom:password
+      label: mongo_initdb_root_password

@@ -1,0 +1,48 @@
+# MySQL / MariaDB — my.cnf, .my.cnf, client credentials
+- processor: key-value
+  extensions: [".cnf", ".ini"]
+  include: ["my.cnf", ".my.cnf", "mysql.cnf", "my.ini", ".my.ini",
+            "mariadb.cnf", ".mariadb.cnf", "mysql/my.cnf"]
+  options:
+    delimiter: "="
+    comment_prefix: "#"
+  fields:
+    - pattern: "password"
+      category: custom:password
+      label: mysql_password
+    - pattern: "user"
+      category: name
+      label: mysql_user
+    - pattern: "host"
+      category: hostname
+      label: mysql_host
+    - pattern: "socket"
+      category: file_path
+      label: mysql_socket
+
+- processor: env
+  extensions: [".env"]
+  include: [".env", ".env.local", ".env.production", ".env.staging",
+            ".env.development", ".env.test", "*.env"]
+  fields:
+    - pattern: "MYSQL_PASSWORD"
+      category: custom:password
+      label: mysql_password
+    - pattern: "MYSQL_ROOT_PASSWORD"
+      category: custom:password
+      label: mysql_root_password
+    - pattern: "MYSQL_USER"
+      category: name
+      label: mysql_user
+    - pattern: "MYSQL_DATABASE"
+      category: name
+      label: mysql_database
+    - pattern: "MARIADB_PASSWORD"
+      category: custom:password
+      label: mariadb_password
+    - pattern: "MARIADB_ROOT_PASSWORD"
+      category: custom:password
+      label: mariadb_root_password
+    - pattern: "DATABASE_URL"
+      category: url
+      label: mysql_database_url

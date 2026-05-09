@@ -1,0 +1,50 @@
+# Elasticsearch — elasticsearch.yml, Kibana/Logstash .env credentials
+- processor: yaml
+  extensions: [".yml", ".yaml"]
+  include: ["elasticsearch.yml", "elasticsearch.yaml"]
+  fields:
+    - pattern: "*.secure_password"
+      category: custom:password
+      label: es_secure_password
+    - pattern: "*.password"
+      category: custom:password
+      label: es_password
+    - pattern: "*.keystore.secure_password"
+      category: custom:password
+      label: es_keystore_password
+    - pattern: "*.truststore.secure_password"
+      category: custom:password
+      label: es_truststore_password
+    - pattern: "*.ssl.keystore.password"
+      category: custom:password
+      label: es_ssl_keystore_password
+    - pattern: "*.access_key"
+      category: auth_token
+      label: es_access_key
+    - pattern: "*.secret_key"
+      category: auth_token
+      label: es_secret_key
+
+- processor: env
+  extensions: [".env"]
+  include: [".env", ".env.local", ".env.production", ".env.staging",
+            ".env.development", ".env.test", "*.env"]
+  fields:
+    - pattern: "ELASTIC_PASSWORD"
+      category: custom:password
+      label: elastic_password
+    - pattern: "ELASTICSEARCH_PASSWORD"
+      category: custom:password
+      label: elasticsearch_password
+    - pattern: "ELASTICSEARCH_USERNAME"
+      category: name
+      label: elasticsearch_username
+    - pattern: "KIBANA_PASSWORD"
+      category: custom:password
+      label: kibana_password
+    - pattern: "LOGSTASH_KEYSTORE_PASS"
+      category: custom:password
+      label: logstash_keystore_pass
+    - pattern: "ELASTICSEARCH_HOSTS"
+      category: url
+      label: elasticsearch_hosts

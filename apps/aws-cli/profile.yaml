@@ -1,0 +1,27 @@
+# AWS CLI — ~/.aws/credentials, ~/.aws/config
+- processor: key-value
+  extensions: [""]
+  include:
+    - ".aws/credentials"
+    - ".aws/config"
+    - "aws/credentials"
+    - "aws/config"
+  options:
+    delimiter: "="
+    comment_prefix: "#"
+  fields:
+    - pattern: "aws_access_key_id"
+      category: auth_token
+      label: aws_access_key_id
+    - pattern: "aws_secret_access_key"
+      category: auth_token
+      label: aws_secret_access_key
+    - pattern: "aws_session_token"
+      category: auth_token
+      label: aws_session_token
+    - pattern: "aws_security_token"
+      category: auth_token
+      label: aws_security_token
+    - pattern: "role_arn"
+      category: auth_token
+      label: aws_role_arn

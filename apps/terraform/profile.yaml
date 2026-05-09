@@ -1,0 +1,58 @@
+# Terraform — *.tfvars variable files, terraform.tfstate sensitive outputs
+- processor: key-value
+  extensions: [".tfvars"]
+  include: ["*.tfvars", "terraform.tfvars", "terraform.tfvars.json"]
+  options:
+    delimiter: "="
+    comment_prefix: "#"
+  fields:
+    - pattern: "*password*"
+      category: custom:password
+      label: tf_password
+    - pattern: "*secret*"
+      category: auth_token
+      label: tf_secret
+    - pattern: "*_token"
+      category: auth_token
+      label: tf_token
+    - pattern: "*_key"
+      category: auth_token
+      label: tf_key
+    - pattern: "*api_key*"
+      category: auth_token
+      label: tf_api_key
+    - pattern: "access_key"
+      category: auth_token
+      label: tf_access_key
+    - pattern: "secret_key"
+      category: auth_token
+      label: tf_secret_key
+
+- processor: json
+  extensions: [".tfstate", ".backup"]
+  include: ["*.tfstate", "terraform.tfstate", "terraform.tfstate.backup", "*.tfstate.backup"]
+  fields:
+    - pattern: "*.attributes.password"
+      category: custom:password
+      label: tf_state_password
+    - pattern: "*.attributes.*_password"
+      category: custom:password
+      label: tf_state_password_attr
+    - pattern: "*.attributes.access_key"
+      category: auth_token
+      label: tf_state_access_key
+    - pattern: "*.attributes.secret_key"
+      category: auth_token
+      label: tf_state_secret_key
+    - pattern: "*.attributes.*_secret"
+      category: auth_token
+      label: tf_state_secret
+    - pattern: "*.attributes.*_token"
+      category: auth_token
+      label: tf_state_token
+    - pattern: "*.attributes.*_key"
+      category: auth_token
+      label: tf_state_key
+    - pattern: "*.sensitive_values.*"
+      category: auth_token
+      label: tf_state_sensitive

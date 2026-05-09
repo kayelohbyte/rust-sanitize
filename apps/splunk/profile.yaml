@@ -1,0 +1,46 @@
+# Splunk — outputs.conf, inputs.conf, authentication.conf, server.conf credentials
+- processor: key-value
+  extensions: [".conf"]
+  include:
+    - "outputs.conf"
+    - "inputs.conf"
+    - "authentication.conf"
+    - "passwords.conf"
+    - "server.conf"
+    - "alert_actions.conf"
+    - "transforms.conf"
+    - "splunk/etc/system/local/*.conf"
+    - "splunk/etc/apps/*/local/*.conf"
+    - "default/outputs.conf"
+    - "default/inputs.conf"
+    - "default/authentication.conf"
+    - "default/server.conf"
+    - "local/outputs.conf"
+    - "local/inputs.conf"
+    - "local/authentication.conf"
+    - "local/server.conf"
+  options:
+    delimiter: "="
+    comment_prefix: "#"
+  fields:
+    - pattern: "password"
+      category: custom:password
+      label: splunk_password
+    - pattern: "bindDNpassword"
+      category: custom:password
+      label: splunk_ldap_password
+    - pattern: "pass4SymmKey"
+      category: auth_token
+      label: splunk_symm_key
+    - pattern: "token"
+      category: auth_token
+      label: splunk_hec_token
+    - pattern: "sslKeysfilePassword"
+      category: custom:password
+      label: splunk_ssl_key_password
+    - pattern: "hashValue"
+      category: auth_token
+      label: splunk_password_hash
+    - pattern: "secret"
+      category: auth_token
+      label: splunk_secret

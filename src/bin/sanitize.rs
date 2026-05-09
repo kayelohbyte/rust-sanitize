@@ -2789,6 +2789,18 @@ struct BuiltinApp {
 
 const BUILTIN_APPS: &[BuiltinApp] = &[
     BuiltinApp {
+        name: "ansible",
+        description: "Ansible — group_vars, host_vars, vault credentials",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/ansible/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "aws-cli",
+        description: "AWS CLI — ~/.aws/credentials, ~/.aws/config access keys",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/aws-cli/profile.yaml")),
+    },
+    BuiltinApp {
         name: "docker-compose",
         description: "Docker Compose — compose.yml environment variables, image credentials",
         secrets_yaml: None,
@@ -2801,16 +2813,46 @@ const BUILTIN_APPS: &[BuiltinApp] = &[
         profile_yaml: Some(include_str!("../../apps/django/profile.yaml")),
     },
     BuiltinApp {
+        name: "elasticsearch",
+        description: "Elasticsearch — elasticsearch.yml, Kibana/Logstash credentials",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/elasticsearch/profile.yaml")),
+    },
+    BuiltinApp {
         name: "gitlab",
         description: "GitLab — CI/CD logs, runner output, .gitlab-ci.yml variables",
         secrets_yaml: Some(include_str!("../../apps/gitlab/secrets.yaml")),
         profile_yaml: Some(include_str!("../../apps/gitlab/profile.yaml")),
     },
     BuiltinApp {
+        name: "grafana",
+        description: "Grafana — grafana.ini admin credentials, provisioning datasource secrets",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/grafana/profile.yaml")),
+    },
+    BuiltinApp {
         name: "kubernetes",
         description: "Kubernetes — kubeconfig credentials, Secret manifests, Helm values",
         secrets_yaml: None,
         profile_yaml: Some(include_str!("../../apps/kubernetes/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "laravel",
+        description: "Laravel — .env files, APP_KEY, Pusher, Passport, Stripe secrets",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/laravel/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "mongodb",
+        description: "MongoDB — mongod.conf TLS passwords, .env connection strings",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/mongodb/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "mysql",
+        description: "MySQL / MariaDB — my.cnf credentials, .env DATABASE_URL",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/mysql/profile.yaml")),
     },
     BuiltinApp {
         name: "nginx",
@@ -2831,11 +2873,29 @@ const BUILTIN_APPS: &[BuiltinApp] = &[
         profile_yaml: Some(include_str!("../../apps/rails/profile.yaml")),
     },
     BuiltinApp {
+        name: "redis",
+        description: "Redis — redis.conf requirepass/masterauth, .env credentials",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/redis/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "splunk",
+        description: "Splunk — outputs.conf, inputs.conf, authentication.conf credentials",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/splunk/profile.yaml")),
+    },
+    BuiltinApp {
         name: "spring-boot",
         description:
             "Spring Boot — application.yml, application.properties, datasource credentials",
         secrets_yaml: None,
         profile_yaml: Some(include_str!("../../apps/spring-boot/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "terraform",
+        description: "Terraform — *.tfvars variable files, terraform.tfstate sensitive outputs",
+        secrets_yaml: None,
+        profile_yaml: Some(include_str!("../../apps/terraform/profile.yaml")),
     },
 ];
 

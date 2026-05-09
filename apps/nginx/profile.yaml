@@ -1,7 +1,14 @@
 # nginx — nginx.conf, virtual host configs, proxy upstreams, server names
 - processor: key-value
   extensions: [".conf"]
-  include: ["nginx.conf", "*.conf"]
+  include:
+    - "nginx.conf"
+    - "conf.d/*.conf"
+    - "sites-available/*"
+    - "sites-enabled/*"
+    - "snippets/*.conf"
+    - "nginx/nginx.conf"
+    - "nginx/conf.d/*.conf"
   options:
     delimiter: " "
     comment_prefix: "#"

@@ -1,0 +1,51 @@
+# Laravel — .env files, APP_KEY, database credentials, queue and mail secrets
+- processor: env
+  extensions: [".env"]
+  include: [".env", ".env.local", ".env.production", ".env.staging",
+            ".env.development", ".env.testing", "*.env"]
+  fields:
+    - pattern: "APP_KEY"
+      category: auth_token
+      label: laravel_app_key
+    - pattern: "DB_PASSWORD"
+      category: custom:password
+      label: laravel_db_password
+    - pattern: "REDIS_PASSWORD"
+      category: custom:password
+      label: laravel_redis_password
+    - pattern: "MAIL_PASSWORD"
+      category: custom:password
+      label: laravel_mail_password
+    - pattern: "PUSHER_APP_KEY"
+      category: auth_token
+      label: laravel_pusher_key
+    - pattern: "PUSHER_APP_SECRET"
+      category: auth_token
+      label: laravel_pusher_secret
+    - pattern: "MIX_PUSHER_APP_KEY"
+      category: auth_token
+      label: laravel_mix_pusher_key
+    - pattern: "JWT_SECRET"
+      category: auth_token
+      label: laravel_jwt_secret
+    - pattern: "PASSPORT_PRIVATE_KEY"
+      category: auth_token
+      label: laravel_passport_private_key
+    - pattern: "STRIPE_KEY"
+      category: auth_token
+      label: laravel_stripe_key
+    - pattern: "STRIPE_SECRET"
+      category: auth_token
+      label: laravel_stripe_secret
+    - pattern: "*PASSWORD"
+      category: custom:password
+      label: env_password
+    - pattern: "*SECRET"
+      category: auth_token
+      label: env_secret
+    - pattern: "*_KEY"
+      category: auth_token
+      label: env_key
+    - pattern: "*TOKEN"
+      category: auth_token
+      label: env_token

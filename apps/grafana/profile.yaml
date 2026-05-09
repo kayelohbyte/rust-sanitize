@@ -1,0 +1,52 @@
+# Grafana — grafana.ini, provisioning datasources
+- processor: key-value
+  extensions: [".ini"]
+  include: ["grafana.ini", "grafana.conf", "defaults.ini"]
+  options:
+    delimiter: "="
+    comment_prefix: ";"
+  fields:
+    - pattern: "secret_key"
+      category: auth_token
+      label: grafana_secret_key
+    - pattern: "admin_password"
+      category: custom:password
+      label: grafana_admin_password
+    - pattern: "password"
+      category: custom:password
+      label: grafana_password
+    - pattern: "client_secret"
+      category: auth_token
+      label: grafana_oauth_client_secret
+    - pattern: "token"
+      category: auth_token
+      label: grafana_token
+
+- processor: yaml
+  extensions: [".yml", ".yaml"]
+  include:
+    - "provisioning/datasources/*.yml"
+    - "provisioning/datasources/*.yaml"
+    - "datasource.yml"
+    - "datasource.yaml"
+    - "datasources.yml"
+    - "datasources.yaml"
+  fields:
+    - pattern: "*.secureJsonData.*"
+      category: auth_token
+      label: grafana_datasource_secure
+    - pattern: "*.basicAuthPassword"
+      category: custom:password
+      label: grafana_basic_auth_password
+    - pattern: "*.password"
+      category: custom:password
+      label: grafana_datasource_password
+    - pattern: "*.bearerToken"
+      category: auth_token
+      label: grafana_bearer_token
+    - pattern: "*.apiKey"
+      category: auth_token
+      label: grafana_datasource_api_key
+    - pattern: "*.tlsClientKey"
+      category: auth_token
+      label: grafana_tls_client_key

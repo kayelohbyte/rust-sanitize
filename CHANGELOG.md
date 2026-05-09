@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **10 new built-in app bundles** — ansible, aws-cli, elasticsearch, grafana,
+  laravel, mongodb, mysql, redis, splunk, terraform. Each profile targets only
+  app-specific config filenames (e.g. `redis.conf`, `elasticsearch.yml`,
+  `*.tfvars`) rather than broad globs. The nginx profile's `*.conf` include was
+  tightened to `nginx.conf`, `conf.d/*.conf`, `sites-available/*`, and
+  `sites-enabled/*`.
+
 - **`sanitize apps edit <name>`** — copies a built-in app bundle's YAML files
   into `~/.config/sanitize/apps/<name>/` so they can be customised. The local
   copy automatically takes precedence over the compiled built-in (no extra

@@ -1,0 +1,44 @@
+# Ansible — group_vars, host_vars, vars/main.yml, vault variables
+- processor: yaml
+  extensions: [".yml", ".yaml"]
+  include:
+    - "group_vars/*.yml"
+    - "group_vars/*.yaml"
+    - "group_vars/**/*.yml"
+    - "group_vars/**/*.yaml"
+    - "host_vars/*.yml"
+    - "host_vars/*.yaml"
+    - "host_vars/**/*.yml"
+    - "host_vars/**/*.yaml"
+    - "vars/main.yml"
+    - "vars/main.yaml"
+    - "defaults/main.yml"
+    - "defaults/main.yaml"
+  fields:
+    - pattern: "ansible_password"
+      category: custom:password
+      label: ansible_password
+    - pattern: "ansible_become_password"
+      category: custom:password
+      label: ansible_become_password
+    - pattern: "ansible_ssh_pass"
+      category: custom:password
+      label: ansible_ssh_pass
+    - pattern: "vault_password"
+      category: auth_token
+      label: ansible_vault_password
+    - pattern: "*_password"
+      category: custom:password
+      label: ansible_var_password
+    - pattern: "*_secret"
+      category: auth_token
+      label: ansible_var_secret
+    - pattern: "*_token"
+      category: auth_token
+      label: ansible_var_token
+    - pattern: "*_api_key"
+      category: auth_token
+      label: ansible_var_api_key
+    - pattern: "*_private_key"
+      category: auth_token
+      label: ansible_var_private_key
