@@ -1,8 +1,125 @@
-# .gitlab-ci.yml — redact CI/CD variables whose names indicate secrets
+# GitLab — gitlab.rb Omnibus config, .gitlab-ci.yml CI/CD variables, Helm chart values
+
+# --- Omnibus gitlab.rb (Ruby key = 'value' DSL) ---
+# Sensitive key substrings mirror gitlab-scrubber/internal/scrubber/unstructured/gitlab_rb.go
+# sensitiveKeyPatterns: authorization, aws_access_key, accesskey, secretkey,
+# accountkey, key_base, secret, _key, bind_dn, _fingerprint, token, _dsn
+# Plus "password" (handled more aggressively in the scrubber).
+- processor: key-value
+  extensions: [".rb"]
+  include: ["gitlab.rb", "*/gitlab.rb"]
+  options:
+    delimiter: "="
+    comment_prefix: "#"
+  fields:
+    - pattern: "*password*"
+      category: custom:password
+      label: gitlab_rb_password
+    - pattern: "*secret*"
+      category: auth_token
+      label: gitlab_rb_secret
+    - pattern: "*token*"
+      category: auth_token
+      label: gitlab_rb_token
+    - pattern: "*_key*"
+      category: auth_token
+      label: gitlab_rb_key
+    - pattern: "*key_base*"
+      category: auth_token
+      label: gitlab_rb_key_base
+    - pattern: "*authorization*"
+      category: auth_token
+      label: gitlab_rb_authorization
+    - pattern: "*aws_access_key*"
+      category: auth_token
+      label: gitlab_rb_aws_access_key
+    - pattern: "*accesskey*"
+      category: auth_token
+      label: gitlab_rb_accesskey
+    - pattern: "*secretkey*"
+      category: auth_token
+      label: gitlab_rb_secretkey
+    - pattern: "*accountkey*"
+      category: auth_token
+      label: gitlab_rb_accountkey
+    - pattern: "*bind_dn*"
+      category: auth_token
+      label: gitlab_rb_ldap_bind_dn
+    - pattern: "*_fingerprint*"
+      category: auth_token
+      label: gitlab_rb_fingerprint
+    - pattern: "*_dsn*"
+      category: url
+      label: gitlab_rb_sentry_dsn
+
+# --- .gitlab-ci.yml and GitLab CI config includes ---
 - processor: yaml
   extensions: [".yml", ".yaml"]
-  include: [".gitlab-ci.yml", "gitlab-ci.yml", "*/.gitlab-ci.yml"]
+  include:
+    - ".gitlab-ci.yml"
+    - "gitlab-ci.yml"
+    - "*/.gitlab-ci.yml"
   fields:
     - pattern: "variables.*"
       category: auth_token
       label: ci_variable
+
+# --- GitLab Helm chart values (gitlab-specific deep paths) ---
+# Note: broad *.password / *.token patterns intentionally catch inlined credentials
+# in user override files. K8s secret reference fields (secret: name, key: name)
+# are also matched — redacting object names is acceptable in this context.
+- processor: yaml
+  extensions: [".yml", ".yaml"]
+  include:
+    - "values.yaml"
+    - "values-*.yaml"
+    - "gitlab-values.yaml"
+    - "gitlab-values-*.yaml"
+  fields:
+    # Generic credential fields (catches inlined passwords/tokens anywhere)
+    - pattern: "*.password"
+      category: custom:password
+      label: gitlab_helm_password
+    - pattern: "*.token"
+      category: auth_token
+      label: gitlab_helm_token
+    - pattern: "*.authToken"
+      category: auth_token
+      label: gitlab_helm_auth_token
+    # GitLab-specific global paths
+    - pattern: "global.smtp.password"
+      category: custom:password
+      label: gitlab_helm_smtp_password
+    - pattern: "global.psql.password"
+      category: custom:password
+      label: gitlab_helm_psql_password
+    - pattern: "global.redis.auth.secret"
+      category: auth_token
+      label: gitlab_helm_redis_auth_secret
+    - pattern: "global.gitaly.authToken"
+      category: auth_token
+      label: gitlab_helm_gitaly_auth_token
+    - pattern: "global.initialRootPassword"
+      category: custom:password
+      label: gitlab_helm_initial_root_password
+    # MinIO (used as object storage in GitLab Helm deployments)
+    - pattern: "minio.accessKey"
+      category: auth_token
+      label: gitlab_helm_minio_access_key
+    - pattern: "minio.secretKey"
+      category: auth_token
+      label: gitlab_helm_minio_secret_key
+    # KAS and Pages secrets
+    - pattern: "gitlab.kas.*.secret"
+      category: auth_token
+      label: gitlab_helm_kas_secret
+    - pattern: "gitlab.gitlab-pages.*.secret"
+      category: auth_token
+      label: gitlab_helm_pages_secret
+    # Registry storage credentials (S3/GCS/Azure backends)
+    - pattern: "registry.storage.*.accesskey"
+      category: auth_token
+      label: gitlab_helm_registry_access_key
+    - pattern: "registry.storage.*.secretkey"
+      category: auth_token
+      label: gitlab_helm_registry_secret_key
