@@ -1,0 +1,28 @@
+# CircleCI — .circleci/config.yml job/step environment variables, docker auth
+- processor: yaml
+  extensions: [".yml", ".yaml"]
+  include:
+    - ".circleci/config.yml"
+    - ".circleci/config.yaml"
+    - ".circleci/continue_config.yml"
+    - ".circleci/continue_config.yaml"
+  fields:
+    # Job-level environment block
+    - pattern: "jobs.*.environment.*"
+      category: auth_token
+      label: cci_job_env
+    # Step run environment (run: { environment: { KEY: value } })
+    - pattern: "jobs.*.steps.*.run.environment.*"
+      category: auth_token
+      label: cci_step_env
+    # Executor-level environment (shared executor definitions)
+    - pattern: "executors.*.environment.*"
+      category: auth_token
+      label: cci_executor_env
+    # Docker image registry auth (username / password inlined in config)
+    - pattern: "jobs.*.docker.*.auth.username"
+      category: name
+      label: cci_docker_auth_user
+    - pattern: "jobs.*.docker.*.auth.password"
+      category: custom:password
+      label: cci_docker_auth_password

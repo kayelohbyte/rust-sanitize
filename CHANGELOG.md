@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **11 new built-in app bundles** — ansible, aws-cli, elasticsearch, grafana,
-  heroku, laravel, mongodb, mysql, redis, splunk, terraform. Each profile targets only
+- **13 new built-in app bundles** — ansible, aws-cli, circleci, elasticsearch,
+  github-actions, grafana, heroku, laravel, mongodb, mysql, redis, splunk,
+  terraform. Each profile targets only
   app-specific config filenames (e.g. `redis.conf`, `elasticsearch.yml`,
   `*.tfvars`) rather than broad globs. The nginx profile's `*.conf` include was
   tightened to `nginx.conf`, `conf.d/*.conf`, `sites-available/*`, and

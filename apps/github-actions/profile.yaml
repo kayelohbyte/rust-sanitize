@@ -1,0 +1,36 @@
+# GitHub Actions — .github/workflows workflow env vars, step inputs, container credentials
+- processor: yaml
+  extensions: [".yml", ".yaml"]
+  include:
+    - ".github/workflows/*.yml"
+    - ".github/workflows/*.yaml"
+    - ".github/workflows/**/*.yml"
+    - ".github/workflows/**/*.yaml"
+  fields:
+    # Workflow-level env block
+    - pattern: "env.*"
+      category: auth_token
+      label: gha_workflow_env
+    # Job-level env block
+    - pattern: "jobs.*.env.*"
+      category: auth_token
+      label: gha_job_env
+    # Step-level env block
+    - pattern: "jobs.*.steps.*.env.*"
+      category: auth_token
+      label: gha_step_env
+    # Action inputs (with: block) — tokens, passwords, API keys passed to actions
+    - pattern: "jobs.*.steps.*.with.*"
+      category: auth_token
+      label: gha_step_with
+    # Service container env vars (e.g. POSTGRES_PASSWORD, MYSQL_ROOT_PASSWORD)
+    - pattern: "jobs.*.services.*.env.*"
+      category: auth_token
+      label: gha_service_env
+    # Container registry credentials
+    - pattern: "jobs.*.container.credentials.username"
+      category: name
+      label: gha_container_registry_user
+    - pattern: "jobs.*.container.credentials.password"
+      category: custom:password
+      label: gha_container_registry_password
