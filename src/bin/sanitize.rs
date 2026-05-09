@@ -120,6 +120,8 @@ const DEFAULT_PROGRESS_INTERVAL_MS: u64 = 200;
 const VALID_FORMATS: &[&str] = &[
     "text",
     "json",
+    "jsonl",
+    "ndjson",
     "yaml",
     "yml",
     "xml",
@@ -255,7 +257,7 @@ struct Cli {
 
     /// Force input format, overriding file-extension detection.
     /// Required when reading from stdin with structured data.
-    /// Values: text, json, yaml, xml, csv, key-value.
+    /// Values: text, json, jsonl, yaml, xml, csv, key-value, toml, env, ini, log.
     #[arg(short = 'f', long, value_name = "FMT")]
     format: Option<String>,
 
@@ -2978,6 +2980,7 @@ fn file_inputs(cli: &Cli) -> Vec<&PathBuf> {
 fn format_to_ext(fmt: &str) -> Option<&str> {
     match fmt {
         "json" => Some("json"),
+        "jsonl" | "ndjson" => Some("jsonl"),
         "yaml" | "yml" => Some("yaml"),
         "xml" => Some("xml"),
         "csv" => Some("csv"),

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`--format jsonl` / `--format ndjson` rejected by CLI** — `jsonl` and `ndjson`
+  were missing from `VALID_FORMATS` and from `format_to_ext`, so passing
+  `--format jsonl` produced an "invalid format" error even though the JSONL
+  processor was fully functional. Both are now accepted; MCP `format: "jsonl"`
+  works correctly end-to-end.
+
 - **Structured YAML/JSON/TOML output corrupted by key=value patterns** — the
   format-preserving double-pass scanner used by `--profile` included the
   built-in balanced `password_kv` / `secret_kv` patterns which match
