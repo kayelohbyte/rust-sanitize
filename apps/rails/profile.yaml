@@ -38,6 +38,12 @@
     - pattern: "*.stripe_secret_key"
       category: auth_token
       label: stripe_secret_key
+    - pattern: "*.jwt_secret"
+      category: auth_token
+      label: rails_jwt_secret
+    - pattern: "*.jwt_key"
+      category: auth_token
+      label: rails_jwt_key
 
 - processor: env
   extensions: [".env"]

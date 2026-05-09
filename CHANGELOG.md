@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **JWT secret patterns** — `jwt_secret` and `jwt_key` (and camelCase variants
+  `jwtSecret`, `jwtKey`) added to plaintext log scanning (`secret_kv` regex in
+  `build_guided_entries`) and to the `apps/rails/profile.yaml` and
+  `apps/kubernetes/profile.yaml` structured-config profiles.
+
 ### Fixed
 
 - **`--format jsonl` / `--format ndjson` rejected by CLI** — `jsonl` and `ndjson`

@@ -55,3 +55,15 @@
     - pattern: "*.privateKey"
       category: auth_token
       label: helm_private_key
+    - pattern: "*.jwt_secret"
+      category: auth_token
+      label: jwt_secret
+    - pattern: "*.jwtSecret"
+      category: auth_token
+      label: jwt_secret_camel
+    - pattern: "*.jwt_key"
+      category: auth_token
+      label: jwt_key
+    - pattern: "*.jwtKey"
+      category: auth_token
+      label: jwt_key_camel

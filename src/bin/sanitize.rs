@@ -992,7 +992,7 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
         // Generic secret key=value in any text format.
         // Matches: api_key=..., client_secret: ..., access_token: ..., etc.
         make_regex_entry(
-            r#"(?i)(?:api_key|api_secret|access_token|client_secret|private_key|secret_key|auth_key|signing_key)[\s:="']+[A-Za-z0-9._~+/=-]{16,}"#,
+            r#"(?i)(?:api_key|api_secret|access_token|client_secret|private_key|secret_key|auth_key|signing_key|jwt_secret|jwt_key)[\s:="']+[A-Za-z0-9._~+/=-]{16,}"#,
             "auth_token",
             "secret_kv",
         ),
