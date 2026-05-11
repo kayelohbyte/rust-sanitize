@@ -163,3 +163,70 @@ jobs:
         with:
           generate_release_notes: true
           files: artifacts/*
+
+  gitlab-release:
+    name: Publish to GitLab
+    needs: [build, build-mcp]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+
+      - name: Upload artifacts and create GitLab Release
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_REPO: ${{ secrets.GITLAB_REPO }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Derive the URL-encoded project path from the mirror remote URL.
+          # GITLAB_REPO is e.g. "gitlab.com/kayelohbyte/rust-sanitize.git"
+          PROJECT_PATH=$(echo "$GITLAB_REPO" \
+            | sed 's|https\?://||' \
+            | sed 's|gitlab\.com/||' \
+            | sed 's|\.git$||')
+          ENCODED=$(python3 -c \
+            "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" \
+            "$PROJECT_PATH")
+          API="https://gitlab.com/api/v4/projects/${ENCODED}"
+
+          # Upload each file to the GitLab generic packages registry.
+          for f in artifacts/*; do
+            filename=$(basename "$f")
+            echo "Uploading $filename …"
+            curl --fail --silent --show-error \
+              --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+              --upload-file "$f" \
+              "${API}/packages/generic/sanitize-engine/${TAG}/${filename}"
+          done
+
+          # Build the asset-links JSON array for the release.
+          LINKS="["
+          first=true
+          for f in artifacts/*; do
+            filename=$(basename "$f")
+            url="${API}/packages/generic/sanitize-engine/${TAG}/${filename}"
+            [ "$first" = true ] && first=false || LINKS+=","
+            LINKS+=$(printf '{"name":"%s","url":"%s","link_type":"package"}' \
+              "$filename" "$url")
+          done
+          LINKS+="]"
+
+          # Create the GitLab release (idempotent: delete first if it exists).
+          curl --silent --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+            --request DELETE "${API}/releases/${TAG}" || true
+
+          curl --fail --silent --show-error \
+            --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data "{
+              \"name\": \"${TAG}\",
+              \"tag_name\": \"${TAG}\",
+              \"description\": \"See [GitHub Release](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}) for full release notes.\",
+              \"assets\": { \"links\": ${LINKS} }
+            }" \
+            "${API}/releases"
+
+          echo "GitLab release ${TAG} published."
