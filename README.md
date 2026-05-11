@@ -623,9 +623,9 @@ Maintainers will acknowledge receipt within 5 business days and aim to provide a
 
 ## Stability
 
-This project follows [Semantic Versioning](https://semver.org/). As of 1.0.0,
-the public library API and CLI interface are stable. Breaking changes require a
-major version bump.
+This project follows [Semantic Versioning](https://semver.org/). As of 0.8.0,
+the public library API and CLI interface are considered stable. Breaking changes
+will be avoided but may occur in minor releases until 1.0.0.
 
 ### What is stable
 

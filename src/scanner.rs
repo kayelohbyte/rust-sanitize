@@ -221,6 +221,21 @@ impl Clone for ScanPattern {
 impl ScanPattern {
     /// Create a pattern from a regex string.
     ///
+    /// ## Capture group 1 — partial replacement
+    ///
+    /// If the regex contains a capture group 1 (`(...)`), only the bytes
+    /// matched by that group are replaced; the bytes before and after it
+    /// within the full match are emitted verbatim. This lets you write
+    /// context-anchored patterns without redacting the prefix/suffix:
+    ///
+    /// ```text
+    /// pattern: glpat-([A-Za-z0-9_-]{20})
+    ///           ^^^^^^ prefix preserved
+    ///                  ^^^^^^^^^^^^^^^^^^^^ group 1 → replaced
+    /// ```
+    ///
+    /// Patterns **without** a capture group replace the entire match.
+    ///
     /// # Errors
     ///
     /// Returns [`SanitizeError::PatternCompileError`] if the regex is invalid.
@@ -231,10 +246,18 @@ impl ScanPattern {
     /// use sanitize_engine::scanner::ScanPattern;
     /// use sanitize_engine::category::Category;
     ///
-    /// let pat = ScanPattern::from_regex(
+    /// // No capture group — full match replaced:
+    /// let email = ScanPattern::from_regex(
     ///     r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
     ///     Category::Email,
     ///     "email_address",
+    /// ).unwrap();
+    ///
+    /// // Capture group 1 — prefix preserved, only the token value replaced:
+    /// let token = ScanPattern::from_regex(
+    ///     r"glpat-([A-Za-z0-9_-]{20})",
+    ///     Category::AuthToken,
+    ///     "gitlab_pat",
     /// ).unwrap();
     /// ```
     pub fn from_regex(pattern: &str, category: Category, label: impl Into<String>) -> Result<Self> {
@@ -1079,6 +1102,22 @@ impl StreamScanner {
                 // emitting the surrounding context bytes of the full match verbatim.
                 // This preserves delimiters, key names, and prefixes that the
                 // pattern uses as anchors to reduce false positives.
+                if cap_start < m.start || cap_end > m.end || cap_start > cap_end {
+                    // Capture bounds outside match bounds — skip rather than panic.
+                    // This should not happen with correct regex patterns; log it so it
+                    // surfaces during testing without crashing production runs.
+                    tracing::warn!(
+                        pattern = %pattern.label,
+                        m_start = m.start,
+                        m_end = m.end,
+                        cap_start,
+                        cap_end,
+                        "capture group bounds outside match bounds — emitting full match unreplaced"
+                    );
+                    output_buf.extend_from_slice(&committed[m.start..m.end]);
+                    last_end = m.end;
+                    continue;
+                }
                 output_buf.extend_from_slice(&committed[m.start..cap_start]);
                 let secret = String::from_utf8_lossy(&committed[cap_start..cap_end]);
                 let replacement = self.store.get_or_insert(&pattern.category, &secret)?;

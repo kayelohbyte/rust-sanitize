@@ -232,14 +232,28 @@ Prints built-in and user-defined bundles. Use the name with `--app` to load the 
 sanitize apps
 # Built-in app bundles (use with --app <name>):
 #
-#   docker-compose     Docker Compose — compose.yml environment variables...
-#   django             Django — .env files, SECRET_KEY, database credentials...
+#   ansible            Ansible — group_vars, host_vars, vault credentials
+#   aws-cli            AWS CLI — ~/.aws/credentials, ~/.aws/config access keys
+#   circleci           CircleCI — .circleci/config.yml job/step environment variables, docker auth
+#   django             Django — .env files, SECRET_KEY, database credentials, third-party API keys
+#   docker-compose     Docker Compose — compose.yml environment variables, image credentials
+#   elasticsearch      Elasticsearch — elasticsearch.yml, Kibana/Logstash credentials
+#   fstab              fstab — /etc/fstab CIFS/SMB credentials, NFS and iSCSI server addresses
+#   github-actions     GitHub Actions — workflow env vars, step inputs, container registry credentials
 #   gitlab             GitLab — CI/CD logs, runner output, .gitlab-ci.yml variables
-#   kubernetes         Kubernetes — kubeconfig credentials, Secret manifests...
-#   nginx              Nginx — nginx.conf virtual hosts, proxy upstreams...
+#   grafana            Grafana — grafana.ini admin credentials, provisioning datasource secrets
+#   heroku             Heroku — app.json env values, add-on credentials (Postgres, Redis, SendGrid…)
+#   kubernetes         Kubernetes — kubeconfig credentials, Secret manifests, Helm values
+#   laravel            Laravel — .env files, APP_KEY, Pusher, Passport, Stripe secrets
+#   mongodb            MongoDB — mongod.conf TLS passwords, .env connection strings
+#   mysql              MySQL / MariaDB — my.cnf credentials, .env DATABASE_URL
+#   nginx              Nginx — nginx.conf virtual hosts, proxy upstreams, access/error logs
 #   postgresql         PostgreSQL — postgresql.conf, connection strings, pg logs
 #   rails              Ruby on Rails — database.yml, .env, config/secrets.yml
-#   spring-boot        Spring Boot — application.yml, application.properties...
+#   redis              Redis — redis.conf requirepass/masterauth, .env credentials
+#   splunk             Splunk — outputs.conf, inputs.conf, authentication.conf credentials
+#   spring-boot        Spring Boot — application.yml, application.properties, datasource credentials
+#   terraform          Terraform — *.tfvars variable files, terraform.tfstate sensitive outputs
 
 # Use a single bundle:
 sanitize config.rb --app gitlab -s secrets.yaml
@@ -441,7 +455,7 @@ sanitize template --preset aws --overwrite
 | `-p, --password` | `-p` | Trigger an interactive password prompt (masked input, never echoed). Requires `--encrypted-secrets`. Providing this flag without `--encrypted-secrets` is an error. For non-interactive automation use `--password-file` or `SANITIZE_PASSWORD` instead. |
 | `-P, --password-file <FILE>` | `-P` | Read the decryption password from a file. Requires `--encrypted-secrets`. The file must have permissions `0600` or `0400` (owner-only). Trailing newline is stripped. |
 | `--encrypted-secrets` | | Treat the secrets file as AES-256-GCM encrypted and decrypt it before loading. Requires a password via `-p`, `--password-file`, or `SANITIZE_PASSWORD`. Without this flag the file is loaded as plaintext. Providing any password input without this flag is an error. |
-| `-f, --format <FMT>` | `-f` | Force input format, overriding file-extension detection. Values: `text`, `json`, `yaml`, `xml`, `csv`, `key-value`. Required for structured processing when reading from stdin. |
+| `-f, --format <FMT>` | `-f` | Force input format, overriding file-extension detection. Values: `text`, `json`, `jsonl`, `yaml`, `yml`, `xml`, `csv`, `tsv`, `key-value`, `toml`, `env`, `ini`, `log`. Required for structured processing when reading from stdin. |
 | `-n, --dry-run` | `-n` | Scan and report matches without writing output. |
 | `--fail-on-match` | | Exit with code 2 if any matches are found. |
 | `-r, --report [PATH]` | `-r` | Write a JSON report to `PATH` (or stderr if no path given). Use `--report -` to write the report to stdout. The report includes: `metadata` (tool version, flags), `summary` (totals, `duration_ms`, `pattern_counts`), and a `files` array with per-file `matches`, `replacements`, byte counts, `pattern_counts`, and `method`. `pattern_counts` maps each pattern `label` to its scanner hit count; it is empty (`{}`) when all matches came from the structured-processor pass or when patterns have no label. |
@@ -457,7 +471,7 @@ sanitize template --preset aws --overwrite
 | `--profile <FILE>` | | Path to a file-type profile (JSON or YAML). Enables structured field-level sanitization for matched files. Discovered field values are automatically saved to the secrets file after the run (see `--no-update-secrets`). Loads common allow patterns (loopback IPs, `localhost`, `example.com`, nil UUID, etc.) so those values are never replaced. See [Structured Processing](structured-processing.md). |
 | `--default` | | Use built-in balanced detection patterns without a secrets file. Covers API keys (AWS, GCP, GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab, SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM headers, password/secret key=value pairs, and credential URLs. Loads common allow patterns so loopback IPs, `localhost`, `example.com`, etc. are never replaced. Cannot be combined with `--secrets-file`. |
 | `--app <APPS>` | | Load built-in secrets patterns and structured field profiles for one or more applications. Comma-separated app names (e.g. `--app gitlab` or `--app gitlab,nginx`). Additive with `--default`, `--secrets-file`, and `--profile`. Loads common allow patterns. Run `sanitize apps` to list available app names. |
-| `--allow <PATTERN>` | | Allow a specific value through unchanged (repeatable). Matched values are not replaced and not recorded in the mapping store — they will pass through in every file processed in the same run. Supports exact strings and `*` glob patterns. Examples: `--allow localhost`, `--allow "*.internal"`, `--allow "192.168.1.*"`. Allowlist entries can also be placed in the secrets file as `kind: allow` entries. |
+| `--allow <PATTERN>` | | Allow a specific value through unchanged (repeatable). Matched values are not replaced and not recorded in the mapping store — they will pass through in every file processed in the same run. Supports exact strings and `*` glob patterns. Matching is **case-insensitive** by default (patterns and values are lowercased before comparison). Examples: `--allow localhost`, `--allow "*.internal"`, `--allow "192.168.1.*"`. Allowlist entries can also be placed in the secrets file as `kind: allow` entries. |
 | `--only <PATTERN>` | | Keep only archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--only` flags accumulate. Combined with `--exclude`: `--only` narrows first, then `--exclude` removes. Only affects archive inputs; ignored for plain files. |
 | `--exclude <PATTERN>` | | Remove archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--exclude` flags accumulate. |
 | `--log-format <FMT>` | | Log output format: `human` (default) or `json`. |
@@ -474,6 +488,7 @@ sanitize template --preset aws --overwrite
 | `--strip-values` | | Strip all values from structured output, emitting only keys and structure. Useful for generating a profile template from a real config file without exposing any values. Bypasses the sanitization pipeline — no secrets file is required. |
 | `--strip-delimiter <DELIM>` | | Delimiter string used to split key/value lines when `--strip-values` is set. Default: `=`. Use `--strip-delimiter :` for YAML-style or nginx-style config files. Requires `--strip-values`. |
 | `--strip-comment-prefix <PREFIX>` | | Line prefix that marks a comment when `--strip-values` is set. Comment lines are preserved verbatim. Default: `#`. Use `--strip-comment-prefix //` for C-style or nginx-style comment lines. Requires `--strip-values`. |
+| `--llm [TEMPLATE]` | | Format the sanitized output as an LLM-ready prompt written to stdout instead of writing raw sanitized bytes. `TEMPLATE` selects the instruction set: `troubleshoot` (default — root cause analysis), `review-config` (configuration review and security audit), or a path to a custom template file. Combine with `--extract-context` to include notable log events in the prompt. When this flag is set, `--output` / `-o` is ignored for the main payload (the prompt goes to stdout); `--report` still writes its JSON file normally. |
 | `-h, --help` | `-h` | Print help. |
 | `-V, --version` | `-V` | Print version. |
 

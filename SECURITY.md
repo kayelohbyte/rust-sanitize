@@ -1,6 +1,6 @@
 # Security Model
 
-> **sanitize-engine** v0.2.0
+> **sanitize-engine** v0.8.0
 
 This document describes the security properties, threat mitigations,
 and operational constraints of the sanitization engine.

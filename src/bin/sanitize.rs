@@ -1801,7 +1801,10 @@ fn run_allow_test(args: &AllowTestArgs) -> Result<(), (String, i32)> {
             },
             results,
         };
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        match serde_json::to_string_pretty(&out) {
+            Ok(json) => println!("{}", json),
+            Err(e) => eprintln!("allow-test: failed to serialize JSON output: {e}"),
+        }
     } else {
         for r in &results {
             if r.allowed {
@@ -1821,7 +1824,11 @@ fn validate_app_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("app name cannot be empty".into());
     }
-    if !name.chars().next().unwrap().is_ascii_alphanumeric() {
+    if !name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
         return Err(format!(
             "app name '{name}' must start with a letter or digit"
         ));

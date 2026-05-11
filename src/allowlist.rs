@@ -170,7 +170,7 @@ impl AllowlistMatcher {
 ///
 /// `*` matches any sequence of characters (including empty). Multiple `*`
 /// wildcards are supported. Matching is case-sensitive.
-fn glob_matches(pattern: &str, value: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, value: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     let n = parts.len();
 
@@ -225,8 +225,8 @@ mod tests {
         let m = matcher(&["localhost", "127.0.0.1"]);
         assert!(m.is_allowed("localhost"));
         assert!(m.is_allowed("127.0.0.1"));
-        assert!(m.is_allowed("Localhost"));   // now matches — case-insensitive
-        assert!(m.is_allowed("LOCALHOST"));   // now matches
+        assert!(m.is_allowed("Localhost")); // now matches — case-insensitive
+        assert!(m.is_allowed("LOCALHOST")); // now matches
         assert!(!m.is_allowed("localhost2")); // suffix still fails
     }
 

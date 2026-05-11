@@ -219,14 +219,13 @@ pub(crate) fn pattern_matches(pattern: &str, key_path: &str) -> bool {
     // Dot-path glob: `*.suffix` — requires a dot boundary before the suffix
     // so that `*.password` matches `db.password` but not `dbpassword`.
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        if !suffix.contains('*') {
-            if key_path == suffix
+        if !suffix.contains('*')
+            && (key_path == suffix
                 || key_path
                     .strip_suffix(suffix)
-                    .is_some_and(|rest| rest.ends_with('.'))
-            {
-                return true;
-            }
+                    .is_some_and(|rest| rest.ends_with('.')))
+        {
+            return true;
         }
     }
     // Dot-path glob: `prefix.*` — `db.*` matches `db.host`, `db.nested.key`.
@@ -244,39 +243,7 @@ pub(crate) fn pattern_matches(pattern: &str, key_path: &str) -> bool {
     glob_matches(pattern, key_path)
 }
 
-/// Match `key` against a `*`-glob `pattern` where `*` matches any sequence.
-///
-/// Identical algorithm to `AllowlistMatcher::glob_matches` — kept local to
-/// avoid a cross-module dependency on the allowlist crate internals.
-fn glob_matches(pattern: &str, key: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    let n = parts.len();
-    // First segment must be a prefix.
-    if !key.starts_with(parts[0]) {
-        return false;
-    }
-    // Last segment must be a suffix.
-    if !key.ends_with(parts[n - 1]) {
-        return false;
-    }
-    // Guard against overlap when prefix and suffix together are longer than key.
-    if n == 2 {
-        return key.len() >= parts[0].len() + parts[n - 1].len();
-    }
-    // For 3+ segments, verify inner segments appear in order between prefix and suffix.
-    let mut pos = parts[0].len();
-    let end = key.len().saturating_sub(parts[n - 1].len());
-    for part in &parts[1..n - 1] {
-        if part.is_empty() {
-            continue;
-        }
-        match key[pos..end].find(part) {
-            Some(found) => pos += found + part.len(),
-            None => return false,
-        }
-    }
-    true
-}
+use crate::allowlist::glob_matches;
 
 /// Return the first rule in `profile` whose pattern matches `key_path`.
 ///

@@ -227,13 +227,16 @@ exclude: ["*.log.json", "logs/**"]
 
 ## Field Rules
 
-Each field rule specifies a key pattern to match and an optional category and label.
+Each field rule specifies a key pattern to match and how to replace its value.
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `pattern` | Yes | — | Key pattern to match (see pattern syntax below). |
 | `category` | No | `"custom:field"` | Category for replacement generation. Accepts any built-in category or `custom:<tag>`. |
-| `label` | No | — | Human-readable label for reporting. |
+| `label` | No | — | Human-readable label for reporting and per-pattern hit counts. |
+| `min_length` | No | — | Minimum byte length a value must reach before it is replaced. Values shorter than this threshold pass through unchanged. Use this with broad glob patterns like `*token*` or `*secret*` to avoid redacting obviously non-secret values such as `"false"`, `"0"`, or `"nil"`. A value of `8` is a reasonable default for token/password fields. |
+| `sub_processor` | No | — | Processor name (`"yaml"`, `"json"`, `"toml"`, etc.) to use when the field's value is itself a structured document embedded as a string (e.g. YAML inside a Ruby heredoc). The parent processor extracts the value and delegates it to this processor. |
+| `sub_fields` | No | `[]` | Field rules applied by `sub_processor` to the nested content. Ignored when `sub_processor` is absent. |
 
 ### Pattern Syntax
 
@@ -243,9 +246,43 @@ Each field rule specifies a key pattern to match and an optional category and la
 | `"database.password"` | Exact dotted path `database.password` |
 | `"*.password"` | Any key ending in `.password`, or `password` itself |
 | `"db.*"` | Any key starting with `db.` |
+| `"*password*"` | Any key containing `password` as a substring |
 | `"*"` | Every field |
 
 Patterns are matched against the full dot-separated key path (JSON/YAML), slash-separated path (XML), or literal key string (key-value files).
+
+### `min_length` — Avoiding false positives with broad patterns
+
+Broad patterns like `*token*` or `*secret*` can match short non-secret values (`"false"`, `"0"`, `"nil"`). Use `min_length` to skip values below a threshold:
+
+```yaml
+fields:
+  - pattern: "*token*"
+    category: auth_token
+    min_length: 8      # skip values shorter than 8 bytes
+  - pattern: "*password*"
+    category: "custom:password"
+    min_length: 8
+```
+
+### `sub_processor` — Nested structured content
+
+When a field value is itself a structured document (e.g. YAML embedded as a string inside a Ruby config file), use `sub_processor` to delegate it:
+
+```yaml
+- processor: key_value
+  extensions: [".rb"]
+  include: ["gitlab.rb"]
+  fields:
+    - pattern: "*['ldap_servers']"
+      sub_processor: yaml
+      sub_fields:
+        - pattern: "*.password"
+          category: "custom:password"
+          min_length: 8
+        - pattern: "*.bind_dn"
+          category: "custom:dn"
+```
 
 ---
 
@@ -316,12 +353,14 @@ Same dot-separated path convention and array traversal as YAML.
 
 ### Key-Value (`"key_value"`)
 
-Handles line-oriented `key = value` configuration files. Preserves blank lines, comments, indentation, and quoting style.
+Handles line-oriented `key = value` configuration files. Preserves blank lines, comments, indentation, and quoting style. Supports Ruby `gitlab.rb` bracket-notation keys (`gitlab_rails['smtp_password']`) and heredoc values delegated to a sub-processor.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `delimiter` | `"="` | The key-value separator string. |
-| `comment_prefix` | `"#"` | Lines starting with this prefix are preserved as-is. |
+| `delimiter` | `"="` | Primary key-value separator string. |
+| `secondary_delimiter` | *(none)* | Optional second delimiter tried when the primary delimiter's key does not match any field rule. Useful for files that mix two delimiter styles (e.g. `:` alongside `=`). |
+| `comment_prefix` | `"#"` | Lines starting with this prefix (after leading whitespace) are preserved verbatim. |
+| `value_strip_suffix` | *(none)* | Strip this suffix from a value before comparing and replacing. Useful for nginx-style lines that end with `;` (e.g. `proxy_pass http://secret/;`). |
 
 ```yaml
 - processor: key_value

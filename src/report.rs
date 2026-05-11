@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn metadata_flags_preserved() {
         let meta = ReportMetadata {
-            version: "1.0.0".into(),
+            version: "0.8.0".into(),
             timestamp: "2026-06-15T12:00:00Z".into(),
             deterministic: true,
             dry_run: true,

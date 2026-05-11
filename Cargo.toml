@@ -1,6 +1,6 @@
 [package]
 name = "sanitize-engine"
-version = "1.0.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Deterministic one-way data sanitization engine"
@@ -65,3 +65,8 @@ harness = false
 [[bin]]
 name = "sanitize"
 path = "src/bin/sanitize.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

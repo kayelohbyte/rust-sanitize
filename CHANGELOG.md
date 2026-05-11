@@ -64,12 +64,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   from the base scanner so only value-only patterns and profile-discovered literals
   are used in the structured pass.
 
-## [1.0.0] — 2026-05-08
+## [0.8.0] — 2026-05-10
 
-This release marks the **stability boundary**. The public library API and CLI
-interface are now covered by Semantic Versioning: breaking changes require a
-major version bump. See the [Stability section in README.md](README.md#stability)
-for the full stability contract and MSRV policy.
+This is the **community preview release**. The public library API and CLI
+interface are considered stable and breaking changes will be avoided, but may
+occur in minor releases based on community feedback before 1.0.0. See the
+[Stability section in README.md](README.md#stability) for the full stability
+contract and MSRV policy.
 
 ### Added
 
@@ -349,8 +350,8 @@ for the full stability contract and MSRV policy.
 - **290+ tests** including unit, integration, property-based (proptest), and
   4 fuzz targets.
 
-[Unreleased]: https://github.com/kayelohbyte/rust-sanitize/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/kayelohbyte/rust-sanitize/compare/v0.5.0...v1.0.0
+[Unreleased]: https://github.com/kayelohbyte/rust-sanitize/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/kayelohbyte/rust-sanitize/compare/v0.5.0...v0.8.0
 [0.5.0]: https://github.com/kayelohbyte/rust-sanitize/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/kayelohbyte/rust-sanitize/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kayelohbyte/rust-sanitize/releases/tag/v0.3.0

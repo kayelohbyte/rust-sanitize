@@ -18,8 +18,8 @@ All public types are re-exported from the crate root (`sanitize_engine::*`) for 
 | `StreamScanner::with_extra_literals(extra)` | Returns a new scanner with the same base patterns plus additional literal patterns. |
 | `StreamScanner::for_structured_pass(extra)` | Returns a new scanner for format-preserving structured-file passes. Filters out `_kv`-labeled patterns (those that match key+value pairs as a unit, which would corrupt YAML/JSON/TOML keys) and adds the provided extra literals. |
 | `ScanPattern` | A single detection pattern with category and label. |
-| `ScanPattern::from_regex(pattern, category, label)` | Create from a regex string. |
-| `ScanPattern::from_literal(literal, category, label)` | Create from a literal string (auto-escaped). |
+| `ScanPattern::from_regex(pattern, category, label)` | Create from a regex string. If the pattern contains a capture group 1 (`(…)`), only the captured bytes are replaced; bytes before and after group 1 within the full match are emitted verbatim. This lets you write context-anchored patterns like `glpat-([A-Za-z0-9]{20})` where the prefix is preserved but only the token value is redacted. Patterns without a capture group replace the entire match. |
+| `ScanPattern::from_literal(literal, category, label)` | Create from a literal string (auto-escaped). Literals never have capture groups — the full match is always replaced. |
 | `ScanConfig` | Configuration for chunk size and overlap size. |
 | `ScanConfig::new(chunk_size, overlap_size)` | Explicit construction. |
 | `ScanConfig::default()` | Defaults: 1 MiB chunk, 4 KiB overlap. |
@@ -30,14 +30,16 @@ All public types are re-exported from the crate root (`sanitize_engine::*`) for 
 
 | Type / Function | Description |
 |-----------------|-------------|
-| `MappingStore` | Thread-safe, one-way replacement cache backed by `DashMap` (64 shards). |
-| `MappingStore::new(generator, capacity_limit)` | Create with a generator and optional max entries. |
-| `MappingStore::with_expected_capacity(generator, capacity_limit, expected)` | Pre-allocate for an expected number of unique values. |
-| `MappingStore::get_or_insert(category, original)` | Primary API: returns cached replacement or generates and caches a new one. Atomic first-writer-wins. |
-| `MappingStore::forward_lookup(category, original)` | Read-only lookup without insert. |
-| `MappingStore::len()` / `is_empty()` | Current entry count. |
-| `MappingStore::clear()` | Zeroize and remove all entries. |
-| `MappingStore::iter()` | Iterator over `(Category, original, replacement)` triples. |
+| `MappingStore` | Thread-safe, one-way replacement cache. Two-level structure: outer `DashMap<Category, Arc<InnerMap>>` (tiny, always hot in cache) + inner `DashMap<ZeroizingString, …>` per category. Fast-path reads (`get_or_insert` cache hits) are allocation-free. |
+| `MappingStore::new(generator, capacity_limit)` | Create with a generator and optional max unique-mapping limit. |
+| `MappingStore::new_with_allowlist(generator, capacity_limit, allowlist)` | Same as `new()` but attaches an `AllowlistMatcher`. Values matching the allowlist are returned unchanged and never recorded in the map. |
+| `MappingStore::get_or_insert(category, original)` | Primary API: returns cached replacement or generates and caches a new one. Cache hits are allocation-free (looks up `&str` via `Borrow<str>`). Atomic first-writer-wins. |
+| `MappingStore::forward_lookup(category, original)` | Read-only lookup without insert. Returns `None` if not yet mapped. |
+| `MappingStore::len()` / `is_empty()` | Current unique-mapping count (atomic, lock-free). |
+| `MappingStore::clear()` | Zeroize and remove all entries. Drops all inner maps, triggering `ZeroizingString::drop` on every plaintext key. |
+| `MappingStore::snapshot()` | Capture current insertion count. O(1), no allocation. Pass to `iter_since` to enumerate only entries added after this point. |
+| `MappingStore::iter_since(snapshot)` | Iterate entries added at or after `snapshot`. Still O(n) total, but avoids building a full `HashSet` of prior keys. Yields `(Category, original, replacement)`. |
+| `MappingStore::iter()` | Iterate all mappings. Yields `(Category, original, replacement)` triples. Not snapshot-consistent under concurrent inserts — call after all workers finish. |
 
 ## Generator Module (`generator`)
 
@@ -63,10 +65,10 @@ All public types are re-exported from the crate root (`sanitize_engine::*`) for 
 
 | Type / Function | Description |
 |-----------------|-------------|
-| `Processor` | Trait: `fn name()`, `fn can_handle(content, profile)`, `fn process(content, profile, store)`. Must be `Send + Sync`. |
+| `Processor` | Trait: `fn name()`, `fn can_handle(content, profile)`, `fn process(content, profile, store)`. Must be `Send + Sync`. Optionally implement `supports_streaming() -> bool` and `process_stream(reader, writer, profile, store)` for bounded-memory incremental processing. |
 | `ProcessorRegistry` | Maps processor names to `Arc<dyn Processor>`. `ProcessorRegistry::with_builtins()` pre-loads all ten built-in processors: `key_value`, `json`, `jsonl`, `yaml`, `xml`, `csv`, `toml`, `env`, `ini`, `log`. |
-| `FileTypeProfile` | Associates a processor name, file extensions, field rules, and options. |
-| `FieldRule` | A field pattern + optional category and label. |
+| `FileTypeProfile` | Associates a processor name, file extensions, include/exclude globs, field rules, and free-form options. |
+| `FieldRule` | Specifies a single field to sanitize. Fields: `pattern` (required), `category` (default `custom:field`), `label` (optional), `min_length` (optional — values shorter than this are passed through unchanged, useful with broad glob patterns like `*token*` to skip short non-secret values such as `"false"` or `"0"`), `sub_processor` (optional — name of processor to use when the field's value is an embedded structured document), `sub_fields` (optional — field rules applied by `sub_processor`). |
 
 ## Archive Module (`processor::archive`)
 
@@ -204,6 +206,53 @@ When `--extract-context` is used, each file entry in the report's `files` array 
 | `serialize_secrets(entries, format)` | Serialize `Vec<SecretEntry>` back to JSON, YAML, or TOML bytes. |
 | `entries_to_patterns(entries)` | Convert `Vec<SecretEntry>` to `(Vec<ScanPattern>, warnings)`. Patterns that fail to compile are skipped and returned in warnings. |
 | `parse_category(s)` | Parse a category string (`"email"`, `"custom:tag"`, etc.) into a `Category`. |
+
+## Allowlist Module (`allowlist`)
+
+The allowlist suppresses specific values from sanitization. Values that match an allowlist entry are returned unchanged and are **not** recorded in the `MappingStore` — they will pass through in every file processed in the same run.
+
+| Type / Function | Description |
+|-----------------|-------------|
+| `AllowlistMatcher` | Compiled allowlist. Exact patterns are stored in a `HashSet` for O(1) lookup; glob patterns (containing `*`) are stored in a `Vec` and scanned linearly on hash miss. |
+| `AllowlistMatcher::new(patterns)` | Build a **case-insensitive** matcher. Both patterns and query values are lowercased before comparison, so `"Localhost"` matches a pattern of `"localhost"` and vice-versa. This is the default for allowlists loaded from secrets files. |
+| `AllowlistMatcher::new_case_sensitive(patterns)` | Build a **case-sensitive** matcher. Use when exact-case matching is required (e.g. allowlisting a known token that must not match a differently-cased substring). |
+| `AllowlistMatcher::is_allowed(value)` | Returns `true` if `value` matches any pattern. Thread-safe; increments an internal counter. |
+| `AllowlistMatcher::match_pattern(value)` | Returns the first matching pattern string, or `None`. Useful for diagnostics (see also `sanitize allow-test`). |
+| `AllowlistMatcher::seen_count()` | Total values allowed through since construction. |
+| `AllowlistMatcher::pattern_count()` | Number of registered patterns (exact + glob). |
+| `AllowlistMatcher::is_empty()` | `true` when no patterns are registered. |
+
+**Pattern syntax** — only `*` is a wildcard (matches any sequence including empty):
+
+| Pattern | Matches |
+|---------|---------|
+| `localhost` | Exactly `localhost` (case-insensitive by default) |
+| `*.internal` | Any value ending with `.internal` |
+| `192.168.1.*` | Any value starting with `192.168.1.` |
+| `user-*@corp.com` | Prefix `user-`, suffix `@corp.com` |
+| `*` | Anything |
+
+```rust
+use sanitize_engine::allowlist::AllowlistMatcher;
+
+let (matcher, warnings) = AllowlistMatcher::new(vec![
+    "localhost".into(),
+    "*.internal".into(),
+    "192.168.1.*".into(),
+]);
+assert!(warnings.is_empty());
+
+assert!(matcher.is_allowed("localhost"));
+assert!(matcher.is_allowed("LOCALHOST"));           // case-insensitive default
+assert!(matcher.is_allowed("db.internal"));
+assert!(matcher.is_allowed("192.168.1.42"));
+assert!(!matcher.is_allowed("8.8.8.8"));
+
+// Case-sensitive for exact-token matching:
+let (cs, _) = AllowlistMatcher::new_case_sensitive(vec!["MyToken".into()]);
+assert!(cs.is_allowed("MyToken"));
+assert!(!cs.is_allowed("mytoken"));
+```
 
 ## Error Module (`error`)
 

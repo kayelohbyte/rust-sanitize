@@ -28,7 +28,7 @@
 //!
 //! ## Stability
 //!
-//! As of 1.0.0 the public API is stable and follows Semantic Versioning.
+//! As of 0.8.0 the public API is considered stable and follows Semantic Versioning.
 //! Breaking changes require a major version bump. The core guarantees —
 //! one-way replacement, deterministic mode, and length preservation — are
 //! stable across all 1.x releases. Processor heuristics, default limit

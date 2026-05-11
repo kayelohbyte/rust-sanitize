@@ -12,7 +12,21 @@
 //! - **Atomic get-or-insert** via the `entry()` API, which prevents TOCTOU races
 //!   and guarantees first-writer-wins semantics.
 //!
-//! The forward map is keyed by `(Category, original)` → `sanitized`.
+//! # Structure
+//!
+//! The forward map is two-level: `Category → original → sanitized`.
+//!
+//! ```text
+//! DashMap<Category, Arc<DashMap<ZeroizingString, (CompactString, usize)>>>
+//!    outer (~20 entries, always hot in cache)
+//!               └── inner (one per category, holds the actual values)
+//! ```
+//!
+//! This lets the fast-path read call `inner.get(original: &str)` without
+//! constructing a temporary `String`, because `ZeroizingString: Borrow<str>`.
+//! For files where the same value appears thousands of times, this eliminates
+//! thousands of `malloc`/`free` cycles on the hot path.
+//!
 //! Replacements are **one-way only** — there is no reverse map, no mapping
 //! file, and no restore capability.
 //!
@@ -31,12 +45,13 @@ use crate::error::{Result, SanitizeError};
 use crate::generator::ReplacementGenerator;
 use compact_str::CompactString;
 use dashmap::DashMap;
+use std::borrow::Borrow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use zeroize::Zeroize;
 
 // ---------------------------------------------------------------------------
-// Composite key for the forward map
+// ZeroizingString — map key for the inner (per-category) DashMap
 // ---------------------------------------------------------------------------
 
 /// A `String` that zeroizes its heap buffer on drop.
@@ -44,6 +59,10 @@ use zeroize::Zeroize;
 /// `Zeroizing<String>` from the `zeroize` crate does not implement `Hash`,
 /// so it cannot be used as a `HashMap` key. This newtype adds `Hash` while
 /// keeping the zeroize-on-drop guarantee via an explicit `Drop` impl.
+///
+/// Implementing `Borrow<str>` allows `DashMap<ZeroizingString, _>::get(s: &str)`
+/// to work without constructing a temporary `ZeroizingString` — the key insight
+/// that makes the fast-path read allocation-free.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ZeroizingString(String);
 
@@ -59,16 +78,20 @@ impl Drop for ZeroizingString {
     }
 }
 
-/// Composite key: `(Category, original_value)`.
-///
-/// `original` is `ZeroizingString` so that every copy of the sensitive
-/// plaintext — both the short-lived temporary key on the fast-path lookup
-/// and the long-lived stored key — is overwritten when dropped.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ForwardKey {
-    category: Category,
-    original: ZeroizingString,
+/// Enables `DashMap<ZeroizingString, _>::get(s: &str)` — zero allocation on
+/// cache hits. Correct because `ZeroizingString` delegates `Hash` and `Eq`
+/// to its inner `String`, which is consistent with `str`'s `Hash` and `Eq`.
+impl Borrow<str> for ZeroizingString {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Convenience type alias for the inner map
+// ---------------------------------------------------------------------------
+
+type InnerMap = DashMap<ZeroizingString, (CompactString, usize)>;
 
 // ---------------------------------------------------------------------------
 // MappingStore
@@ -82,12 +105,13 @@ struct ForwardKey {
 ///
 /// See the [module-level documentation](self) for concurrency and memory details.
 pub struct MappingStore {
-    /// `(category, original) → (sanitized, insertion_index)`
+    /// `category → original → (sanitized, insertion_index)`
     ///
-    /// The `usize` is the monotonic insertion index (equal to `len` at the
-    /// time of insert). This allows `iter_since(snapshot)` to return only
-    /// entries added after a snapshot point without building a full HashSet.
-    forward: DashMap<ForwardKey, (CompactString, usize)>,
+    /// Two-level map: outer is keyed by `Category` (tiny, always in cache),
+    /// inner is keyed by `ZeroizingString` (actual values). The inner map is
+    /// behind an `Arc` so it can be obtained without holding the outer shard
+    /// lock during inner map operations.
+    forward: DashMap<Category, Arc<InnerMap>>,
     /// Replacement generator (HMAC deterministic or CSPRNG random).
     generator: Arc<dyn ReplacementGenerator>,
     /// Current number of mappings (atomic for lock-free reads).
@@ -111,7 +135,7 @@ impl MappingStore {
     #[must_use]
     pub fn new(generator: Arc<dyn ReplacementGenerator>, capacity_limit: Option<usize>) -> Self {
         Self {
-            forward: DashMap::with_capacity(1024),
+            forward: DashMap::with_capacity(32),
             generator,
             len: AtomicUsize::new(0),
             capacity_limit,
@@ -128,7 +152,7 @@ impl MappingStore {
         allowlist: Arc<AllowlistMatcher>,
     ) -> Self {
         Self {
-            forward: DashMap::with_capacity(1024),
+            forward: DashMap::with_capacity(32),
             generator,
             len: AtomicUsize::new(0),
             capacity_limit,
@@ -147,11 +171,15 @@ impl MappingStore {
     ///
     /// This is the primary API for one-way sanitization.
     ///
+    /// **Hot-path allocation:** When the value is already cached, this method
+    /// is allocation-free. The inner `DashMap::get` accepts `&str` directly via
+    /// `ZeroizingString: Borrow<str>`, so no temporary `String` is constructed.
+    ///
     /// **Thread-safety:** Uses `DashMap::entry()` which holds a shard-level
     /// lock only for the duration of the insert closure. The generator is
     /// called inside the lock, but generation is fast (one HMAC or one RNG
     /// call). Capacity enforcement uses `compare_exchange` to prevent
-    /// TOCTOU over-insertion (C-1 fix).
+    /// TOCTOU over-insertion.
     ///
     /// **Per-run consistency:** Once a value is mapped, all subsequent
     /// lookups return the same sanitized value (first-writer-wins).
@@ -168,32 +196,42 @@ impl MappingStore {
             }
         }
 
-        // Fast path: already mapped (lock-free read).
-        // Zeroizing<String> ensures this temporary key is overwritten on drop.
-        let key = ForwardKey {
-            category: category.clone(),
-            original: ZeroizingString(original.to_owned()),
-        };
-        if let Some(existing) = self.forward.get(&key) {
-            return Ok(existing.value().0.clone());
+        // Fast path: already mapped — zero allocation.
+        // `inner.get(original)` accepts `&str` via `ZeroizingString: Borrow<str>`.
+        if let Some(inner) = self.forward.get(category) {
+            if let Some(existing) = inner.value().get(original) {
+                return Ok(existing.value().0.clone());
+            }
         }
 
-        // Slow path: need to insert.
-        // Atomically reserve a capacity slot *before* generating the
-        // value.  This eliminates the TOCTOU race (C-1) where multiple
-        // threads pass the capacity check and all insert.
+        // Slow path: get or create the inner map for this category, then insert.
+        // Try a read-lock get first — inner maps are stable once created, so
+        // this is the common case for any category seen before. Only fall back
+        // to the write-locking entry() when creating a category's map for the
+        // first time (happens at most once per category per run).
+        let inner: Arc<InnerMap> = if let Some(existing) = self.forward.get(category) {
+            existing.value().clone()
+        } else {
+            self.forward
+                .entry(category.clone())
+                .or_insert_with(|| Arc::new(DashMap::new()))
+                .value()
+                .clone()
+        };
+
         if let Some(limit) = self.capacity_limit {
+            // Atomically reserve a capacity slot *before* generating the value.
+            // This eliminates the TOCTOU race where multiple threads pass the
+            // capacity check and all insert.
             loop {
                 let current = self.len.load(Ordering::Acquire);
                 if current >= limit {
-                    // One more chance: key may have been inserted by
-                    // another thread while we were checking.
-                    if let Some(existing) = self.forward.get(&key) {
+                    // One more chance: key may have been inserted by another thread.
+                    if let Some(existing) = inner.get(original) {
                         return Ok(existing.value().0.clone());
                     }
                     return Err(SanitizeError::CapacityExceeded { current, limit });
                 }
-                // Try to reserve a slot atomically.
                 if self
                     .len
                     .compare_exchange_weak(
@@ -209,13 +247,11 @@ impl MappingStore {
                 // CAS failed → another thread incremented; retry.
             }
 
-            // Slot reserved — generate and insert.
-            // Use entry() for first-writer-wins semantics.
+            // Slot reserved — generate and insert (first-writer-wins).
             let mut was_inserted = false;
             let insertion_index = self.len.load(Ordering::Acquire).saturating_sub(1);
-            let result = self
-                .forward
-                .entry(key)
+            let result = inner
+                .entry(ZeroizingString(original.to_owned()))
                 .or_insert_with(|| {
                     was_inserted = true;
                     let val = self.generator.generate(category, original);
@@ -232,11 +268,10 @@ impl MappingStore {
 
             Ok(result)
         } else {
-            // No capacity limit — generate inside the entry lock to
-            // avoid wasted work (C-2 fix: only the first writer generates).
-            let result = self
-                .forward
-                .entry(key)
+            // No capacity limit — generate inside the entry lock so only the
+            // first writer calls the generator (first-writer-wins semantics).
+            let result = inner
+                .entry(ZeroizingString(original.to_owned()))
                 .or_insert_with(|| {
                     let insertion_index = self.len.fetch_add(1, Ordering::AcqRel);
                     let val = self.generator.generate(category, original);
@@ -253,11 +288,8 @@ impl MappingStore {
     /// Look up an existing forward mapping without creating one.
     #[must_use]
     pub fn forward_lookup(&self, category: &Category, original: &str) -> Option<CompactString> {
-        let key = ForwardKey {
-            category: category.clone(),
-            original: ZeroizingString(original.to_owned()),
-        };
-        self.forward.get(&key).map(|r| r.value().0.clone())
+        let inner = self.forward.get(category)?;
+        inner.value().get(original).map(|r| r.value().0.clone())
     }
 
     // ---------------- Metrics ----------------
@@ -279,7 +311,10 @@ impl MappingStore {
     /// This is useful for resetting the store between runs without
     /// dropping and recreating it.
     pub fn clear(&mut self) {
-        // Dropping the map entries triggers Zeroizing<String>::drop on each key.
+        // Dropping the map entries triggers ZeroizingString::drop on each inner key.
+        // If any cloned Arcs are still live (e.g., in a concurrent thread's stack),
+        // those inner maps survive until the last Arc drops — but `clear` is only
+        // called after all workers have finished, so this is safe in practice.
         drop(std::mem::take(&mut self.forward));
         self.len.store(0, Ordering::Release);
     }
@@ -303,23 +338,30 @@ impl MappingStore {
     ///
     /// `snapshot` is the value returned by a previous call to [`snapshot`].
     /// Entries whose insertion index is ≥ `snapshot` are yielded; older
-    /// entries are skipped.  Still O(n) in total store size, but avoids
+    /// entries are skipped. Still O(n) in total store size, but avoids
     /// allocating a `HashSet` of all prior keys.
     pub fn iter_since(
         &self,
         snapshot: usize,
     ) -> impl Iterator<Item = (Category, CompactString, CompactString)> + '_ {
-        self.forward.iter().filter_map(move |entry| {
-            let (sanitized, idx) = entry.value();
-            if *idx >= snapshot {
-                Some((
-                    entry.key().category.clone(),
-                    CompactString::new(entry.key().original.0.as_str()),
-                    sanitized.clone(),
-                ))
-            } else {
-                None
-            }
+        self.forward.iter().flat_map(move |outer| {
+            let cat = outer.key().clone();
+            outer
+                .value()
+                .iter()
+                .filter_map(move |inner| {
+                    let (sanitized, idx) = inner.value();
+                    if *idx >= snapshot {
+                        Some((
+                            cat.clone(),
+                            CompactString::new(inner.key().0.as_str()),
+                            sanitized.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
         })
     }
 
@@ -330,20 +372,27 @@ impl MappingStore {
     /// Note: iteration over `DashMap` is not snapshot-consistent if concurrent
     /// inserts are happening. Call this after all workers have finished.
     pub fn iter(&self) -> impl Iterator<Item = (Category, CompactString, CompactString)> + '_ {
-        self.forward.iter().map(|entry| {
-            (
-                entry.key().category.clone(),
-                CompactString::new(entry.key().original.0.as_str()),
-                entry.value().0.clone(),
-            )
+        self.forward.iter().flat_map(|outer| {
+            let cat = outer.key().clone();
+            outer
+                .value()
+                .iter()
+                .map(move |inner| {
+                    (
+                        cat.clone(),
+                        CompactString::new(inner.key().0.as_str()),
+                        inner.value().0.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
         })
     }
 }
 
-/// F-09 fix: zeroize original keys stored in the forward map on drop.
-/// `Zeroizing<String>` already zeroizes its buffer when dropped; we take
-/// ownership of the map so that every key's destructor runs before the
-/// backing allocation is freed.
+/// Zeroize original keys stored in the forward map on drop.
+/// Dropping the outer `DashMap` triggers `Arc::drop` for each inner map; when
+/// the last Arc drops, `ZeroizingString::drop` runs for every key, overwriting
+/// the plaintext before the memory is freed.
 impl Drop for MappingStore {
     fn drop(&mut self) {
         drop(std::mem::take(&mut self.forward));
@@ -362,9 +411,6 @@ macro_rules! static_assertions_send_sync {
     };
 }
 
-// DashMap is Send + Sync, AtomicUsize is Send + Sync,
-// Arc<dyn ReplacementGenerator> is Send + Sync.
-// This is satisfied automatically, but let's assert it:
 static_assertions_send_sync!(MappingStore);
 
 // ---------------------------------------------------------------------------
