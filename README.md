@@ -162,26 +162,26 @@ A second prompt sets the **replacement strictness** (`Balanced` or `Aggressive`)
 
 For a full step-by-step breakdown of prompts and the exact categories/patterns generated, see the `sanitize guided` section in [docs/cli-reference.md](docs/cli-reference.md).
 
-### Quick Start — Built-in Patterns (`--default`, `--app`, `--allow`)
+### Quick Start — Built-in Patterns (`--use-default`, `--app`, `--allow`)
 
-**`--default`** — scan without writing a secrets file. Covers the most common high-value secrets: API keys (AWS, GCP, GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab, SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM headers, password/secret key=value pairs, and credential URLs.
+**`--use-default`** — scan without writing a secrets file. Covers the most common high-value secrets: API keys (AWS, GCP, GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab, SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM headers, password/secret key=value pairs, and credential URLs.
 
 ```bash
 # No secrets file required:
-sanitize data.log --default
+sanitize data.log --use-default
 
 # Dry-run to see what would be replaced:
-sanitize data.log --default -n
+sanitize data.log --use-default -n
 
 # Fail CI if anything is detected:
-sanitize config.yaml --default --fail-on-match
+sanitize config.yaml --use-default --fail-on-match
 ```
 
-`--default` cannot be combined with `--secrets-file`. Use `--secrets-file` when you need custom patterns on top.
+`--use-default` is additive with `--secrets-file`, `--app`, and `--profile` — combine them to extend the built-in patterns with your own.
 
 **`--app`** — load a built-in bundle for a specific application. Each bundle provides both a secrets pattern set and a structured field profile so field-level sanitization works out of the box.
 
-Built-in bundles: `docker-compose`, `django`, `gitlab`, `kubernetes`, `nginx`, `postgresql`, `rails`, `spring-boot`.
+Run `sanitize apps` (or the `list_apps` MCP tool) to see all available bundles. Built-in bundles include: `ansible`, `aws-cli`, `circleci`, `django`, `docker-compose`, `elasticsearch`, `fstab`, `github-actions`, `gitlab`, `grafana`, `heroku`, `kubernetes`, `laravel`, `mongodb`, `mysql`, `nginx`, `postgresql`, `rails`, `redis`, `splunk`, `spring-boot`, `terraform`.
 
 ```bash
 # List available bundles (built-in and user-defined):
@@ -332,6 +332,19 @@ sanitize data.log -s secrets.enc --encrypted-secrets -p
 sanitize data.log -s secrets.enc --encrypted-secrets -P /run/secrets/pw
 ```
 
+### Startup Config Summary
+
+When running interactively (TTY or `--progress on`), `sanitize` prints a one-line-per-setting summary of the resolved configuration to stderr before processing begins:
+
+```
+  secrets:  /home/user/.config/sanitize/secrets.yaml
+  profile:  /repo/.sanitize/k8s-profile.yaml  [config]
+  apps:     k8s, database  [config]
+  flags:    --strict  [config]
+```
+
+Settings that came from `settings.yaml` or `.sanitize.toml` rather than the command line are annotated with `[config]`. Silent in pipe/script contexts (auto+non-TTY). Use `sanitize show-config` for the full effective configuration at any time.
+
 ---
 
 ## Installation
@@ -382,14 +395,23 @@ assert_eq!(sanitized, again);
 
 ### As an MCP server
 
+The `sanitize-mcp` binary wraps the `sanitize` CLI as an MCP server. All sensitive data processing happens inside the audited Rust CLI — the MCP layer handles only protocol framing. This means files are sanitized **before** their contents enter the LLM context window.
+
 Download the `sanitize-mcp` binary for your platform from the [Releases](https://github.com/kayelohbyte/rust-sanitize/releases) page (no Deno or Node required — the runtime is embedded).
 
-Add it to your MCP client config. Example for Claude Desktop (`claude_desktop_config.json`):
+**Claude Code:**
+
+```bash
+claude mcp add sanitize-engine /usr/local/bin/sanitize-mcp \
+  -e SANITIZE_BIN=/usr/local/bin/sanitize
+```
+
+**Claude Desktop** (`claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
-    "sanitize": {
+    "sanitize-engine": {
       "command": "/usr/local/bin/sanitize-mcp",
       "env": {
         "SANITIZE_BIN": "/usr/local/bin/sanitize"
@@ -399,26 +421,308 @@ Add it to your MCP client config. Example for Claude Desktop (`claude_desktop_co
 }
 ```
 
-**Environment variables:**
+**Run from source** with [Deno](https://deno.land) 2.x (no compile step):
+
+```bash
+SANITIZE_BIN=/usr/local/bin/sanitize \
+  deno run --allow-run --allow-env --allow-read --allow-write \
+  mcp/src/index.ts
+```
+
+#### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SANITIZE_BIN` | `sanitize` | Path to the `sanitize` binary |
-| `SANITIZE_MCP_MAX_CONTENT_BYTES` | `524288` (512 KB) | Per-call content size limit |
-| `SANITIZE_SECRETS_DIR` | _(unset)_ | Root directory for per-namespace secrets. Each subdirectory is a namespace and may contain `secrets.yaml` (or `.enc`), `profile.yaml`, and an optional `.password` file (`0600`/`0400` permissions enforced). |
+| `SANITIZE_MCP_MAX_CONTENT_BYTES` | `524288` (512 KB) | Per-call inline content size limit |
+| `SANITIZE_MCP_TIMEOUT_MS` | `60000` (60 s) | Subprocess timeout — kills the CLI and returns an error if exceeded |
+| `SANITIZE_MCP_THREADS` | _(unset = CLI default = logical CPUs)_ | Worker thread cap for every invocation — useful on shared hosts |
+| `SANITIZE_MCP_MAX_ARCHIVE_DEPTH` | `2` | Default max archive nesting depth (CLI default is 3; MCP default is lower to limit zip-bomb exposure) |
+| `SANITIZE_SECRETS_DIR` | _(unset)_ | Root directory for per-namespace secrets. Each subdirectory is a namespace and may contain `secrets.yaml[.enc]`, `profile.yaml`, and an optional `.password` file (`0600`/`0400` permissions enforced). |
 
-**Available tools:**
+#### Available tools
 
-| Tool | Key parameters | Description |
-|------|----------------|-------------|
-| `sanitize` | `content`, `secrets_file`, `patterns`, `seed`, `format`, `namespace`, `use_default`, `app`, `allow`, `extract_context`, `context_keywords`, `max_context_matches`, `context_lines`, `context_case_sensitive` | Sanitize sensitive values in text. Namespace takes priority over inline patterns/secrets file. Returns plain text or a `{ content, report }` object when `extract_context` is true. |
-| `scan` | `content`, `secrets_file`, `patterns`, `format`, `namespace`, `use_default`, `app`, `allow` | Scan text for sensitive values and return a structured match report without modifying content. |
-| `strip_config_values` | `content`, `delimiter`, `comment_prefix` | Strip values from a key/value config file, preserving keys, comments, and structure. |
-| `test_allowlist` | `patterns`, `values` | Test which values match a set of allowlist patterns. Returns per-value match results with the matched pattern and a summary count. Use this to verify `--allow` globs before running a full sanitization. |
-| `list_processors` | _(none)_ | Return the list of valid processor names for use in `format` parameters and profile YAML `processor` fields. |
-| `list_templates` | _(none)_ | List built-in LLM prompt templates. |
+| Tool | Description |
+|------|-------------|
+| `sanitize` | Sanitize inline text or files. Set `llm_template: 'troubleshoot'` or `'review-config'` for a fully-formatted LLM prompt. |
+| `scan` | Scan for secrets and return a report without modifying content. |
+| `strip_config_values` | Strip values from key=value config files, preserving keys and structure. |
+| `test_allowlist` | Test which values match a set of allowlist patterns. |
+| `list_apps` | List all available app bundles (built-in + user-defined). |
+| `init` | Create a starter secrets file on disk from a preset template and return its contents. |
+| `build_secrets` | Build a tailored secrets file from specific patterns. The setup workflow: scan → identify gaps → build_secrets → sanitize. |
+| `test_pattern` | Test which values are matched by a secrets file, app bundle, or inline patterns. Returns per-value match results. |
 
-**Namespace-based secrets (multi-tenant / MSP)**
+---
+
+#### MCP examples
+
+All examples show the JSON parameters passed to the relevant tool.
+
+##### Sanitize inline content
+
+Inline text is piped through the CLI via stdin — content never touches disk.
+
+```json
+{
+  "tool": "sanitize",
+  "content": "Error connecting to postgres://admin:hunter2@db.internal:5432/prod",
+  "use_default": true
+}
+```
+
+Returns the sanitized string. `use_default` enables the built-in pattern set covering API keys, emails, IPs, JWTs, UUIDs, and credential URLs with no secrets file required.
+
+##### Sanitize files before the LLM reads them
+
+Pass file paths via `files` — the CLI processes them directly and the raw content never enters the LLM context window.
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["/etc/gitlab/gitlab.rb", "/var/log/gitlab/production_json.log"],
+  "app": ["gitlab"]
+}
+```
+
+Returns a `results` array — one entry per input file — each containing `input` (original path), `file` (output filename), and `content` (sanitized text).
+
+##### Get a fully-formatted LLM prompt (the main workflow)
+
+Set `llm_template` to skip raw sanitized text and get a structured prompt ready to paste directly into a conversation. This is the fastest path from raw logs/configs to actionable LLM analysis.
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["/var/log/app.log"],
+  "use_default": true,
+  "llm_template": "troubleshoot"
+}
+```
+
+Returns a pre-structured incident-triage prompt with the sanitized content embedded. Use `"review-config"` for configuration audit:
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["/etc/gitlab/gitlab.rb"],
+  "app": ["gitlab"],
+  "llm_template": "review-config"
+}
+```
+
+Combine with `extract_context` to have notable error/warning events surfaced and highlighted inside the prompt:
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["app.log"],
+  "use_default": true,
+  "llm_template": "troubleshoot",
+  "extract_context": true,
+  "context_lines": 15,
+  "context_keywords": ["timeout", "oomkilled", "segfault"]
+}
+```
+
+##### Multiple files with a secrets file
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["app.log", "config.yaml", "backup.zip"],
+  "secrets_file": "secrets.yaml",
+  "profile": "profile.yaml"
+}
+```
+
+Archives are extracted, sanitized entry-by-entry, and re-packaged. Archive results carry `binary: true` and `size` instead of inline `content`.
+
+##### Archive entry filtering
+
+Use `archive_filters` to restrict which entries inside an archive are processed — equivalent to the CLI's `--only` / `--exclude` flags.
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["backup.zip", "logs.tar.gz"],
+  "archive_filters": [
+    {
+      "path": "backup.zip",
+      "only": ["config/", "**/*.json"],
+      "exclude": ["config/secrets.json"]
+    },
+    {
+      "path": "logs.tar.gz",
+      "only": ["**/*.log"]
+    }
+  ],
+  "use_default": true
+}
+```
+
+Patterns follow the same rules as the CLI: `*` does not cross `/`, `**` does, trailing `/` is a directory-prefix match.
+
+##### Scan for secrets (audit without modifying)
+
+Returns a structured JSON report of what would be replaced — nothing is written.
+
+```json
+{
+  "tool": "scan",
+  "files": ["config.yaml"],
+  "app": ["gitlab"],
+  "use_default": true
+}
+```
+
+##### Security gate — fail if secrets are detected
+
+`fail_on_match` adds a `secrets_detected` boolean to the response. Agents can branch on it without parsing the full report.
+
+```json
+{
+  "tool": "scan",
+  "files": ["terraform.tfvars"],
+  "use_default": true,
+  "fail_on_match": true
+}
+```
+
+Returns `{ "secrets_detected": true, "report": { ... } }` if secrets are found, `{ "secrets_detected": false, "report": { ... } }` otherwise.
+
+##### App bundles
+
+App bundles pair a secrets pattern set with a structured field profile for a specific application. Pass one or more bundle names to `app`.
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["/etc/nginx/nginx.conf"],
+  "app": ["nginx"]
+}
+```
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["docker-compose.yml", "values.yaml"],
+  "app": ["docker-compose", "kubernetes"]
+}
+```
+
+Use `list_apps` to discover all available bundle names including any user-defined bundles:
+
+```json
+{ "tool": "list_apps" }
+```
+
+##### Extract context (error/warning snippets)
+
+`extract_context` scans the sanitized output for error/warning keywords and returns a structured context report alongside the sanitized content. Requires `extract_context: true` on the `sanitize` tool.
+
+```json
+{
+  "tool": "sanitize",
+  "content": "...",
+  "use_default": true,
+  "extract_context": true,
+  "context_lines": 10,
+  "context_keywords": ["timeout", "connection refused"],
+  "max_context_matches": 100
+}
+```
+
+Response becomes `{ content, report }`. `report` contains per-file match lists with surrounding lines.
+
+To use an entirely custom keyword set (replacing the built-in defaults), add `context_keywords_replace: true`:
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["app.log"],
+  "use_default": true,
+  "extract_context": true,
+  "context_keywords": ["FATAL", "OOM"],
+  "context_keywords_replace": true
+}
+```
+
+##### Deterministic replacements
+
+Supply a `seed` for HMAC-deterministic mode. Identical seed + identical input → identical replacements across calls and sessions.
+
+```json
+{
+  "tool": "sanitize",
+  "content": "alice@corp.com logged in from 10.0.1.5",
+  "use_default": true,
+  "seed": "session-2024-incident-42"
+}
+```
+
+Use the same `seed` in follow-up calls to get consistent replacements when correlating sanitized data across multiple files.
+
+##### Inline patterns (no secrets file)
+
+Define patterns directly in the tool call using the `patterns` array. Supports `regex`, `literal`, and `allow` kinds.
+
+```json
+{
+  "tool": "sanitize",
+  "content": "user alice@corp.com, token sk-proj-abc123, host db.internal",
+  "patterns": [
+    { "name": "corp_email",  "pattern": "alice@corp\\.com",   "category": "email",      "kind": "regex" },
+    { "name": "openai_key",  "pattern": "sk-proj-abc123",     "category": "auth_token", "kind": "literal" },
+    { "name": "safe_host",   "pattern": "*.internal",          "category": "auth_token", "kind": "allow" }
+  ]
+}
+```
+
+`allow` entries pass through unchanged and are not recorded in the mapping store. `kind` defaults to `"literal"` when omitted.
+
+##### Force streaming scan (bypass structured processors)
+
+`force_text` skips all structured processors (JSON, YAML, etc.) and runs only the byte-level streaming scanner. Use when the format is ambiguous or when guaranteed full-byte coverage is required regardless of field rules.
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["unknown-format.dat"],
+  "use_default": true,
+  "force_text": true
+}
+```
+
+##### Binary entries in archives
+
+By default, binary entries inside archives are skipped. Set `include_binary: true` to process them.
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["mixed-content.zip"],
+  "use_default": true,
+  "include_binary": true
+}
+```
+
+##### Archive depth limit
+
+Override the server-wide archive depth default on a per-call basis. Useful for known-safe deeply nested archives.
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["nested.tar.gz"],
+  "use_default": true,
+  "max_archive_depth": 4
+}
+```
+
+The MCP server default is `2` (lower than the CLI's `3`). Override the server default for all calls via the `SANITIZE_MCP_MAX_ARCHIVE_DEPTH` environment variable.
+
+##### Namespace-based secrets (multi-tenant / MSP)
 
 Set `SANITIZE_SECRETS_DIR` to a directory and create one subdirectory per customer or software type:
 
@@ -427,21 +731,281 @@ Set `SANITIZE_SECRETS_DIR` to a directory and create one subdirectory per custom
   acme-corp/
     secrets.yaml        # or secrets.yaml.enc
     profile.yaml        # optional structured-field profile
-    .password           # optional; must be chmod 0600
+    .password           # required if encrypted; must be chmod 0600
   widgets-inc/
     secrets.yaml.enc
     .password
 ```
 
-Pass `namespace: "acme-corp"` in `sanitize` or `scan` tool calls. The server loads only that namespace's secrets and profile, keeping pattern sets isolated and avoiding false positives across tenants.
+Pass `namespace` in `sanitize` or `scan` tool calls. The server loads only that namespace's secrets, profile, and password — keeping pattern sets isolated across tenants.
 
-Alternatively, run from source with [Deno](https://deno.land) 2.x:
+```json
+{
+  "tool": "sanitize",
+  "files": ["/var/log/acme/app.log"],
+  "namespace": "acme-corp"
+}
+```
+
+```json
+{
+  "tool": "scan",
+  "files": ["report.json"],
+  "namespace": "widgets-inc",
+  "fail_on_match": true
+}
+```
+
+An explicit `profile` parameter overrides the namespace's `profile.yaml` when both are present.
+
+##### Strip config values (reveal structure only)
+
+`strip_config_values` removes all values from a key=value config file, leaving keys, comments, and structure. Useful for sharing config layout without exposing secrets. Accepts inline `content` or `files`.
+
+```json
+{
+  "tool": "strip_config_values",
+  "files": ["/etc/gitlab/gitlab.rb"]
+}
+```
+
+```json
+{
+  "tool": "strip_config_values",
+  "content": "REDIS_URL=redis://user:pass@cache.internal:6379/0\nDEBUG=false",
+  "delimiter": "="
+}
+```
+
+For colon-delimited formats (nginx, some `.conf` files):
+
+```json
+{
+  "tool": "strip_config_values",
+  "files": ["nginx.conf"],
+  "delimiter": " ",
+  "comment_prefix": "#"
+}
+```
+
+##### Test allowlist patterns
+
+Verify that glob patterns match the intended values before committing to a full run.
+
+```json
+{
+  "tool": "test_allowlist",
+  "patterns": ["*.internal", "192.168.1.*", "localhost"],
+  "values": ["db.internal", "192.168.1.50", "api.example.com", "localhost"]
+}
+```
+
+Returns a per-value result showing which pattern matched (or none), plus a summary count.
+
+##### Test patterns before sanitizing
+
+`test_pattern` checks which values would be matched by a secrets file, app bundle, or inline patterns — without processing any files.
+
+```json
+{
+  "tool": "test_pattern",
+  "values": ["glpat-abc123xyz", "AKIA1234567890ABCDEF", "safe-value"],
+  "app": ["gitlab"]
+}
+```
+
+Returns a per-value result showing which pattern matched and what replacement category applies. Exit code 1 (some values unmatched) is treated as informational — the JSON result is always returned.
+
+##### Build a tailored secrets file
+
+After scanning content and spotting what the default patterns missed, use `build_secrets` to create a targeted secrets file for those specific values. The workflow:
+
+1. `scan` with `use_default: true` to see what's already caught
+2. Identify patterns that weren't matched (specific tokens, internal hostnames, etc.)
+3. `build_secrets` to write a file covering those gaps
+4. `sanitize` with the new `secrets_file`
+
+```json
+{
+  "tool": "build_secrets",
+  "output_path": "secrets.yaml",
+  "preset": "generic",
+  "entries": [
+    { "label": "gitlab_token", "pattern": "glpat-[A-Za-z0-9_-]{20}", "kind": "regex", "category": "auth_token" },
+    { "label": "internal_db_host", "pattern": "db.internal.corp", "kind": "literal", "category": "hostname" }
+  ]
+}
+```
+
+Omit `preset` to create a file with only the entries you specify. Returns the written file content.
+
+##### Shannon entropy detection
+
+Add `entropy_threshold` to the sanitize tool to catch high-entropy tokens beyond pattern matching:
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["app.log"],
+  "use_default": true,
+  "entropy_threshold": 4.5
+}
+```
+
+Tokens of 20–200 alphanumeric characters whose Shannon entropy exceeds the threshold (bits per character) are treated as secrets. Typical secrets sit above 4.5; random UUIDs sit around 3.8. Supplements pattern matching — catches high-entropy tokens not covered by your secrets file.
+
+##### Path exclusions and hidden files
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["/repo/logs/"],
+  "use_default": true,
+  "ignore_path": ["tests/fixtures/", "vendor/", "**/*.generated.*"],
+  "hidden": true
+}
+```
+
+`ignore_path` excludes paths matching glob patterns (trailing `/` prunes entire subtrees). `hidden` walks dot-files and dot-directories that would otherwise be skipped.
+
+##### Create a starter secrets file
+
+`init` writes a ready-to-use secrets YAML to disk and returns its contents so you can review and customise it immediately.
+
+```json
+{ "tool": "init", "output_path": "secrets.yaml", "preset": "web" }
+```
+
+Available presets: `generic` (default), `web`, `k8s`, `database`, `aws`. Pass `overwrite: true` to replace an existing file. Once created, pass the path via `secrets_file` on subsequent `sanitize` or `scan` calls.
+
+#### IDE & editor setup
+
+All configurations assume `sanitize-mcp` is at `/usr/local/bin/sanitize-mcp` and `sanitize` is at `/usr/local/bin/sanitize`. Adjust paths to match your installation.
+
+##### Claude Code (CLI / VS Code extension)
+
+Add at **project scope** (writes `.mcp.json` in the repo root, checked into version control):
 
 ```bash
-SANITIZE_BIN=/usr/local/bin/sanitize \
-  deno run --allow-run --allow-env --allow-read --allow-write \
-  mcp/src/index.ts
+claude mcp add --scope project sanitize-engine /usr/local/bin/sanitize-mcp \
+  -e SANITIZE_BIN=/usr/local/bin/sanitize
 ```
+
+Add at **user scope** (available in all your projects):
+
+```bash
+claude mcp add --scope user sanitize-engine /usr/local/bin/sanitize-mcp \
+  -e SANITIZE_BIN=/usr/local/bin/sanitize
+```
+
+Or write `.mcp.json` at the repo root manually:
+
+```json
+{
+  "mcpServers": {
+    "sanitize-engine": {
+      "command": "/usr/local/bin/sanitize-mcp",
+      "env": {
+        "SANITIZE_BIN": "/usr/local/bin/sanitize"
+      }
+    }
+  }
+}
+```
+
+##### Cursor
+
+**Project scope** — create `.cursor/mcp.json` in the repo root:
+
+```json
+{
+  "mcpServers": {
+    "sanitize-engine": {
+      "command": "/usr/local/bin/sanitize-mcp",
+      "args": [],
+      "env": {
+        "SANITIZE_BIN": "/usr/local/bin/sanitize"
+      }
+    }
+  }
+}
+```
+
+**Global scope** — same format at `~/.cursor/mcp.json`.
+
+Requires Cursor 0.43 or later. Restart Cursor after editing the file.
+
+##### Neovim
+
+**mcphub.nvim** — add to `~/.config/mcphub/servers.json`:
+
+```json
+{
+  "servers": {
+    "sanitize-engine": {
+      "command": "/usr/local/bin/sanitize-mcp",
+      "args": [],
+      "env": {
+        "SANITIZE_BIN": "/usr/local/bin/sanitize"
+      }
+    }
+  }
+}
+```
+
+**codecompanion.nvim** (v19+, built-in MCP support) — add to your Lua config:
+
+```lua
+require("codecompanion").setup({
+  strategies = {
+    chat = { adapter = "anthropic" },
+  },
+  extensions = {
+    mcphub = {
+      callback = "mcphub.extensions.codecompanion",
+      opts = { show_result_in_chat = true },
+    },
+  },
+})
+```
+
+**avante.nvim** — wire via mcphub bridge:
+
+```lua
+require("avante").setup({
+  provider = "claude",
+  custom_tools = require("mcphub.extensions.avante").mcp_tool(),
+  system_prompt = function()
+    local hub = require("mcphub").get_hub_instance()
+    return hub and hub:get_active_servers_prompt() or ""
+  end,
+})
+```
+
+##### OpenCode
+
+**Project scope** — create `opencode.json` in the repo root:
+
+```json
+{
+  "mcp": {
+    "sanitize-engine": {
+      "type": "local",
+      "command": ["/usr/local/bin/sanitize-mcp"],
+      "environment": {
+        "SANITIZE_BIN": "/usr/local/bin/sanitize",
+        "PATH": "{env:PATH}"
+      }
+    }
+  }
+}
+```
+
+**Global scope** — same format at `~/.config/opencode/opencode.json`. Both files are merged, so project config layers on top of global config.
+
+Use `{env:VAR}` syntax to forward existing shell variables into the server process.
+
+---
 
 ### Requirements
 
@@ -547,6 +1111,27 @@ sanitize data.csv -s s.enc --password -d
 
 ```bash
 sanitize config.yaml -s s.enc -P /run/secrets/pw --fail-on-match
+```
+
+**Shannon entropy detection (catches high-entropy tokens beyond pattern matching):**
+
+```bash
+sanitize app.log -s secrets.yaml --entropy-threshold 4.5
+sanitize ./configs/ -s secrets.yaml --entropy-threshold 4.0 --report report.json
+```
+
+**Exclude paths from scanning:**
+
+```bash
+sanitize ./logs/ -s secrets.yaml --ignore-path "tests/fixtures/"
+sanitize . --app gitlab --ignore-path "vendor/" --ignore-path "**/*.generated.*"
+```
+
+**Walk hidden files when scanning a directory:**
+
+```bash
+sanitize . -s secrets.yaml --hidden
+sanitize . --app gitlab --hidden --ignore-path ".git/"
 ```
 
 **Extract context from sanitized output (error/warning snippets for LLM sharing):**

@@ -1,5 +1,5 @@
 //! Integration tests for `--extract-context`, `--context-keywords`,
-//! `--context-keywords-only`, and `--strip-values`.
+//! `--context-keywords-replace`, and `--strip-values`.
 
 use std::fs;
 use std::io::Write;
@@ -189,7 +189,7 @@ fn extract_context_keywords_only_replaces_defaults() {
             "--extract-context",
             "--context-keywords",
             "oomkilled",
-            "--context-keywords-only",
+            "--context-keywords-replace",
             "--context-lines",
             "0",
         ])
@@ -207,12 +207,12 @@ fn extract_context_keywords_only_replaces_defaults() {
     );
 
     // The match count should be 1: "ERROR default match" must NOT match because
-    // --context-keywords-only replaced the defaults.
+    // --context-keywords-replace replaced the defaults.
     let match_count_one =
         report.contains("\"match_count\":1") || report.contains("\"match_count\": 1");
     assert!(
         match_count_one,
-        "default 'error' keyword should be suppressed by --context-keywords-only, got: {report}"
+        "default 'error' keyword should be suppressed by --context-keywords-replace, got: {report}"
     );
 }
 

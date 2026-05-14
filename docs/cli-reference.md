@@ -5,6 +5,11 @@
 ```
 sanitize [OPTIONS] [INPUT]...
 command | sanitize [OPTIONS]
+sanitize scan [OPTIONS] [INPUT]...
+sanitize test-pattern [OPTIONS] [VALUE]...
+sanitize init [OPTIONS]
+sanitize show-config
+sanitize install-hook [OPTIONS]
 sanitize guided
 sanitize apps
 sanitize apps add <NAME> [OPTIONS]
@@ -221,6 +226,7 @@ Manage app bundles: list available bundles, install custom ones, remove them, or
 sanitize apps
 sanitize apps add <NAME> [OPTIONS]
 sanitize apps remove <NAME> [OPTIONS]
+sanitize apps edit <NAME>
 sanitize apps dir
 ```
 
@@ -338,6 +344,28 @@ sanitize apps dir
 SANITIZE_APPS_DIR=/opt/sanitize/apps sanitize apps dir
 ```
 
+#### `sanitize apps edit`
+
+Copy a built-in app bundle's YAML files into the user apps directory so you can customise them. Opens the copied files in `$EDITOR` (or `$VISUAL`) if one is set.
+
+```
+sanitize apps edit <NAME>
+```
+
+| Argument | Description |
+|----------|-------------|
+| `<NAME>` | Name of the built-in bundle to copy (e.g. `rails`, `kubernetes`, `gitlab`). |
+
+```bash
+# Copy the built-in rails bundle into the user apps directory for editing:
+sanitize apps edit rails
+
+# After editing, use the customised bundle like any other:
+sanitize app.log --app rails
+```
+
+The copied files are placed in the user apps directory (see `sanitize apps dir`). To revert to the built-in version, remove the user copy with `sanitize apps remove <name> --yes`.
+
 You can also drop bundle directories manually without using `sanitize apps add`:
 
 ```
@@ -350,6 +378,311 @@ You can also drop bundle directories manually without using `sanitize apps add`:
 ```
 
 The directory name is the app name. `SANITIZE_APPS_DIR` overrides the default location. User-defined bundles take precedence over built-in bundles with the same name.
+
+### `sanitize init`
+
+One-time machine setup. Creates `~/.config/sanitize/secrets.yaml` (the auto-loaded default patterns file) and `~/.config/sanitize/settings.yaml` (persistent flag defaults). Run this once on a new machine; use `sanitize install-hook` to add a git hook to each repository separately.
+
+```
+sanitize init [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--with-hook` | Also install a git hook in the current repository after creating the config files. |
+| `--hook <pre-commit\|pre-push>` | Hook type when `--with-hook` is set (default: `pre-commit`). |
+| `--mode <scan\|sanitize>` | Hook mode when `--with-hook` is set (default: `scan`). |
+| `--global` | When `--with-hook` is set, install the hook globally for all repositories. |
+| `-f, --force` | Overwrite existing config files. |
+| `--dry-run` | Print what would be created without writing any files. |
+
+If the files already exist `init` prints a notice and does nothing unless `--force` is given.
+
+```bash
+# First-time machine setup:
+sanitize init
+
+# Setup + hook in one step:
+sanitize init --with-hook
+
+# Hook that sanitizes in place instead of blocking:
+sanitize init --with-hook --mode sanitize
+
+# Preview without writing:
+sanitize init --dry-run
+sanitize init --with-hook --dry-run
+
+# Recreate files (e.g. after a tool upgrade):
+sanitize init --force
+```
+
+---
+
+### `sanitize scan`
+
+Scan files for secrets without modifying them. Exits with code 2 if any matches are found, 0 if the input is clean. Equivalent to running the default mode with `--dry-run --fail-on-match`, but discoverable as a dedicated subcommand designed for CI.
+
+```
+sanitize scan [OPTIONS] [INPUT]...
+```
+
+| Flag | Description |
+|------|-------------|
+| `[INPUT]...` | Files, directories, or archives to scan. Omit to read from stdin. |
+| `-s, --secrets-file <FILE>` | Secrets file to match against. |
+| `--encrypted-secrets` | Secrets file is AES-256-GCM encrypted. |
+| `-p, --password` | Prompt for decryption password interactively. |
+| `-P, --password-file <FILE>` | Read decryption password from a file (0600/0400 only). |
+| `--app <APPS>` | App bundle(s) to load. Comma-separated. Repeatable. |
+| `--allow <PATTERN>` | Allow values through unchanged. Repeatable. |
+| `--profile <FILE>` | Field-level profile for structured files. |
+| `--hidden` | Walk hidden files and directories. |
+| `--ignore-path <GLOB>` | Exclude paths by glob pattern. Repeatable. |
+| `-r, --report [PATH]` | Write a JSON match report to PATH (or stderr if omitted). |
+| `--entropy-threshold <THRESHOLD>` | Enable Shannon entropy detection for high-entropy tokens (bits/char, e.g. `4.5`). Off by default. |
+| `--use-default` | Load built-in balanced detection patterns. Additive with `--secrets-file` and `--app`. |
+| `--json` | Write findings as NDJSON to stdout instead of human-readable log. One JSON object per file plus a summary line. Implies `--progress off`. |
+| `--threads <N>` | Worker thread count (default: auto). |
+| `--log-format <FMT>` | `human` (default) or `json`. |
+
+**Exit codes:** `0` = clean, `2` = matches found, `1` = error.
+
+**`--json` flag:** writes per-file findings as NDJSON to stdout instead of human-readable log output. Each line is a self-contained JSON object — one per file, plus a summary line. Implies `--no-progress`. Compatible with `jq`, SIEM ingest, and line-oriented JSON tools.
+
+```
+{"type":"file","file":"app.log","matches":3,"clean":false,"patterns":{"aws_access_key":2,"github_pat":1},"bytes_processed":4096}
+{"type":"file","file":"clean.log","matches":0,"clean":true,"bytes_processed":512}
+{"type":"summary","files":2,"matches":3,"clean":false}
+```
+
+```bash
+sanitize scan app.log -s secrets.yaml          # scan a file
+sanitize scan ./logs/ --app gitlab             # scan a directory
+sanitize scan . --ignore-path tests/fixtures/  # skip test fixtures
+git diff HEAD | sanitize scan -s secrets.yaml  # scan a patch
+
+# Machine-readable output:
+sanitize scan ./logs/ --app gitlab --json
+sanitize scan ./logs/ --app gitlab --json | jq 'select(.type=="file" and .clean==false)'
+sanitize scan ./logs/ --app gitlab --json | jq -r 'select(.type=="summary") | .matches'
+```
+
+---
+
+### `sanitize test-pattern`
+
+Test whether secrets patterns match example values. Useful when authoring custom entries in a secrets file — shows exactly which pattern matched, the matched span, and which part would be replaced versus preserved.
+
+```
+sanitize test-pattern [OPTIONS] [VALUE]...
+```
+
+| Flag | Description |
+|------|-------------|
+| `-P, --pattern <REGEX>` | Inline regex to test. Repeatable. |
+| `-s, --secrets-file <FILE>` | Test all patterns from this file. |
+| `--app <APPS>` | Test patterns from app bundle(s). |
+| `[VALUE]...` | Example strings to test. Omit to read from stdin (one per line). |
+| `--json` | Output results as JSON. |
+
+All three pattern sources are additive — you can combine `--pattern`, `--secrets-file`, and `--app` in one invocation.
+
+**Output:** Each value is printed with ✓ (matched) or ✗ (no match). For matches, the label, category, matched text, and byte span are shown. When a pattern uses capture group 1, the output notes "partial — prefix/suffix preserved" to show that the surrounding context would be kept verbatim.
+
+**Exit codes:** `0` = all values matched at least one pattern, `1` = one or more values unmatched (useful for scripting).
+
+```bash
+# Test an inline pattern:
+sanitize test-pattern --pattern 'ghp_([A-Za-z0-9_]{36})' 'ghp_abc123...'
+
+# Test all patterns in a secrets file:
+sanitize test-pattern -s secrets.yaml 'my-secret' 'safe-value'
+
+# Test an app bundle's patterns:
+sanitize test-pattern --app gitlab 'glpat-abc123xyz'
+
+# Read values from stdin:
+echo 'AKIA1234567890ABCDEF' | sanitize test-pattern --app aws
+
+# JSON output for scripting:
+sanitize test-pattern -s secrets.yaml --json 'value1' 'value2'
+```
+
+---
+
+### `sanitize show-config`
+
+Print the effective configuration that will apply on the next `sanitize` run: the global secrets and settings files, the project-level `.sanitize.toml` (if any), and which values are active versus using their defaults.
+
+```
+sanitize show-config
+```
+
+No flags.
+
+```bash
+sanitize show-config
+SANITIZE_NO_SETTINGS=1 sanitize show-config   # see a no-settings invocation
+SANITIZE_NO_CONFIG=1   sanitize show-config   # see without project config
+```
+
+#### Startup config summary
+
+When running in interactive mode (`--progress auto` on a TTY or `--progress on`), `sanitize` automatically prints a brief configuration summary to stderr showing which secrets file, profile, and apps are active. Settings that came from `settings.yaml` or `.sanitize.toml` rather than the CLI are annotated with `[config]`. This output is silent in pipe and script contexts.
+
+Example:
+
+```
+  secrets:  /home/user/.config/sanitize/secrets.yaml
+  profile:  /repo/.sanitize/k8s-profile.yaml  [config]
+  apps:     k8s, database  [config]
+  flags:    --strict  [config]
+```
+
+---
+
+### `sanitize install-hook`
+
+Install a git hook that scans staged files for secrets before each commit (or push). Run `sanitize init` first to create the default secrets file that the hook relies on. The installed script is plain POSIX sh — no external dependencies beyond `sanitize` itself. If `sanitize` is not in PATH the hook silently passes so teammates who haven't installed the tool are unaffected.
+
+```
+sanitize install-hook [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--hook <pre-commit\|pre-push>` | Git hook to install (default: `pre-commit`). |
+| `--mode <scan\|sanitize>` | `scan` (default) blocks the commit if secrets are found without modifying anything. `sanitize` rewrites staged files in place and re-stages them — committed content will differ from what you typed. |
+| `--app <NAMES>` | Comma-separated app bundles to load in addition to the default secrets file (e.g. `gitlab,kubernetes`). |
+| `-s, --secrets <FILE>` | Path to a custom secrets file to bake into the hook (overrides the auto-loaded default). |
+| `--global` | Install globally for all repositories via `~/.config/git/hooks/` (or the value of `git config --global core.hooksPath`). |
+| `-f, --force` | Overwrite an existing hook without prompting. |
+| `--remove` | Remove a hook previously installed by `sanitize install-hook`. |
+| `--dry-run` | Print the script that would be written without touching any files. |
+
+```bash
+# Most common setup — relies on the default secrets file from `sanitize init`:
+sanitize install-hook
+
+# Add app bundles on top of the default patterns:
+sanitize install-hook --app gitlab,kubernetes
+
+# Use a custom secrets file instead of the default:
+sanitize install-hook -s .sanitize/secrets.yaml
+
+# Sanitize staged files in place (they'll be modified before committing):
+sanitize install-hook --mode sanitize
+
+# Install a pre-push hook instead:
+sanitize install-hook --hook pre-push
+
+# Install globally for every repository on this machine:
+sanitize install-hook --global
+
+# Preview what would be written without installing:
+sanitize install-hook --dry-run
+
+# Uninstall:
+sanitize install-hook --remove
+sanitize install-hook --hook pre-push --remove   # remove a pre-push hook
+sanitize install-hook --global --remove          # remove a global hook
+```
+
+#### Settings file (`~/.config/sanitize/settings.yaml`)
+
+Created by `sanitize init`. Provides persistent defaults for CLI flags — values here apply when the corresponding flag is not passed on the command line. An explicit CLI flag always wins.
+
+```yaml
+# ~/.config/sanitize/settings.yaml
+
+# Load these app bundles on every run (--app).
+# app:
+#   - gitlab
+#   - kubernetes
+
+# Values that pass through unchanged; supports * glob patterns (--allow).
+# allow:
+#   - localhost
+#   - "*.internal"
+
+# Exit with code 2 when any secrets are found (--fail-on-match).
+# fail_on_match: false
+
+# Abort on the first error instead of skipping (--strict).
+# strict: false
+
+# Suppress auto-save of discovered literal values (--no-update-secrets).
+# no_update_secrets: false
+
+# Worker thread count — omit for auto-detect (--threads).
+# threads: 4
+
+# Log format: "human" or "json" for SIEM ingestion (--log-format).
+# log_format: human
+
+# Disable progress output (--no-progress).
+# no_progress: false
+```
+
+Set `SANITIZE_NO_SETTINGS=1` to skip loading the settings file entirely — useful in CI where you want fully explicit, reproducible behaviour.
+
+#### Project config (`.sanitize.toml`)
+
+Place a `.sanitize.toml` file in any directory (typically the root of a repository or a customer data directory). `sanitize` searches for it by walking up from the current working directory. Project config is applied **after** `settings.yaml` but **before** CLI flags, so it overrides global defaults while explicit flags still win.
+
+```toml
+# .sanitize.toml  — project-level config, committed to the repository
+
+# Extra app bundles to load (merged with --app / settings app).
+app = ["gitlab", "kubernetes"]
+
+# Additional allow-list values (merged with --allow / settings allow).
+allow = ["localhost", "*.internal"]
+
+# Secrets file path, relative to this file.
+# Overrides the global default (~/.config/sanitize/secrets.yaml) but is
+# itself overridden by --secrets-file on the CLI.
+secrets_file = "secrets.yaml"
+
+# Set to true when the secrets_file above is AES-GCM encrypted.
+# encrypted_secrets = false
+
+# Profile YAML for field-level rules, relative to this file.
+# profile = "sanitize.profile.yaml"
+
+# Exit 2 when any match is found (--fail-on-match).
+# fail_on_match = false
+
+# Abort on first error instead of skipping (--strict).
+# strict = false
+
+# Suppress auto-save of discovered literal values (--no-update-secrets).
+# no_update_secrets = false
+
+# Path-level exclusions — matched relative to this file's location.
+# Patterns without a `/` also match the bare filename anywhere in the tree.
+# A trailing `/` prunes the entire subtree (no files inside are scanned).
+# exclude = [
+#   "tests/fixtures/",   # fake credentials used in unit tests
+#   "vendor/",           # checked-in dependencies
+#   "**/*.generated.*",  # generated source files
+#   "docs/examples/",    # documentation with intentional example tokens
+#   "README.md",         # top-level readme often contains example snippets
+# ]
+```
+
+**Apply order (lowest to highest precedence):**
+1. Built-in defaults
+2. `~/.config/sanitize/settings.yaml` (global, per-machine)
+3. `.sanitize.toml` (per-project, committed to the repo)
+4. CLI flags (always win)
+
+**Multi-customer use:** create a `.sanitize.toml` in each customer directory pointing to that customer's `secrets_file`. Running `sanitize ./customer-a/` picks up `customer-a/.sanitize.toml` automatically.
+
+Override the file path directly with `SANITIZE_CONFIG=/path/to/file.toml`.  
+Set `SANITIZE_NO_CONFIG=1` to disable project config entirely (useful in CI or when composing flags from multiple repos).
+
+The installed script responds to `SANITIZE_SKIP=1 git commit ...` for a one-time override without using `--no-verify` (which would bypass all hooks). The hook detects husky (`.husky/` directory) and writes to the appropriate location. For lefthook and the pre-commit framework it prints instructions for manual integration.
 
 ### `sanitize allow-test`
 
@@ -461,29 +794,29 @@ sanitize template --preset aws --overwrite
 | `-r, --report [PATH]` | `-r` | Write a JSON report to `PATH` (or stderr if no path given). Use `--report -` to write the report to stdout. The report includes: `metadata` (tool version, flags), `summary` (totals, `duration_ms`, `pattern_counts`), and a `files` array with per-file `matches`, `replacements`, byte counts, `pattern_counts`, and `method`. `pattern_counts` maps each pattern `label` to its scanner hit count; it is empty (`{}`) when all matches came from the structured-processor pass or when patterns have no label. |
 | `--strict` | | Abort on the first error instead of skipping and continuing. |
 | `-d, --deterministic` | `-d` | Use HMAC-deterministic replacements (reproducible across runs with the same password). Requires a password via `SANITIZE_PASSWORD`, `--password-file`, or `-p`. |
-| `--no-update-secrets` | | Suppress the automatic save of values discovered during a profile-driven run. By default, when a profile is active (`--profile` or `--app` with a profile), any field values found are appended to `--secrets-file` (or `sanitize-discovered.yaml` if no secrets file is given) as `kind: literal` entries so future runs can match them without re-running the profile. Pass this flag to disable that write. |
+| `--no-update-secrets` | | Suppress the automatic save of values discovered during a profile-driven run. By default, when a profile is active (`--profile` or `--app` with a profile) and `--secrets-file` is provided, any field values found are appended to that file as `kind: literal` entries so future runs can match them without re-running the profile. Pass this flag to disable that write. |
 | `--include-binary` | | Process entries that appear to be binary data (default: skip). |
 | `--threads <N>` | | Number of worker threads. When multiple input files are given, files are processed in parallel up to this limit. For a single archive input, entries are sanitized in parallel using the same budget. Defaults to the number of logical CPUs. Capped to available parallelism. |
-| `--chunk-size <BYTES>` | | Chunk size for the streaming scanner in bytes (default: `1048576` = 1 MiB). |
-| `--max-mappings <N>` | | Maximum unique replacement mappings in memory (default: `10000000`). Use `0` for unlimited. |
-| `--max-structured-size <BYTES>` | | Maximum structured file size in bytes before falling back to streaming (default: `268435456` = 256 MiB). |
-| `--max-archive-depth <N>` | | Maximum nesting depth for recursive archive processing (default: `3`, max: `10`). Each nesting level may buffer up to 256 MiB. |
+| `--max-archive-depth <N>` | | Maximum nesting depth for recursive archive processing (default: `3`, max: `10`). Each nesting level may buffer up to 256 MiB. Advanced flag — hidden from `--help` but works at runtime. |
 | `--profile <FILE>` | | Path to a file-type profile (JSON or YAML). Enables structured field-level sanitization for matched files. Discovered field values are automatically saved to the secrets file after the run (see `--no-update-secrets`). Loads common allow patterns (loopback IPs, `localhost`, `example.com`, nil UUID, etc.) so those values are never replaced. See [Structured Processing](structured-processing.md). |
-| `--default` | | Use built-in balanced detection patterns without a secrets file. Covers API keys (AWS, GCP, GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab, SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM headers, password/secret key=value pairs, and credential URLs. Loads common allow patterns so loopback IPs, `localhost`, `example.com`, etc. are never replaced. Cannot be combined with `--secrets-file`. |
-| `--app <APPS>` | | Load built-in secrets patterns and structured field profiles for one or more applications. Comma-separated app names (e.g. `--app gitlab` or `--app gitlab,nginx`). Additive with `--default`, `--secrets-file`, and `--profile`. Loads common allow patterns. Run `sanitize apps` to list available app names. |
+| `--use-default` | | Use built-in balanced detection patterns without a secrets file. Covers API keys (AWS, GCP, GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab, SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM headers, password/secret key=value pairs, and credential URLs. Loads common allow patterns so loopback IPs, `localhost`, `example.com`, etc. are never replaced. Additive with `--secrets-file`, `--app`, and `--profile`. |
+| `--app <APPS>` | | Load built-in secrets patterns and structured field profiles for one or more applications. Comma-separated app names (e.g. `--app gitlab` or `--app gitlab,nginx`). Additive with `--use-default`, `--secrets-file`, and `--profile`. Loads common allow patterns. Run `sanitize apps` to list available app names. |
 | `--allow <PATTERN>` | | Allow a specific value through unchanged (repeatable). Matched values are not replaced and not recorded in the mapping store — they will pass through in every file processed in the same run. Supports exact strings and `*` glob patterns. Matching is **case-insensitive** by default (patterns and values are lowercased before comparison). Examples: `--allow localhost`, `--allow "*.internal"`, `--allow "192.168.1.*"`. Allowlist entries can also be placed in the secrets file as `kind: allow` entries. |
 | `--only <PATTERN>` | | Keep only archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--only` flags accumulate. Combined with `--exclude`: `--only` narrows first, then `--exclude` removes. Only affects archive inputs; ignored for plain files. |
 | `--exclude <PATTERN>` | | Remove archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--exclude` flags accumulate. |
 | `--log-format <FMT>` | | Log output format: `human` (default) or `json`. |
 | `--progress <MODE>` | | Progress display mode: `auto`, `on`, or `off`. Default: `auto`. |
-| `--no-progress` | | Alias for `--progress off`. |
-| `--progress-interval-ms <MS>` | | Minimum interval between progress refreshes (default: `200`). |
+| `--no-progress` | | Deprecated. Use `--progress off` instead. Hidden from `--help`. |
 | `--extract-context` | | After sanitizing, scan the output for error/warning/failure keywords and embed matching lines with surrounding context in the JSON report. Each file entry in `files[]` gets its own `log_context` object. Requires `--report`. Has no effect without `--report`. For stdout paths larger than 256 MiB the flag is silently skipped (use file output and the two-pass reader path instead). |
 | `--context-lines <N>` | | Lines of context to capture before and after each keyword match when `--extract-context` is set. Default: `10`. |
-| `--context-keywords <KEYWORDS>` | | Comma-separated list of keywords to scan for when `--extract-context` is set. Merged with the built-in defaults (`error`, `failure`, `warning`, `warn`, `fatal`, `exception`, `critical`) unless `--context-keywords-only` is also passed. Example: `--context-keywords timeout,oomkilled,backoff`. |
-| `--context-keywords-only` | | When set, `--context-keywords` replaces the built-in default keyword list entirely instead of being merged with it. Has no effect without `--context-keywords`. |
+| `--context-keywords <KEYWORDS>` | | Comma-separated list of keywords to scan for when `--extract-context` is set. Merged with the built-in defaults (`error`, `failure`, `warning`, `warn`, `fatal`, `exception`, `critical`, `panic`, `timeout`, `oomkilled`) unless `--context-keywords-replace` is also passed. Example: `--context-keywords timeout,oomkilled,backoff`. |
+| `--context-keywords-replace` | | Replace the built-in keyword list entirely with the keywords given by `--context-keywords`. Without this flag, custom keywords are merged with the built-ins. Has no effect if `--context-keywords` is not set. |
 | `--max-context-matches <N>` | | Maximum number of keyword matches to capture per file when `--extract-context` is set. Default: `50`. Once this cap is hit, `truncated: true` is set in `log_context` and the rest of the file is skipped. Increase this (not `--context-lines`) when you are missing events. |
 | `--context-case-sensitive` | | Make keyword matching case-sensitive when `--extract-context` is set. By default keywords are matched case-insensitively (`error` matches `ERROR`, `Error`, etc.). |
+| `--findings [PATH]` | | Write per-file findings as NDJSON to PATH (or stdout when PATH is omitted or `-`). Each line is a JSON object: one `{"type":"file",...}` per processed file with match count and per-pattern breakdown, followed by `{"type":"summary",...}`. In default sanitize mode, use `--output` to redirect sanitized content so stdout is free for findings. |
+| `--entropy-threshold <THRESHOLD>` | | Enable Shannon entropy detection for high-entropy tokens not caught by pattern matching. `THRESHOLD` is bits per character (e.g. `4.5`). Tokens of 20–200 alphanumeric characters whose entropy meets or exceeds this value are treated as secrets. Off by default. Supplement with `kind: entropy` entries in the secrets file for finer control. |
+| `--hidden` | | When an input is a directory, also walk hidden files and directories (names starting with `.`). VCS metadata directories (`.git`, `.hg`, `.svn`, `.bzr`) are always skipped regardless of this flag. |
+| `--ignore-path <GLOB>` | | Exclude paths matching these glob patterns from scanning (repeatable). Patterns are matched against the path relative to the input root (or against the filename alone when no `/` is present in the pattern). A trailing `/` excludes the entire subtree. Merged with `exclude` entries in `.sanitize.toml`; CLI patterns are applied in addition to, not instead of, project config patterns. Example: `--ignore-path "tests/fixtures/"`. |
 | `--force-text` | | Bypass all structured processors (JSON, YAML, XML, TOML, etc.) and run only the streaming scanner on every file. Use when you want a guarantee that every byte is pattern-scanned regardless of file type. |
 | `--strip-values` | | Strip all values from structured output, emitting only keys and structure. Useful for generating a profile template from a real config file without exposing any values. Bypasses the sanitization pipeline — no secrets file is required. |
 | `--strip-delimiter <DELIM>` | | Delimiter string used to split key/value lines when `--strip-values` is set. Default: `=`. Use `--strip-delimiter :` for YAML-style or nginx-style config files. Requires `--strip-values`. |
@@ -491,6 +824,8 @@ sanitize template --preset aws --overwrite
 | `--llm [TEMPLATE]` | | Format the sanitized output as an LLM-ready prompt written to stdout instead of writing raw sanitized bytes. `TEMPLATE` selects the instruction set: `troubleshoot` (default — root cause analysis), `review-config` (configuration review and security audit), or a path to a custom template file. Combine with `--extract-context` to include notable log events in the prompt. When this flag is set, `--output` / `-o` is ignored for the main payload (the prompt goes to stdout); `--report` still writes its JSON file normally. |
 | `-h, --help` | `-h` | Print help. |
 | `-V, --version` | `-V` | Print version. |
+
+> **Advanced / hidden flags:** `--chunk-size <BYTES>`, `--max-mappings <N>`, `--max-structured-size <BYTES>`, and `--progress-interval-ms <MS>` are performance-tuning flags that still work at runtime but are hidden from `--help`. `--max-archive-depth <N>` is also hidden from `--help` but widely useful (see table row above). Use these only when the defaults are insufficient for your workload.
 
 Log level is controlled via the `SANITIZE_LOG` environment variable (e.g. `SANITIZE_LOG=debug`).
 
@@ -756,16 +1091,16 @@ sanitize app.log -s secrets.yaml --report report.json --extract-context --contex
 sanitize app.log -s secrets.yaml --report report.json --extract-context --context-keywords timeout,oomkilled,backoff
 
 # Use only custom keywords, suppress built-in defaults:
-sanitize app.log -s secrets.yaml --report report.json --extract-context --context-keywords "timeout,oomkilled" --context-keywords-only
+sanitize app.log -s secrets.yaml --report report.json --extract-context --context-keywords "timeout,oomkilled" --context-keywords-replace
 
-# Strip values from a key=value config file (default delimiter is =):
-sanitize config.ini -s secrets.yaml --strip-values -o config-stripped.ini
+# Strip values from a key=value config file — no secrets file required:
+sanitize config.ini --strip-values -o config-stripped.ini
 
 # Strip values using a colon delimiter (e.g. YAML-style or nginx-style configs):
-sanitize nginx.conf -s secrets.yaml --strip-values --strip-delimiter : -o nginx-stripped.conf
+sanitize nginx.conf --strip-values --strip-delimiter : -o nginx-stripped.conf
 
 # Strip values with C-style comment lines (// prefix):
-sanitize app.conf -s secrets.yaml --strip-values --strip-comment-prefix // -o app-stripped.conf
+sanitize app.conf --strip-values --strip-comment-prefix // -o app-stripped.conf
 
 # Generate a sanitized LLM-ready prompt with built-in troubleshoot template:
 sanitize app.log -s secrets.yaml --llm
@@ -778,6 +1113,18 @@ sanitize app.log -s secrets.yaml --llm /path/to/my-template.txt
 
 # Combine LLM output with context extraction for notable events:
 sanitize app.log -s secrets.yaml --report /tmp/report.json --extract-context --llm troubleshoot
+
+# Shannon entropy detection for unrecognized high-entropy tokens:
+sanitize app.log -s secrets.yaml --entropy-threshold 4.5
+sanitize app.log -s secrets.yaml --entropy-threshold 4.0 --report report.json
+
+# Exclude paths from scanning:
+sanitize ./logs/ -s secrets.yaml --ignore-path "tests/fixtures/"
+sanitize ./logs/ -s secrets.yaml --ignore-path "vendor/" --ignore-path "**/*.generated.*"
+
+# Walk hidden files (dot-files) in a directory:
+sanitize ./config/ -s secrets.yaml --hidden
+sanitize . --app gitlab --hidden --ignore-path ".git/"
 ```
 
 ### `sanitize encrypt`
@@ -1038,7 +1385,7 @@ cat app.log | sanitize -s secrets.yaml --report - --extract-context
 
 # Only keywords you care about (replaces defaults entirely):
 sanitize app.log -s secrets.yaml --report report.json \
-  --extract-context --context-keywords fatal,critical --context-keywords-only
+  --extract-context --context-keywords fatal,critical --context-keywords-replace
 ```
 
 **Report JSON — `log_context` shape** (present per file when `--extract-context` is used):

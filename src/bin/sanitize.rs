@@ -64,11 +64,11 @@ use progress::{
     SharedProgressReporter,
 };
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 use sanitize_engine::secrets::{
-    decrypt_secrets, encrypt_secrets, entries_to_patterns, parse_secrets, serialize_secrets,
-    SecretEntry, SecretsFormat,
+    decrypt_secrets, encrypt_secrets, entries_to_patterns, extract_allow_patterns, parse_secrets,
+    serialize_secrets, SecretEntry, SecretsFormat,
 };
 use sanitize_engine::{
     atomic_write, extract_context, extract_context_reader, format_llm_prompt,
@@ -288,9 +288,8 @@ struct Cli {
     deterministic: bool,
 
     /// Disable the automatic save of values discovered by structured
-    /// scanning. By default, when a profile is active, any field values
-    /// found are appended to the secrets file (`--secrets-file`, or
-    /// `sanitize-discovered.yaml` if none is given) as `kind: literal`
+    /// scanning. When a profile is active and `--secrets-file` is provided,
+    /// newly discovered field values are appended to that file as `kind: literal`
     /// entries so future runs can match them without re-running the profile.
     /// Pass this flag to suppress that write.
     #[arg(long)]
@@ -299,6 +298,31 @@ struct Cli {
     /// Process entries that appear to be binary data (default: skip).
     #[arg(long)]
     include_binary: bool,
+
+    /// When a directory is given as input, also walk hidden files and
+    /// directories (those whose name starts with `.`). VCS metadata
+    /// directories (.git, .hg, .svn, .bzr) are always skipped regardless
+    /// of this flag.
+    #[arg(long)]
+    hidden: bool,
+
+    /// Enable Shannon entropy detection for high-entropy tokens not caught by
+    /// pattern matching. THRESHOLD is bits per character (e.g. 4.5). Tokens
+    /// of 20–200 alphanumeric characters whose entropy meets or exceeds this
+    /// value are treated as secrets. Off by default. Supplement with
+    /// `kind: entropy` entries in the secrets file for finer control.
+    #[arg(long, value_name = "THRESHOLD")]
+    entropy_threshold: Option<f64>,
+
+    /// Exclude paths matching these glob patterns from scanning.
+    /// Patterns are matched against the path relative to the input root
+    /// (or against the filename alone when no `/` is present in the pattern).
+    /// A trailing `/` excludes the entire subtree.
+    /// Merged with `exclude` entries in `.sanitize.toml`; CLI patterns are
+    /// applied in addition to, not instead of, project config patterns.
+    /// Example: --ignore-path "tests/fixtures/" --ignore-path "**/*.generated.*"
+    #[arg(long, value_name = "GLOB", num_args = 1)]
+    ignore_path: Vec<String>,
 
     /// Bypass all structured processors (JSON, YAML, XML, TOML, etc.) and
     /// run only the streaming scanner on every file.
@@ -312,6 +336,14 @@ struct Cli {
     #[arg(long)]
     force_text: bool,
 
+    /// Load the built-in balanced detection patterns without requiring a
+    /// secrets file. Covers API keys (AWS, GCP, GitHub, GitLab, Stripe,
+    /// Slack, OpenAI, Anthropic, HuggingFace, SendGrid, npm), JWTs, emails,
+    /// IPv4/IPv6, UUIDs, MAC addresses, PEM headers, and credential URLs.
+    /// Additive with `--secrets-file`, `--app`, and `--profile`.
+    #[arg(long)]
+    use_default: bool,
+
     /// Number of worker threads. When multiple input files are provided,
     /// files are processed in parallel up to this limit. For a single
     /// archive input, entries are sanitized in parallel using the same
@@ -321,19 +353,19 @@ struct Cli {
     threads: Option<usize>,
 
     /// Chunk size in bytes for the streaming scanner (default: 1 MiB).
-    #[arg(long, value_name = "BYTES", default_value_t = 1_048_576)]
+    #[arg(long, value_name = "BYTES", default_value_t = 1_048_576, hide = true)]
     chunk_size: usize,
 
     /// Maximum number of unique replacement mappings to keep in memory.
     /// Guards against memory exhaustion when inputs contain huge numbers
     /// of unique matches.  Use 0 for unlimited (not recommended).
-    #[arg(long, value_name = "N", default_value_t = 10_000_000)]
+    #[arg(long, value_name = "N", default_value_t = 10_000_000, hide = true)]
     max_mappings: usize,
 
     /// Maximum structured file size in bytes. Files exceeding this limit
     /// fall back to streaming scanner instead of structured processing.
     /// Prevents unbounded memory usage from large structured files (F-03 fix).
-    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_STRUCTURED_FILE_SIZE)]
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_STRUCTURED_FILE_SIZE, hide = true)]
     max_structured_size: u64,
 
     /// Maximum nesting depth for recursive archive processing.
@@ -341,48 +373,65 @@ struct Cli {
     /// sanitized recursively up to this depth. Exceeding the limit is an
     /// error. Maximum allowed value is 10 (each level may buffer up to
     /// 256 MiB).
-    #[arg(long, value_name = "N", default_value_t = DEFAULT_ARCHIVE_DEPTH)]
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_ARCHIVE_DEPTH, hide = true)]
     max_archive_depth: u32,
 
     /// Log output format: "human" (default) or "json" (for SIEM ingestion).
-    #[arg(long, value_name = "FMT", default_value = "human")]
-    log_format: String,
+    #[arg(long, value_name = "FMT")]
+    log_format: Option<String>,
 
     /// Progress display mode: auto (default), on, or off.
     #[arg(long, value_enum, value_name = "MODE")]
     progress: Option<ProgressMode>,
 
-    /// Disable live progress output.
-    #[arg(long)]
+    /// Disable live progress output. Deprecated: use `--progress off` instead.
+    #[arg(long, hide = true)]
     no_progress: bool,
 
     /// Minimum interval between live progress refreshes.
-    #[arg(long, value_name = "MS", default_value_t = DEFAULT_PROGRESS_INTERVAL_MS)]
+    #[arg(long, value_name = "MS", default_value_t = DEFAULT_PROGRESS_INTERVAL_MS, hide = true)]
     progress_interval_ms: u64,
 
-    /// After sanitizing, scan the output for error/warning/failure keywords
-    /// and include matching lines with surrounding context in the JSON report.
-    /// Requires `--report`.
+    /// Write per-file findings as newline-delimited JSON (NDJSON) to PATH.
+    /// Omit PATH to write to stdout. Use "-" explicitly for stdout.
+    /// Each line is a JSON object: one `{"type":"file",...}` per processed
+    /// file, followed by a `{"type":"summary",...}` line. Compatible with
+    /// `jq`, SIEM ingest, and other line-oriented JSON tools.
+    /// In default sanitize mode prefer an explicit path so sanitized content
+    /// on stdout is not mixed with findings.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "-")]
+    findings: Option<PathBuf>,
+
+    /// After sanitizing, extract lines matching error/warning keywords with
+    /// surrounding context and include them in the JSON report. Useful when
+    /// sending a large log to support: sanitize the full file, then share
+    /// only the relevant excerpts via `--report`.
+    ///
+    /// Use `--context-lines` to control how many surrounding lines to capture,
+    /// `--context-keywords` to add your own keywords, and `--context-keywords-replace`
+    /// to use only your keywords instead of the built-in list.
     #[arg(long)]
     extract_context: bool,
 
-    /// Number of lines of context to capture before and after each keyword
-    /// match when `--extract-context` is set. Default: 10.
+    /// Lines of context before and after each keyword match. Default: 10.
     #[arg(long, value_name = "N", default_value_t = 10)]
     context_lines: usize,
 
-    /// Comma-separated list of keywords to search for when `--extract-context`
-    /// is set. By default merged with the built-in list (error, failure,
-    /// warning, warn, fatal, exception, critical). Pass
-    /// `--context-keywords-only` to replace the defaults entirely.
+    /// Comma-separated extra keywords to search for when `--extract-context`
+    /// is set. Merged with the built-in list (error, failure, warning, warn,
+    /// fatal, exception, critical, panic, timeout, oomkilled) by default.
+    /// Use `--context-keywords-replace` to suppress the built-in list and use
+    /// only these keywords.
+    ///
+    /// Example: --extract-context --context-keywords "connection refused,ECONNREFUSED"
     #[arg(long, value_name = "KEYWORDS", value_delimiter = ',')]
     context_keywords: Vec<String>,
 
-    /// When set, `--context-keywords` replaces the built-in default keywords
-    /// entirely instead of being merged with them. Has no effect if
-    /// `--context-keywords` is not also provided.
+    /// Replace the built-in keyword list entirely with the keywords given by
+    /// `--context-keywords`. Without this flag, custom keywords are merged
+    /// with the built-ins. Has no effect if `--context-keywords` is not set.
     #[arg(long)]
-    context_keywords_only: bool,
+    context_keywords_replace: bool,
 
     /// Maximum number of keyword matches to capture per file when
     /// `--extract-context` is set. Matches beyond this limit are silently
@@ -432,24 +481,13 @@ struct Cli {
     #[arg(long, value_name = "TEMPLATE", default_missing_value = "troubleshoot", num_args = 0..=1)]
     llm: Option<String>,
 
-    /// Use built-in balanced detection patterns without requiring a secrets
-    /// file. Covers the most common high-value secrets: API keys (AWS, GCP,
-    /// GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab,
-    /// SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM
-    /// headers, password/secret key=value pairs, and credential URLs.
-    ///
-    /// Cannot be combined with `--secrets-file`.
-    #[arg(long, conflicts_with = "secrets_file")]
-    default: bool,
-
     /// Load built-in secrets patterns and structured field profiles for one or
     /// more applications. Comma-separated list of app names.
     ///
     /// Example: `--app gitlab`  `--app gitlab,nginx,postgresql`
     ///
-    /// Can be combined with `--default` (app patterns are merged on top of the
-    /// balanced base), `--secrets-file` (additive), and `--profile` (profiles
-    /// are merged).
+    /// Can be combined with `--secrets-file` (additive) and `--profile`
+    /// (profiles are merged).
     ///
     /// Run `sanitize apps` to list available app names and descriptions.
     #[arg(long, value_delimiter = ',', value_name = "APPS")]
@@ -478,6 +516,10 @@ impl Cli {
         } else {
             ProgressMode::Auto
         }
+    }
+
+    fn effective_log_format(&self) -> &str {
+        self.log_format.as_deref().unwrap_or("human")
     }
 }
 
@@ -552,6 +594,95 @@ EXAMPLES:\n  \
   sanitize template --preset web        # web-app template\n  \
   sanitize template --preset k8s -o k8s-secrets.yaml")]
     Template(TemplateArgs),
+
+    /// Install a git hook that scans (or sanitizes) staged files before each commit.
+    ///
+    /// Detects husky and falls back to a raw .git/hooks/ script. Use --global
+    /// to apply to every repository on this machine.
+    ///
+    /// The installed script is plain POSIX sh and can be inspected or edited
+    /// directly. Remove it with --remove or by deleting the hook file.
+    ///
+    /// Run `sanitize init` first to create the global default secrets file.
+    #[command(
+        name = "install-hook",
+        after_help = "\
+EXAMPLES:\n  \
+  sanitize install-hook                              # scan with auto-loaded default secrets\n  \
+  sanitize install-hook --app gitlab,kubernetes      # scan with app bundles\n  \
+  sanitize install-hook -s secrets.yaml              # scan with custom secrets file\n  \
+  sanitize install-hook --mode sanitize              # sanitize staged files in place\n  \
+  sanitize install-hook --hook pre-push              # install a pre-push hook\n  \
+  sanitize install-hook --global                     # apply to all repos on this machine\n  \
+  sanitize install-hook --remove                     # remove the installed hook\n  \
+  sanitize install-hook --dry-run                    # preview without writing"
+    )]
+    InstallHook(InstallHookArgs),
+
+    /// Show the effective configuration that will be applied on the next run.
+    ///
+    /// Prints the paths and active values from `~/.config/sanitize/settings.yaml`
+    /// and reports whether the default secrets file is present. Useful for
+    /// debugging unexpected behaviour or verifying CI setup.
+    #[command(name = "show-config")]
+    ShowConfig,
+
+    /// One-time machine setup: create the global default secrets file and
+    /// optionally install a git hook for the current repository.
+    ///
+    /// The secrets file is written to ~/.config/sanitize/secrets.yaml
+    /// (or $XDG_CONFIG_HOME/sanitize/secrets.yaml) and contains the balanced
+    /// built-in patterns. It is auto-loaded by every subsequent `sanitize`
+    /// invocation that does not specify --secrets-file explicitly.
+    ///
+    /// Run this once when setting up a new machine. For each repository you
+    /// want a hook in, run `sanitize install-hook` (or use --with-hook here).
+    #[command(
+        name = "init",
+        after_help = "\
+EXAMPLES:\n  \
+  sanitize init                        # create default secrets file only\n  \
+  sanitize init --with-hook            # create secrets file + pre-commit hook\n  \
+  sanitize init --with-hook --mode sanitize  # hook sanitizes files in place\n  \
+  sanitize init --with-hook --hook pre-push  # hook runs on push instead"
+    )]
+    Init(InitArgs),
+
+    /// Scan files for secrets without modifying them. Exits 2 if any are found.
+    ///
+    /// Equivalent to running the default sanitize mode with --dry-run and
+    /// --fail-on-match, but discoverable as a dedicated subcommand. Designed
+    /// for CI pipelines where you want detection without rewriting files.
+    #[command(
+        after_help = "\
+EXAMPLES:\n  \
+  sanitize scan app.log -s secrets.yaml              # scan a log file\n  \
+  sanitize scan ./logs/ -s secrets.yaml              # scan a directory\n  \
+  sanitize scan app.log --app gitlab                 # scan using an app bundle\n  \
+  sanitize scan . --ignore-path tests/fixtures/      # skip test fixtures\n  \
+  git diff HEAD | sanitize scan                      # scan a patch from stdin\n  \
+  sanitize scan app.log -s s.enc --encrypted-secrets -p  # encrypted secrets"
+    )]
+    Scan(ScanArgs),
+
+    /// Test whether secrets patterns match example values.
+    ///
+    /// Useful when authoring custom patterns in a secrets file. Provide one
+    /// or more patterns (inline or from a file) and a set of example strings,
+    /// and the tool reports exactly which pattern matched, the matched span,
+    /// and the replacement category. Values can be positional arguments or
+    /// piped via stdin.
+    #[command(
+        name = "test-pattern",
+        after_help = "\
+EXAMPLES:\n  \
+  sanitize test-pattern --pattern 'ghp_[A-Za-z0-9_]{36}' 'ghp_abc123'\n  \
+  sanitize test-pattern -s secrets.yaml 'my-secret-value' 'safe-value'\n  \
+  sanitize test-pattern --app gitlab 'glpat-abc123'\n  \
+  echo 'AKIA1234567890ABCDEF' | sanitize test-pattern --app aws\n  \
+  sanitize test-pattern -s secrets.yaml --json 'value1' 'value2'"
+    )]
+    TestPattern(TestPatternArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -664,6 +795,109 @@ struct AllowTestArgs {
 }
 
 #[derive(Parser, Debug)]
+struct ScanArgs {
+    /// Files, directories, or archives to scan. Omit to read from stdin.
+    /// Use "-" to include stdin alongside file paths.
+    #[arg(value_name = "INPUT")]
+    input: Vec<PathBuf>,
+
+    /// Path to a secrets file (JSON / YAML / TOML, or encrypted with --encrypted-secrets).
+    #[arg(short = 's', long = "secrets-file", value_name = "FILE")]
+    secrets_file: Option<PathBuf>,
+
+    /// Treat the secrets file as AES-256-GCM encrypted.
+    #[arg(long)]
+    encrypted_secrets: bool,
+
+    /// Prompt interactively for the decryption password.
+    #[arg(short = 'p', long)]
+    password: bool,
+
+    /// Read the decryption password from a file (must be 0600/0400).
+    #[arg(short = 'P', long = "password-file", value_name = "FILE")]
+    password_file: Option<PathBuf>,
+
+    /// App bundle(s) to load. Comma-separated. Repeatable.
+    #[arg(long, value_name = "APPS", value_delimiter = ',')]
+    app: Vec<String>,
+
+    /// Allow values through unchanged. Supports * glob patterns. Repeatable.
+    #[arg(long, value_name = "PATTERN")]
+    allow: Vec<String>,
+
+    /// Field-level profile for structured files.
+    #[arg(long = "profile", value_name = "FILE")]
+    profile: Option<PathBuf>,
+
+    /// Also walk hidden files and directories (names starting with `.`).
+    #[arg(long)]
+    hidden: bool,
+
+    /// Exclude paths matching these glob patterns. A trailing `/` prunes the
+    /// whole subtree. Merged with `exclude` in `.sanitize.toml`.
+    #[arg(long, value_name = "GLOB", num_args = 1)]
+    ignore_path: Vec<String>,
+
+    /// Write a JSON report to this path (or stderr when no path given).
+    #[arg(short = 'r', long, value_name = "PATH")]
+    report: Option<Option<PathBuf>>,
+
+    /// Number of worker threads (default: auto-detect).
+    #[arg(long, value_name = "N")]
+    threads: Option<usize>,
+
+    /// Log format: "human" (default) or "json".
+    #[arg(long, value_name = "FMT")]
+    log_format: Option<String>,
+
+    /// Disable progress output. Deprecated: use `--progress off` instead.
+    #[arg(long, hide = true)]
+    no_progress: bool,
+
+    /// Write findings as NDJSON to stdout instead of human-readable log output.
+    /// One JSON object per file, plus a summary line. Implies --progress off.
+    /// Pipe into `jq`, `wc -l`, SIEM tools, etc.
+    #[arg(long)]
+    json: bool,
+
+    /// Enable Shannon entropy detection with this threshold (bits/char, e.g. 4.5).
+    #[arg(long, value_name = "THRESHOLD")]
+    entropy_threshold: Option<f64>,
+
+    /// Load the built-in balanced detection patterns without a secrets file.
+    /// Same as the main `--use-default` flag.
+    #[arg(long)]
+    use_default: bool,
+}
+
+#[derive(Parser, Debug)]
+struct TestPatternArgs {
+    /// Inline regex pattern to test. Repeatable — multiple patterns are all
+    /// tested and each match is attributed to its pattern. Cannot be combined
+    /// with --secrets-file or --app when used alone, but all three sources
+    /// are additive if provided together.
+    #[arg(long = "pattern", short = 'P', value_name = "REGEX")]
+    patterns: Vec<String>,
+
+    /// Secrets file whose patterns to test (JSON / YAML / TOML).
+    #[arg(short = 's', long = "secrets-file", value_name = "FILE")]
+    secrets_file: Option<PathBuf>,
+
+    /// App bundle(s) whose patterns to test. Comma-separated. Repeatable.
+    #[arg(long, value_name = "APPS", value_delimiter = ',')]
+    app: Vec<String>,
+
+    /// Example values to test against the patterns. If omitted, values are
+    /// read from stdin one per line.
+    #[arg(value_name = "VALUE")]
+    values: Vec<String>,
+
+    /// Output results as JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser, Debug)]
 struct AppsArgs {
     #[command(subcommand)]
     command: Option<AppsSubCommand>,
@@ -753,6 +987,112 @@ struct AppsEditArgs {
     /// For user-defined apps this prints the existing directory path.
     #[arg(value_name = "NAME")]
     name: String,
+}
+
+// ─── install-hook types ───────────────────────────────────────────────────────
+
+#[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq)]
+enum HookType {
+    /// Run before each `git commit`.
+    #[value(name = "pre-commit")]
+    PreCommit,
+    /// Run before each `git push`.
+    #[value(name = "pre-push")]
+    PrePush,
+}
+
+impl HookType {
+    fn hook_name(&self) -> &'static str {
+        match self {
+            HookType::PreCommit => "pre-commit",
+            HookType::PrePush => "pre-push",
+        }
+    }
+}
+
+#[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq)]
+enum HookMode {
+    /// Scan staged files and block the commit if secrets are detected.
+    /// No files are modified.
+    Scan,
+    /// Sanitize staged files in place and re-stage them before committing.
+    /// WARNING: the committed content will differ from what you typed.
+    Sanitize,
+}
+
+#[derive(Parser, Debug)]
+#[command(after_help = "\
+NOTE\n  \
+  The hook calls `sanitize` from PATH at commit time — the binary must be\n  \
+  installed on every machine that will run the hook. If `sanitize` is not\n  \
+  found the hook silently passes rather than blocking the commit.")]
+struct InstallHookArgs {
+    /// Git hook type to install.
+    #[arg(long, value_enum, default_value = "pre-commit", value_name = "HOOK")]
+    hook: HookType,
+
+    /// Hook behaviour: scan blocks the commit; sanitize modifies staged files.
+    #[arg(long, value_enum, default_value = "scan", value_name = "MODE")]
+    mode: HookMode,
+
+    /// Install the hook globally so it applies to every git repository on
+    /// this machine. Writes to the directory returned by
+    /// `git config --global core.hooksPath` (or ~/.config/git/hooks/ if
+    /// not configured).
+    #[arg(long)]
+    global: bool,
+
+    /// Overwrite an existing hook without prompting. By default the command
+    /// refuses to overwrite a hook it did not install.
+    #[arg(long, short = 'f')]
+    force: bool,
+
+    /// Remove the hook previously installed by `sanitize install-hook`.
+    /// Has no effect on hooks not created by this command.
+    #[arg(long)]
+    remove: bool,
+
+    /// App bundles to load in the hook (comma-separated, e.g. gitlab,kubernetes).
+    #[arg(long, value_name = "NAMES")]
+    app: Option<String>,
+
+    /// Path to a secrets file to bake into the hook invocation.
+    #[arg(short = 's', long, value_name = "FILE")]
+    secrets: Option<PathBuf>,
+
+    /// Print the hook script that would be installed without writing any files.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Parser, Debug)]
+struct InitArgs {
+    /// Also install a git hook in the current repository after creating the
+    /// secrets file. Equivalent to running `sanitize install-hook` immediately
+    /// after `sanitize init`.
+    #[arg(long)]
+    with_hook: bool,
+
+    /// Hook type to install when --with-hook is set.
+    #[arg(long, value_enum, default_value = "pre-commit", value_name = "HOOK", requires = "with_hook")]
+    hook: HookType,
+
+    /// Hook behaviour when --with-hook is set: scan blocks the commit without
+    /// modifying files; sanitize rewrites staged files in place.
+    #[arg(long, value_enum, default_value = "scan", value_name = "MODE", requires = "with_hook")]
+    mode: HookMode,
+
+    /// When --with-hook is set, install the hook globally (all repositories).
+    #[arg(long, requires = "with_hook")]
+    global: bool,
+
+    /// Overwrite an existing default secrets file even if it already exists.
+    #[arg(long, short = 'f')]
+    force: bool,
+
+    /// Print what would be created without writing any files.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 fn parse_template_preset(s: &str) -> Result<TemplatePreset, String> {
@@ -962,6 +1302,10 @@ fn make_regex_entry(pattern: &str, category: &str, label: &str) -> SecretEntry {
         category: category.to_string(),
         label: Some(label.to_string()),
         values: vec![],
+        min_length: None,
+        max_length: None,
+        threshold: None,
+        charset: None,
     }
 }
 
@@ -1282,6 +1626,10 @@ fn build_guided_entries(opts: &GuidedOptions) -> Vec<SecretEntry> {
         category: String::new(),
         label: Some("common_safe_values".into()),
         values: common_allow_patterns(),
+        min_length: None,
+        max_length: None,
+        threshold: None,
+        charset: None,
     });
 
     entries
@@ -1729,6 +2077,338 @@ fn template_body_aws() -> &'static str {
   #   category: custom:aws_account_id
   #   label: my_account_id
 "#
+}
+
+fn run_scan(args: &ScanArgs) -> Result<(), (String, i32)> {
+    // Resolve password before building Cli so interactive prompts fire before
+    // any other output (mirrors the logic in run()).
+    let pre_resolved_password: Option<Zeroizing<String>> =
+        if args.encrypted_secrets && !args.password {
+            // Non-interactive sources: env var or password file.
+            if let Some(ref pf) = args.password_file {
+                Some(read_password_file(pf).map_err(|e| (e, 1))?)
+            } else if let Ok(pw) = std::env::var("SANITIZE_PASSWORD") {
+                Some(Zeroizing::new(pw))
+            } else {
+                None
+            }
+        } else if args.encrypted_secrets && args.password {
+            Some(prompt_password("secrets file").map_err(|e| (e, 1))?)
+        } else {
+            None
+        };
+
+    let cli = Cli {
+        command: None,
+        input: args.input.clone(),
+        output: None,
+        secrets_file: args.secrets_file.clone(),
+        profile: args.profile.clone(),
+        password: args.password,
+        password_file: args.password_file.clone(),
+        encrypted_secrets: args.encrypted_secrets,
+        format: None,
+        dry_run: true,
+        fail_on_match: true,
+        report: args.report.clone(),
+        strict: false,
+        deterministic: false,
+        no_update_secrets: true,
+        include_binary: false,
+        hidden: args.hidden,
+        ignore_path: args.ignore_path.clone(),
+        force_text: false,
+        threads: args.threads,
+        chunk_size: 1_048_576,
+        max_mappings: 10_000_000,
+        max_structured_size: DEFAULT_MAX_STRUCTURED_FILE_SIZE,
+        max_archive_depth: DEFAULT_ARCHIVE_DEPTH,
+        log_format: args.log_format.clone(),
+        // --json suppresses progress so stdout stays clean for piping.
+        progress: if args.json || args.no_progress {
+            Some(ProgressMode::Off)
+        } else {
+            None
+        },
+        no_progress: false,
+        progress_interval_ms: DEFAULT_PROGRESS_INTERVAL_MS,
+        extract_context: false,
+        context_lines: DEFAULT_CONTEXT_LINES,
+        context_keywords: Vec::new(),
+        context_keywords_replace: false,
+        max_context_matches: DEFAULT_MAX_MATCHES,
+        context_case_sensitive: false,
+        strip_values: false,
+        strip_delimiter: "=".to_string(),
+        strip_comment_prefix: "#".to_string(),
+        llm: None,
+        app: args.app.clone(),
+        allow: args.allow.clone(),
+        findings: if args.json { Some(PathBuf::from("-")) } else { None },
+        entropy_threshold: args.entropy_threshold,
+        use_default: args.use_default,
+    };
+
+    run_sanitize(cli, pre_resolved_password, HashMap::new())
+}
+
+fn run_test_pattern(args: &TestPatternArgs) -> Result<(), (String, i32)> {
+    // ── Collect SecretEntry objects from all pattern sources ──────────────────
+    let mut entries: Vec<SecretEntry> = Vec::new();
+
+    // 1. Inline --pattern flags.
+    for p in &args.patterns {
+        entries.push(SecretEntry {
+            pattern: p.clone(),
+            kind: "regex".to_string(),
+            category: "auth_token".to_string(),
+            label: None,
+            values: vec![],
+            min_length: None,
+            max_length: None,
+            threshold: None,
+            charset: None,
+        });
+    }
+
+    // 2. --secrets-file.
+    if let Some(ref path) = args.secrets_file {
+        let bytes = fs::read(path)
+            .map_err(|e| (format!("failed to read {}: {e}", path.display()), 1))?;
+        let format = SecretsFormat::from_extension(path.to_string_lossy().as_ref());
+        let mut file_entries = parse_secrets(&bytes, format)
+            .map_err(|e| (format!("failed to parse {}: {e}", path.display()), 1))?;
+        // Strip allow entries — they're not patterns to test against.
+        file_entries.retain(|e| e.kind != "allow");
+        entries.extend(file_entries);
+    }
+
+    // 3. --app bundles.
+    for app_name in &args.app {
+        let bundle = load_app_bundle(app_name).map_err(|e| (e, 1))?;
+        let mut bundle_entries = bundle.secrets;
+        bundle_entries.retain(|e| e.kind != "allow");
+        entries.extend(bundle_entries);
+    }
+
+    if entries.is_empty() {
+        return Err((
+            "no patterns to test — provide --pattern, --secrets-file, or --app".into(),
+            1,
+        ));
+    }
+
+    // ── Compile each entry into a (label, regex) pair ─────────────────────────
+    struct CompiledPattern {
+        label: String,
+        category: String,
+        regex: regex::Regex,
+    }
+
+    let mut compiled: Vec<CompiledPattern> = Vec::new();
+    let mut compile_errors: Vec<String> = Vec::new();
+
+    for entry in &entries {
+        if entry.pattern.is_empty() {
+            continue;
+        }
+        let label = entry
+            .label
+            .clone()
+            .unwrap_or_else(|| entry.pattern.chars().take(40).collect());
+        let (regex_str, _is_literal) = if entry.kind == "literal" {
+            (regex::escape(&entry.pattern), true)
+        } else {
+            (entry.pattern.clone(), false)
+        };
+        match regex::Regex::new(&regex_str) {
+            Ok(re) => compiled.push(CompiledPattern {
+                label,
+                category: entry.category.clone(),
+                regex: re,
+            }),
+            Err(e) => compile_errors.push(format!("  pattern '{}': {e}", entry.pattern)),
+        }
+    }
+
+    if !compile_errors.is_empty() {
+        for e in &compile_errors {
+            eprintln!("warning: pattern failed to compile — {e}");
+        }
+    }
+    if compiled.is_empty() {
+        return Err(("all patterns failed to compile".into(), 1));
+    }
+
+    // ── Collect values from positional args or stdin ──────────────────────────
+    let values: Vec<String> = if args.values.is_empty() {
+        let mut buf = String::new();
+        io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| (format!("failed to read stdin: {e}"), 1))?;
+        buf.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect()
+    } else {
+        args.values.clone()
+    };
+
+    if values.is_empty() {
+        return Err((
+            "no values to test — provide values as arguments or via stdin".into(),
+            1,
+        ));
+    }
+
+    // ── Match each value against all patterns ────────────────────────────────
+    struct MatchHit {
+        label: String,
+        category: String,
+        matched_text: String,
+        /// The span within `value` that was matched (for display).
+        start: usize,
+        end: usize,
+        /// True when only capture group 1 is replaced (partial match).
+        partial: bool,
+    }
+
+    struct ValueResult {
+        value: String,
+        hits: Vec<MatchHit>,
+    }
+
+    let results: Vec<ValueResult> = values
+        .iter()
+        .map(|value| {
+            let mut hits = Vec::new();
+            for cp in &compiled {
+                if let Some(m) = cp.regex.captures(value) {
+                    // Capture group 1 = partial replacement; full match = group 0.
+                    let (span, partial) = if let Some(g1) = m.get(1) {
+                        (g1, true)
+                    } else {
+                        (m.get(0).unwrap(), false)
+                    };
+                    hits.push(MatchHit {
+                        label: cp.label.clone(),
+                        category: cp.category.clone(),
+                        matched_text: span.as_str().to_string(),
+                        start: span.start(),
+                        end: span.end(),
+                        partial,
+                    });
+                }
+            }
+            ValueResult {
+                value: value.clone(),
+                hits,
+            }
+        })
+        .collect();
+
+    let total_matched = results.iter().filter(|r| !r.hits.is_empty()).count();
+
+    // ── Output ────────────────────────────────────────────────────────────────
+    if args.json {
+        #[derive(serde::Serialize)]
+        struct JsonHit<'a> {
+            label: &'a str,
+            category: &'a str,
+            matched_text: &'a str,
+            start: usize,
+            end: usize,
+            partial: bool,
+        }
+        #[derive(serde::Serialize)]
+        struct JsonResult<'a> {
+            value: &'a str,
+            matched: bool,
+            hits: Vec<JsonHit<'a>>,
+        }
+        #[derive(serde::Serialize)]
+        struct JsonOutput<'a> {
+            patterns_loaded: usize,
+            results: Vec<JsonResult<'a>>,
+            summary: JsonSummary,
+        }
+        #[derive(serde::Serialize)]
+        struct JsonSummary {
+            total: usize,
+            matched: usize,
+            unmatched: usize,
+        }
+        let out = JsonOutput {
+            patterns_loaded: compiled.len(),
+            results: results
+                .iter()
+                .map(|r| JsonResult {
+                    value: &r.value,
+                    matched: !r.hits.is_empty(),
+                    hits: r
+                        .hits
+                        .iter()
+                        .map(|h| JsonHit {
+                            label: &h.label,
+                            category: &h.category,
+                            matched_text: &h.matched_text,
+                            start: h.start,
+                            end: h.end,
+                            partial: h.partial,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            summary: JsonSummary {
+                total: results.len(),
+                matched: total_matched,
+                unmatched: results.len() - total_matched,
+            },
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+        );
+    } else {
+        println!(
+            "Testing {} pattern(s) against {} value(s)\n",
+            compiled.len(),
+            values.len()
+        );
+        for r in &results {
+            if r.hits.is_empty() {
+                println!("✗  {}", r.value);
+                println!("   (no match)\n");
+            } else {
+                println!("✓  {}", r.value);
+                for h in &r.hits {
+                    let span_note = if h.partial {
+                        format!("bytes {}..{} (partial — prefix/suffix preserved)", h.start, h.end)
+                    } else {
+                        format!("bytes {}..{} (full match)", h.start, h.end)
+                    };
+                    println!(
+                        "   {:<30}  [{}]  {:?}  {}",
+                        h.label, h.category, h.matched_text, span_note
+                    );
+                }
+                println!();
+            }
+        }
+        println!(
+            "{}/{} values matched",
+            total_matched,
+            results.len()
+        );
+    }
+
+    // Exit 1 if any value was unmatched — useful for scripting / CI.
+    if total_matched < results.len() {
+        Err(("some values did not match any pattern".into(), 1))
+    } else {
+        Ok(())
+    }
 }
 
 fn run_allow_test(args: &AllowTestArgs) -> Result<(), (String, i32)> {
@@ -2485,29 +3165,33 @@ fn run_guided() -> Result<(), (String, i32)> {
         deterministic,
         no_update_secrets: false,
         include_binary: false,
+        hidden: false,
         force_text: false,
         threads: None,
         chunk_size: 1_048_576,
         max_mappings: 10_000_000,
         max_structured_size: DEFAULT_MAX_STRUCTURED_FILE_SIZE,
         max_archive_depth: DEFAULT_ARCHIVE_DEPTH,
-        log_format: "human".to_string(),
+        log_format: None,
         progress: None,
         no_progress: false,
         progress_interval_ms: DEFAULT_PROGRESS_INTERVAL_MS,
         extract_context: false,
         context_lines: DEFAULT_CONTEXT_LINES,
         context_keywords: Vec::new(),
-        context_keywords_only: false,
+        context_keywords_replace: false,
         max_context_matches: DEFAULT_MAX_MATCHES,
         context_case_sensitive: false,
         strip_values: false,
         strip_delimiter: "=".to_string(),
         strip_comment_prefix: "#".to_string(),
         llm: None,
-        default: false,
         app: vec![],
         allow: vec![],
+        ignore_path: vec![],
+        findings: None,
+        entropy_threshold: None,
+        use_default: false,
     };
 
     run_sanitize(cli, deterministic_password.or(run_password), HashMap::new())
@@ -3056,8 +3740,8 @@ fn build_augmented_scanner(
     let mut discovered = 0usize;
     for (category, original, _replacement) in store.iter() {
         let s = original.as_str();
-        if s.len() < 4 {
-            continue; // too short — high false-positive risk
+        if s.is_empty() {
+            continue;
         }
         match ScanPattern::from_literal(s, category, format!("profile-discovered:{s}")) {
             Ok(pat) => {
@@ -3285,6 +3969,149 @@ enum InputTarget {
     File { input: PathBuf, output: PathBuf },
 }
 
+/// VCS metadata directories skipped unconditionally during directory walks.
+const SKIP_VCS_DIRS: &[&str] = &[".git", ".hg", ".svn", ".bzr"];
+
+/// A single file resolved from a CLI input (explicit file or directory walk).
+/// `dir_root` is set when the file was expanded from a directory argument;
+/// it is used to compute relative paths for mirrored output trees.
+struct ExpandedInput {
+    path: PathBuf,
+    dir_root: Option<PathBuf>,
+}
+
+/// Recursively collect all files under `dir`, skipping VCS dirs and
+/// (unless `include_hidden`) any entry whose name starts with `.`.
+/// Symlinks are never followed. Entries are yielded in sorted order for
+/// deterministic processing.
+fn walk_dir(dir: &Path, include_hidden: bool) -> Result<Vec<PathBuf>, String> {
+    use walkdir::WalkDir;
+    let mut files = Vec::new();
+    let walker = WalkDir::new(dir)
+        .follow_links(false)
+        .sort_by_file_name();
+
+    for entry in walker {
+        let entry = entry.map_err(|e| format!("error walking {}: {e}", dir.display()))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .unwrap_or("");
+
+        // Skip VCS dirs (filter on the directory entry so the entire subtree
+        // is pruned, not just the top-level dir itself).
+        if entry.file_type().is_dir() && SKIP_VCS_DIRS.contains(&name) {
+            continue;
+        }
+
+        // Skip hidden entries unless --hidden is set.  The walk root itself
+        // may be hidden (e.g. `sanitize .hidden-dir/`) — allow it through.
+        if !include_hidden
+            && entry.depth() > 0
+            && name.starts_with('.')
+        {
+            continue;
+        }
+
+        if entry.file_type().is_file() {
+            files.push(entry.into_path());
+        }
+    }
+    Ok(files)
+}
+
+/// Compiled glob patterns used to exclude files from scanning.
+///
+/// Patterns are sourced from `.sanitize.toml` `exclude` entries and the
+/// `--exclude` CLI flag (CLI patterns are merged in after project config).
+/// Each pattern is matched against:
+///   1. The path **relative to the project config directory** (or CWD when no
+///      config file was found).
+///   2. The **bare filename** alone — so `*.min.js` skips minified files
+///      anywhere in the tree without needing a `**/*.min.js` prefix.
+///
+/// A trailing `/` in a pattern means "match any path that starts with this
+/// prefix" — it prunes the whole subtree.
+struct IgnoreList {
+    /// Compiled patterns together with a flag for trailing-slash (subtree) semantics.
+    patterns: Vec<(glob::Pattern, bool)>,
+}
+
+impl IgnoreList {
+    /// Build from a list of raw glob strings.  Invalid patterns emit a warning
+    /// and are skipped rather than aborting.
+    fn new(raw: &[String]) -> Self {
+        let mut patterns = Vec::with_capacity(raw.len());
+        for p in raw {
+            let is_subtree = p.ends_with('/');
+            // Strip the trailing slash before compiling — glob::Pattern doesn't
+            // want it and we record the flag separately.
+            let trimmed = p.trim_end_matches('/');
+            if trimmed.is_empty() {
+                continue;
+            }
+            match glob::Pattern::new(trimmed) {
+                Ok(compiled) => patterns.push((compiled, is_subtree)),
+                Err(e) => eprintln!("warning: invalid exclude pattern '{p}': {e} — skipping"),
+            }
+        }
+        Self { patterns }
+    }
+
+    /// Returns `true` if `path` should be excluded.
+    ///
+    /// `root` is the directory the pattern is anchored to (the `.sanitize.toml`
+    /// location, or CWD when there is no project config).
+    fn is_excluded(&self, path: &Path, root: &Path) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let opts = glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        };
+        // Relative path from the anchor root.  Fall back to the full path when
+        // strip_prefix fails (e.g. the file is outside the root).
+        // Canonicalize both sides so relative paths (e.g. `./tests/…`) and
+        // symlink-resolved absolute paths match correctly.  Fall back to the
+        // raw path when canonicalization fails (e.g. the file doesn't exist yet).
+        let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let rel = canon_path.strip_prefix(&canon_root).unwrap_or(&canon_path);
+        let rel_str = rel.to_string_lossy();
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+
+        for (pat, is_subtree) in &self.patterns {
+            if *is_subtree {
+                // Subtree match: the relative path must start with the pattern
+                // string as a prefix (e.g. pattern "tests/fixtures" matches
+                // "tests/fixtures/a.yaml").
+                let prefix = pat.as_str();
+                if rel_str.starts_with(prefix)
+                    && (rel_str.len() == prefix.len()
+                        || rel_str.as_bytes().get(prefix.len()) == Some(&b'/'))
+                {
+                    return true;
+                }
+            } else {
+                // Normal glob: try relative path first, then bare filename.
+                if pat.matches_with(&rel_str, opts) {
+                    return true;
+                }
+                // If the pattern has no path separator, also match on filename alone.
+                if !pat.as_str().contains('/') && pat.matches_with(&filename, opts) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
     let explicit_stdin_count = cli.input.iter().filter(|p| p.as_os_str() == "-").count();
 
@@ -3292,25 +4119,89 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
         return Err("stdin marker '-' can be specified at most once".into());
     }
 
-    // Implicit stdin: no positional inputs at all, OR stdin is a pipe/redirect
-    // with no explicit '-' marker (e.g. `cat file | sanitize other.json`).
     let has_piped_stdin = explicit_stdin_count == 0 && stdin_is_pipe();
 
-    let mut units = Vec::new();
-
-    // No file inputs — stdin only. Output goes to --output if given, else stdout.
+    // No file inputs — stdin only.
     if cli.input.is_empty() {
-        units.push(InputTarget::Stdin {
+        return Ok(vec![InputTarget::Stdin {
             output: cli.output.clone(),
-        });
-        return Ok(units);
+        }]);
     }
 
-    let input_count = cli.input.len();
-    let multi_input = input_count > 1;
-    let mut used_outputs = HashSet::new();
+    // ── build ignore list ─────────────────────────────────────────────────────
+    // Patterns come from two sources, merged in precedence order:
+    //   1. `.sanitize.toml` `exclude` field (project config)
+    //   2. `--exclude` CLI flags (override / supplement project config)
+    // The anchor root for relative-path matching is the `.sanitize.toml`
+    // directory when a project config was found, otherwise CWD.
+    let (ignore_patterns, ignore_root): (Vec<String>, PathBuf) = {
+        let mut patterns: Vec<String> = Vec::new();
+        let root = if let Some(ref cfg_path) = find_project_config() {
+            let (pc, cfg_dir) = load_project_config(cfg_path);
+            patterns.extend(pc.exclude);
+            cfg_dir
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        };
+        // CLI --ignore-path patterns are appended last (they extend, not replace).
+        patterns.extend(cli.ignore_path.iter().cloned());
+        (patterns, root)
+    };
+    let ignore_list = IgnoreList::new(&ignore_patterns);
 
-    let output_dir = if multi_input {
+    // ── expand directory inputs ───────────────────────────────────────────────
+    // Each CLI argument is either a `-` (stdin), a plain file, or a directory.
+    // Directories are walked recursively and each discovered file is added with
+    // its `dir_root` recorded so we can mirror the tree into the output dir.
+    let mut expanded: Vec<ExpandedInput> = Vec::new();
+
+    for input in &cli.input {
+        if input.as_os_str() == "-" {
+            continue; // handled separately below
+        }
+        if input.is_dir() {
+            let files = walk_dir(input, cli.hidden)?;
+            if files.is_empty() {
+                warn!(dir = %input.display(), "directory contains no processable files");
+                continue;
+            }
+            let before = files.len();
+            let files: Vec<PathBuf> = files
+                .into_iter()
+                .filter(|f| {
+                    if ignore_list.is_excluded(f, &ignore_root) {
+                        info!(path = %f.display(), "excluded by ignore pattern");
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+            if files.is_empty() {
+                warn!(dir = %input.display(), excluded = before, "all files in directory excluded by ignore patterns");
+                continue;
+            }
+            info!(dir = %input.display(), files = files.len(), excluded = before - files.len(), "expanding directory input");
+            for f in files {
+                expanded.push(ExpandedInput { path: f, dir_root: Some(input.clone()) });
+            }
+        } else {
+            // Explicit file path: warn when excluded rather than silently drop,
+            // since the user named it directly.
+            if ignore_list.is_excluded(input, &ignore_root) {
+                warn!(path = %input.display(), "explicitly specified file matches an exclude pattern — skipping");
+                continue;
+            }
+            expanded.push(ExpandedInput { path: input.clone(), dir_root: None });
+        }
+    }
+
+    let multi_input = expanded.len() + explicit_stdin_count + (has_piped_stdin as usize) > 1;
+    let mut used_outputs = HashSet::new();
+    let mut units = Vec::new();
+
+    // ── resolve output directory when multi_input ────────────────────────────
+    let output_dir: Option<PathBuf> = if multi_input {
         if let Some(path) = &cli.output {
             if path.exists() && !path.is_dir() {
                 return Err(format!(
@@ -3331,66 +4222,73 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
         None
     };
 
-    for input in &cli.input {
-        if input.as_os_str() == "-" {
-            let stdin_output = if multi_input {
-                Some(
-                    output_dir
-                        .as_ref()
-                        .map(|d| d.join("input-sanitized.txt"))
-                        .unwrap_or_else(|| PathBuf::from("input-sanitized.txt")),
-                )
+    // ── build InputTarget for each expanded file ─────────────────────────────
+    for ei in expanded {
+        let planned_out = if let Some(ref root) = ei.dir_root {
+            // File came from a directory walk. Mirror the structure relative to
+            // the directory root that was passed on the CLI.
+            let rel = ei.path.strip_prefix(root).unwrap_or(&ei.path);
+            if let Some(out_root) = &cli.output {
+                // --output <dir>: out_root/relative/path/file (exact name, no suffix)
+                let dest = out_root.join(rel);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|e| {
+                        format!("failed to create {}: {e}", parent.display())
+                    })?;
+                }
+                uniquify_output_path(dest, &mut used_outputs)
             } else {
-                cli.output
-                    .clone()
-                    .or_else(|| Some(PathBuf::from("input-sanitized.txt")))
+                // No --output: place .sanitized. sibling next to the original.
+                uniquify_output_path(default_plain_output(&ei.path), &mut used_outputs)
+            }
+        } else if multi_input {
+            // Explicit file in a multi-file invocation.
+            let default_out = match ArchiveFormat::from_path(&ei.path.to_string_lossy()) {
+                Some(fmt) => default_archive_output(&ei.path, fmt),
+                None => default_plain_output(&ei.path),
             };
-            units.push(InputTarget::Stdin {
-                output: stdin_output,
-            });
-            continue;
-        }
-
-        let format = ArchiveFormat::from_path(&input.to_string_lossy());
-        let default_out = match format {
-            Some(fmt) => default_archive_output(input, fmt),
-            None => default_plain_output(input),
-        };
-
-        let planned_out = if multi_input {
             let out_name = default_out
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("output")
                 .to_string();
-
             if let Some(dir) = &output_dir {
                 uniquify_output_path(dir.join(out_name), &mut used_outputs)
             } else {
                 uniquify_output_path(default_out, &mut used_outputs)
             }
-        } else if let Some(out) = &cli.output {
-            out.clone()
         } else {
-            default_out
+            // Single explicit file.
+            let default_out = match ArchiveFormat::from_path(&ei.path.to_string_lossy()) {
+                Some(fmt) => default_archive_output(&ei.path, fmt),
+                None => default_plain_output(&ei.path),
+            };
+            if let Some(out) = &cli.output {
+                out.clone()
+            } else {
+                default_out
+            }
         };
 
         units.push(InputTarget::File {
-            input: input.clone(),
+            input: ei.path,
             output: planned_out,
         });
     }
 
-    // Piped stdin alongside file inputs: add a stdin target last so it is
-    // processed after all file targets (profile discovery benefits from this).
-    if has_piped_stdin {
-        let stdin_out = output_dir
-            .as_ref()
-            .map(|d| d.join("input-sanitized.txt"))
-            .unwrap_or_else(|| PathBuf::from("input-sanitized.txt"));
-        units.push(InputTarget::Stdin {
-            output: Some(stdin_out),
-        });
+    // ── stdin targets ─────────────────────────────────────────────────────────
+    if explicit_stdin_count > 0 || has_piped_stdin {
+        let stdin_out = if multi_input {
+            Some(
+                output_dir
+                    .as_ref()
+                    .map(|d| d.join("input-sanitized.txt"))
+                    .unwrap_or_else(|| PathBuf::from("input-sanitized.txt")),
+            )
+        } else {
+            cli.output.clone()
+        };
+        units.push(InputTarget::Stdin { output: stdin_out });
     }
 
     Ok(units)
@@ -3548,11 +4446,11 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
 
     for input in file_inputs(cli) {
         if !input.exists() {
-            return Err(format!("input file not found: {}", input.display()));
+            return Err(format!("input path not found: {}", input.display()));
         }
-        if !input.is_file() {
+        if !input.is_file() && !input.is_dir() {
             return Err(format!(
-                "input path is not a regular file: {}",
+                "input path is not a file or directory: {}",
                 input.display()
             ));
         }
@@ -3599,10 +4497,10 @@ fn validate_args(cli: &Cli) -> Result<(), String> {
         return Err("--max-archive-depth must be ≥ 1".into());
     }
 
-    if !matches!(cli.log_format.as_str(), "human" | "json") {
+    if !matches!(cli.effective_log_format(), "human" | "json") {
         return Err(format!(
             "invalid --log-format '{}': must be 'human' or 'json'",
-            cli.log_format
+            cli.effective_log_format()
         ));
     }
 
@@ -3698,6 +4596,123 @@ fn resolve_thread_count(requested: Option<usize>) -> usize {
     }
 }
 
+/// CLI-only state captured before settings.yaml / .sanitize.toml are merged in.
+/// Used to annotate the run header with `[config]` for values that came from a
+/// config file rather than the command line.
+struct CliConfigSnapshot {
+    had_secrets:       bool,
+    had_profile:       bool,
+    apps:              Vec<String>,
+    allow:             Vec<String>,
+    strict:            bool,
+    fail_on_match:     bool,
+    no_update_secrets: bool,
+    deterministic:     bool,
+    dry_run:           bool,
+}
+
+impl CliConfigSnapshot {
+    fn capture(cli: &Cli) -> Self {
+        Self {
+            had_secrets:       cli.secrets_file.is_some(),
+            had_profile:       cli.profile.is_some(),
+            apps:              cli.app.clone(),
+            allow:             cli.allow.clone(),
+            strict:            cli.strict,
+            fail_on_match:     cli.fail_on_match,
+            no_update_secrets: cli.no_update_secrets,
+            deterministic:     cli.deterministic,
+            dry_run:           cli.dry_run,
+        }
+    }
+}
+
+/// Print a one-time run configuration summary to stderr so the user can see
+/// exactly what secrets file, profile, and apps are active — and whether any
+/// of them came from a config file rather than the command line.
+fn print_run_header(cli: &Cli, snap: &CliConfigSnapshot, json_logs: bool) {
+    if json_logs {
+        info!(
+            secrets = cli.secrets_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            profile = cli.profile.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            apps    = %cli.app.join(","),
+            "run config"
+        );
+        return;
+    }
+
+    // Secrets file
+    match &cli.secrets_file {
+        Some(p) => {
+            let ann = if !snap.had_secrets { "  [config]" } else { "" };
+            eprintln!("  secrets:  {}{}", p.display(), ann);
+        }
+        None => {
+            eprintln!("  secrets:  (none — built-in patterns only)");
+        }
+    }
+
+    // Profile (only shown when active)
+    if let Some(p) = &cli.profile {
+        let ann = if !snap.had_profile { "  [config]" } else { "" };
+        eprintln!("  profile:  {}{}", p.display(), ann);
+    }
+
+    // App bundles (only shown when any are active)
+    if !cli.app.is_empty() {
+        let parts: Vec<String> = cli
+            .app
+            .iter()
+            .map(|a| {
+                if snap.apps.contains(a) {
+                    a.clone()
+                } else {
+                    format!("{a}  [config]")
+                }
+            })
+            .collect();
+        eprintln!("  apps:     {}", parts.join(", "));
+    }
+
+    // Allow-list (only shown when any entries are active)
+    if !cli.allow.is_empty() {
+        let parts: Vec<String> = cli
+            .allow
+            .iter()
+            .map(|v| {
+                if snap.allow.contains(v) {
+                    format!("{v:?}")
+                } else {
+                    format!("{v:?}  [config]")
+                }
+            })
+            .collect();
+        eprintln!("  allow:    {}", parts.join(", "));
+    }
+
+    // Non-default boolean flags
+    let mut flags: Vec<String> = Vec::new();
+    if cli.strict {
+        flags.push(if !snap.strict { "--strict  [config]".into() } else { "--strict".into() });
+    }
+    if cli.fail_on_match {
+        flags.push(if !snap.fail_on_match { "--fail-on-match  [config]".into() } else { "--fail-on-match".into() });
+    }
+    if cli.no_update_secrets {
+        flags.push(if !snap.no_update_secrets { "--no-update-secrets  [config]".into() } else { "--no-update-secrets".into() });
+    }
+    if cli.deterministic {
+        flags.push(if !snap.deterministic { "--deterministic  [config]".into() } else { "--deterministic".into() });
+    }
+    if cli.dry_run {
+        flags.push(if !snap.dry_run { "--dry-run  [config]".into() } else { "--dry-run".into() });
+    }
+    if !flags.is_empty() {
+        eprintln!("  flags:    {}", flags.join(", "));
+    }
+    eprintln!();
+}
+
 // ---------------------------------------------------------------------------
 // Processing helpers
 // ---------------------------------------------------------------------------
@@ -3738,6 +4753,7 @@ fn process_stdin(
     report_builder: Option<&ReportBuilder>,
     progress: Option<&SharedProgressReporter>,
     llm_collector: Option<&LlmCollector>,
+    entropy_configs: &Arc<Vec<EntropyConfig>>,
 ) -> Result<bool, String> {
     // Determine whether structured processing should be attempted.
     // Skipped entirely when --force-text is set.
@@ -3772,9 +4788,11 @@ fn process_stdin(
                 output_path,
                 cli,
                 scanner,
+                store,
                 report_builder,
                 progress,
                 llm_collector,
+                entropy_configs,
             );
         }
 
@@ -3793,10 +4811,15 @@ fn process_stdin(
                 Some(Ok(structured_bytes)) => {
                     // Double-pass: run the streaming scanner on the structured
                     // output to catch anything missed by field-rule gaps.
-                    let (output_bytes, scan_stats) = scanner_fallback(scanner, &structured_bytes)?;
+                    let (mut output_bytes, scan_stats) =
+                        scanner_fallback(scanner, &structured_bytes)?;
+                    let (ent_out, ent_matches) =
+                        entropy_scan_bytes(&output_bytes, entropy_configs, store);
+                    output_bytes = ent_out;
                     let method = format!("structured+scan:{ext}");
                     let structured_reps = store.len().saturating_sub(store_len_before) as u64;
-                    let total_replacements = structured_reps + scan_stats.replacements_applied;
+                    let total_replacements =
+                        structured_reps + scan_stats.replacements_applied + ent_matches;
                     if total_replacements > 0 {
                         had_matches = true;
                     }
@@ -3829,7 +4852,11 @@ fn process_stdin(
                 None => {}
             }
 
-            let (output_bytes, stats) = scanner_fallback(scanner, &input_bytes)?;
+            let (mut output_bytes, mut stats) = scanner_fallback(scanner, &input_bytes)?;
+            let (ent_out, ent_matches) = entropy_scan_bytes(&output_bytes, entropy_configs, store);
+            output_bytes = ent_out;
+            stats.matches_found += ent_matches;
+            stats.replacements_applied += ent_matches;
             if stats.matches_found > 0 {
                 had_matches = true;
             }
@@ -3855,9 +4882,11 @@ fn process_stdin(
         output_path,
         cli,
         scanner,
+        store,
         report_builder,
         progress,
         llm_collector,
+        entropy_configs,
     )
 }
 
@@ -3867,28 +4896,48 @@ fn process_stdin_streaming<R: io::Read>(
     output_path: Option<&Path>,
     cli: &Cli,
     scanner: &Arc<StreamScanner>,
+    store: &Arc<MappingStore>,
     report_builder: Option<&ReportBuilder>,
     progress: Option<&SharedProgressReporter>,
     llm_collector: Option<&LlmCollector>,
+    entropy_configs: &Arc<Vec<EntropyConfig>>,
 ) -> Result<bool, String> {
     let label = if cli.dry_run {
         "Scanning stdin (dry-run)"
     } else {
         "Scanning stdin"
     };
+    let entropy_active = !entropy_configs.is_empty();
 
     with_progress_scope(progress, label, |progress| {
         let mut had_matches = false;
 
         if cli.dry_run {
-            let stats = scanner
-                .scan_reader_with_progress(
-                    reader,
-                    io::sink(),
-                    None,
-                    make_scan_callback(progress.clone(), label),
-                )
-                .map_err(|e| format!("scanner error: {e}"))?;
+            // For dry-run with entropy, buffer so we can count entropy matches.
+            let stats = if entropy_active {
+                let mut buf: Vec<u8> = Vec::new();
+                let mut s = scanner
+                    .scan_reader_with_progress(
+                        reader,
+                        &mut buf,
+                        None,
+                        make_scan_callback(progress.clone(), label),
+                    )
+                    .map_err(|e| format!("scanner error: {e}"))?;
+                let (_ent_out, ent_matches) = entropy_scan_bytes(&buf, entropy_configs, store);
+                s.matches_found += ent_matches;
+                s.replacements_applied += ent_matches;
+                s
+            } else {
+                scanner
+                    .scan_reader_with_progress(
+                        reader,
+                        io::sink(),
+                        None,
+                        make_scan_callback(progress.clone(), label),
+                    )
+                    .map_err(|e| format!("scanner error: {e}"))?
+            };
             if stats.matches_found > 0 {
                 had_matches = true;
             }
@@ -3907,13 +4956,15 @@ fn process_stdin_streaming<R: io::Read>(
             return Ok(had_matches);
         }
 
-        // Buffer when extract-context or llm are active; streaming otherwise.
-        let needs_buffer = cli.extract_context || llm_collector.is_some();
+        // Buffer when extract-context, llm, or entropy are active; streaming otherwise.
+        // Note: for direct-to-stdout streaming (no output path, no buffering reason),
+        // entropy is skipped because stdin is potentially unbounded.
+        let needs_buffer = cli.extract_context || llm_collector.is_some() || entropy_active;
 
         if let Some(out_path) = output_path {
             if needs_buffer {
                 let mut buf: Vec<u8> = Vec::new();
-                let stats = scanner
+                let mut stats = scanner
                     .scan_reader_with_progress(
                         reader,
                         &mut buf,
@@ -3923,6 +4974,12 @@ fn process_stdin_streaming<R: io::Read>(
                     .map_err(|e| format!("scanner error: {e}"))?;
                 if is_interrupted() {
                     return Err("interrupted — partial output discarded".into());
+                }
+                if entropy_active {
+                    let (ent_out, ent_matches) = entropy_scan_bytes(&buf, entropy_configs, store);
+                    buf = ent_out;
+                    stats.matches_found += ent_matches;
+                    stats.replacements_applied += ent_matches;
                 }
                 if stats.matches_found > 0 {
                     had_matches = true;
@@ -3976,7 +5033,7 @@ fn process_stdin_streaming<R: io::Read>(
             }
         } else if needs_buffer {
             let mut buf: Vec<u8> = Vec::new();
-            let stats = scanner
+            let mut stats = scanner
                 .scan_reader_with_progress(
                     reader,
                     &mut buf,
@@ -3984,6 +5041,12 @@ fn process_stdin_streaming<R: io::Read>(
                     make_scan_callback(progress.clone(), label),
                 )
                 .map_err(|e| format!("scanner error: {e}"))?;
+            if entropy_active {
+                let (ent_out, ent_matches) = entropy_scan_bytes(&buf, entropy_configs, store);
+                buf = ent_out;
+                stats.matches_found += ent_matches;
+                stats.replacements_applied += ent_matches;
+            }
             if stats.matches_found > 0 {
                 had_matches = true;
             }
@@ -4005,6 +5068,7 @@ fn process_stdin_streaming<R: io::Read>(
                     .map_err(|e| format!("failed to write to stdout: {e}"))?;
             }
         } else {
+            // Direct streaming to stdout — entropy skipped (stdin is unbounded).
             let stdout = io::stdout();
             let writer = BufWriter::new(stdout.lock());
             let stats = scanner
@@ -4044,6 +5108,7 @@ fn process_plain_file(
     report_builder: Option<&ReportBuilder>,
     progress: Option<&SharedProgressReporter>,
     llm_collector: Option<&LlmCollector>,
+    entropy_configs: &Arc<Vec<EntropyConfig>>,
 ) -> Result<bool, String> {
     // --- binary detection ---
     let mut sample = [0u8; 512];
@@ -4420,6 +5485,18 @@ fn process_plain_file(
                         }
                     };
 
+                // Apply entropy detection on top of the scanner output.
+                let (output_bytes, fallback_stats) = {
+                    let (ent_out, ent_matches) =
+                        entropy_scan_bytes(&output_bytes, entropy_configs, store);
+                    let stats = fallback_stats.map(|mut s| {
+                        s.matches_found += ent_matches;
+                        s.replacements_applied += ent_matches;
+                        s
+                    });
+                    (ent_out, stats)
+                };
+
                 if cli.dry_run || report_builder.is_some() || cli.fail_on_match {
                     // In both structured and scanner paths the final output comes from
                     // a streaming scan pass, so replacements_applied is accurate.
@@ -4473,24 +5550,45 @@ fn process_plain_file(
 
     // --- Streaming path ---
     let method = "scanner";
+    let entropy_active = !entropy_configs.is_empty();
 
     if cli.dry_run {
         let label = format!("Scanning {} (dry-run)", input.display());
         let progress_label = label.clone();
+        let ent_cfgs = Arc::clone(entropy_configs);
+        let store_arc = Arc::clone(store);
         with_progress_scope(progress, &label, move |progress| {
             let reader = BufReader::new(
                 fs::File::open(input)
                     .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
             );
             let progress_for_scan = progress.clone();
-            let stats = scanner
-                .scan_reader_with_progress(
-                    reader,
-                    io::sink(),
-                    Some(file_size(input)?),
-                    make_scan_callback(progress_for_scan, &progress_label),
-                )
-                .map_err(|e| format!("scan error: {e}"))?;
+            let sz = file_size(input)?;
+            // Buffer when entropy is active so we can count entropy matches.
+            let stats = if entropy_active {
+                let mut buf: Vec<u8> = Vec::new();
+                let mut s = scanner
+                    .scan_reader_with_progress(
+                        reader,
+                        &mut buf,
+                        Some(sz),
+                        make_scan_callback(progress_for_scan, &progress_label),
+                    )
+                    .map_err(|e| format!("scan error: {e}"))?;
+                let (_ent_out, ent_matches) = entropy_scan_bytes(&buf, &ent_cfgs, &store_arc);
+                s.matches_found += ent_matches;
+                s.replacements_applied += ent_matches;
+                s
+            } else {
+                scanner
+                    .scan_reader_with_progress(
+                        reader,
+                        io::sink(),
+                        Some(sz),
+                        make_scan_callback(progress_for_scan, &progress_label),
+                    )
+                    .map_err(|e| format!("scan error: {e}"))?
+            };
             if stats.matches_found > 0 {
                 had_matches = true;
             }
@@ -4513,16 +5611,18 @@ fn process_plain_file(
         let label = format!("Scanning {}", input.display());
         let progress_label = label.clone();
         let llm_opt = llm_collector.cloned();
+        let ent_cfgs = Arc::clone(entropy_configs);
+        let store_arc = Arc::clone(store);
         with_progress_scope(progress, &label, move |progress| {
-            if llm_opt.is_some() {
-                // Buffer for LLM collection instead of writing to file.
+            if llm_opt.is_some() || entropy_active {
+                // Buffer: needed for LLM collection and/or entropy post-processing.
                 let reader = BufReader::new(
                     fs::File::open(input)
                         .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
                 );
                 let mut buf: Vec<u8> = Vec::new();
                 let progress_for_scan = progress.clone();
-                let stats = scanner
+                let mut stats = scanner
                     .scan_reader_with_progress(
                         reader,
                         &mut buf,
@@ -4532,6 +5632,12 @@ fn process_plain_file(
                     .map_err(|e| format!("scanner error: {e}"))?;
                 if is_interrupted() {
                     return Err("interrupted — partial output discarded".into());
+                }
+                if entropy_active {
+                    let (ent_out, ent_matches) = entropy_scan_bytes(&buf, &ent_cfgs, &store_arc);
+                    buf = ent_out;
+                    stats.matches_found += ent_matches;
+                    stats.replacements_applied += ent_matches;
                 }
                 if stats.matches_found > 0 {
                     had_matches = true;
@@ -4544,7 +5650,12 @@ fn process_plain_file(
                     ));
                 }
                 maybe_extract_context(&buf, &input.display().to_string(), cli, report_builder);
-                maybe_collect_for_llm(&buf, &input.display().to_string(), llm_opt.as_ref());
+                if llm_opt.is_some() {
+                    maybe_collect_for_llm(&buf, &input.display().to_string(), llm_opt.as_ref());
+                } else {
+                    atomic_write(out_path, &buf)
+                        .map_err(|e| format!("failed to write output: {e}"))?;
+                }
             } else {
                 let reader = BufReader::new(
                     fs::File::open(input)
@@ -4594,10 +5705,12 @@ fn process_plain_file(
         let label = format!("Scanning {}", input.display());
         let progress_label = label.clone();
         let llm_opt = llm_collector.cloned();
+        let ent_cfgs = Arc::clone(entropy_configs);
+        let store_arc = Arc::clone(store);
         with_progress_scope(progress, &label, move |progress| {
             let sz = file_size(input)?;
-            let needs_buffer =
-                (cli.extract_context || llm_opt.is_some()) && sz <= MAX_CONTEXT_BUFFER_BYTES;
+            let needs_buffer = (cli.extract_context || llm_opt.is_some() || entropy_active)
+                && sz <= MAX_CONTEXT_BUFFER_BYTES;
             if needs_buffer {
                 let reader = BufReader::new(
                     fs::File::open(input)
@@ -4605,7 +5718,7 @@ fn process_plain_file(
                 );
                 let mut buf: Vec<u8> = Vec::new();
                 let progress_for_scan = progress.clone();
-                let stats = scanner
+                let mut stats = scanner
                     .scan_reader_with_progress(
                         reader,
                         &mut buf,
@@ -4613,6 +5726,12 @@ fn process_plain_file(
                         make_scan_callback(progress_for_scan, &progress_label),
                     )
                     .map_err(|e| format!("scanner error: {e}"))?;
+                if entropy_active {
+                    let (ent_out, ent_matches) = entropy_scan_bytes(&buf, &ent_cfgs, &store_arc);
+                    buf = ent_out;
+                    stats.matches_found += ent_matches;
+                    stats.replacements_applied += ent_matches;
+                }
                 if stats.matches_found > 0 {
                     had_matches = true;
                 }
@@ -4681,7 +5800,7 @@ fn process_plain_file(
 ///
 /// - If `path` already exists: parse its entries, merge, deduplicate, rewrite.
 /// - If `path` does not exist: create it with the discovered entries.
-/// - Values shorter than 4 bytes are skipped (too short → high false-positive risk).
+/// - Empty values are skipped; length enforcement is handled by `ScanPattern::min_length`.
 /// - Entries whose `pattern` already appears in the file are skipped.
 fn save_discovered_secrets(
     store: &Arc<MappingStore>,
@@ -4690,13 +5809,17 @@ fn save_discovered_secrets(
     // Collect discovered (original, category) pairs from the store.
     let mut new_entries: Vec<SecretEntry> = store
         .iter()
-        .filter(|(_, original, _)| original.len() >= 4)
+        .filter(|(_, original, _)| !original.is_empty())
         .map(|(category, original, _)| SecretEntry {
             pattern: original.to_string(),
             kind: "literal".into(),
             category: category.to_string(),
             label: Some("discovered".into()),
             values: vec![],
+            min_length: None,
+            max_length: None,
+            threshold: None,
+            charset: None,
         })
         .collect();
 
@@ -4832,6 +5955,183 @@ fn build_format_preserving_scanner(
 }
 
 /// Fall back to the streaming scanner for raw bytes.
+// ── Entropy-based detection ────────────────────────────────────────────────────
+
+/// Which character set a token must consist of exclusively to be entropy-checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntropyCharset {
+    Alphanumeric,
+    Base64,
+    Hex,
+    Any,
+}
+
+impl EntropyCharset {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "base64" => Self::Base64,
+            "hex"    => Self::Hex,
+            "any"    => Self::Any,
+            _        => Self::Alphanumeric,
+        }
+    }
+
+    fn matches_all(&self, token: &[u8]) -> bool {
+        token.iter().all(|&b| match self {
+            Self::Alphanumeric => b.is_ascii_alphanumeric(),
+            Self::Base64 => b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=',
+            Self::Hex => matches!(b, b'0'..=b'9' | b'A'..=b'F' | b'a'..=b'f'),
+            Self::Any => b.is_ascii_graphic(),
+        })
+    }
+}
+
+/// Configuration for one entropy-detection pass. Produced from `kind: entropy`
+/// secrets-file entries and from the `--entropy-threshold` CLI flag.
+#[derive(Debug, Clone)]
+struct EntropyConfig {
+    min_length: usize,
+    max_length: usize,
+    threshold: f64,
+    charset: EntropyCharset,
+    label: String,
+    category: sanitize_engine::Category,
+}
+
+impl Default for EntropyConfig {
+    fn default() -> Self {
+        Self {
+            min_length: 20,
+            max_length: 200,
+            threshold: 4.5,
+            charset: EntropyCharset::Alphanumeric,
+            label: "high_entropy_token".into(),
+            category: sanitize_engine::Category::AuthToken,
+        }
+    }
+}
+
+/// Compute Shannon entropy (bits per character) of a byte slice.
+fn shannon_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for &b in data {
+        counts[b as usize] += 1;
+    }
+    let len = data.len() as f64;
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// Build `EntropyConfig`s from `kind: entropy` entries in the secrets file.
+fn entropy_configs_from_entries(entries: &[SecretEntry]) -> Vec<EntropyConfig> {
+    use sanitize_engine::secrets::parse_category;
+    entries
+        .iter()
+        .filter(|e| e.kind == "entropy")
+        .map(|e| EntropyConfig {
+            min_length: e.min_length.unwrap_or(20),
+            max_length: e.max_length.unwrap_or(200),
+            threshold: e.threshold.unwrap_or(4.5),
+            charset: EntropyCharset::from_str(
+                e.charset.as_deref().unwrap_or("alphanumeric"),
+            ),
+            label: e
+                .label
+                .clone()
+                .unwrap_or_else(|| "high_entropy_token".into()),
+            category: parse_category(&e.category),
+        })
+        .collect()
+}
+
+/// Byte values that delimit tokens for entropy analysis.
+/// We split on anything that isn't part of a potential secret value.
+const ENTROPY_DELIMITERS: &[u8] = b" \t\n\r\"'`=:,;()[]{}|<>@#\\/^~!?&%$*";
+
+/// Scan `input` for high-entropy tokens and replace them using `store`.
+/// Returns `(output_bytes, match_count)`.
+///
+/// Runs AFTER the main scanner so tokens already replaced (now placeholders)
+/// won't double-fire — placeholders have low entropy by design.
+fn entropy_scan_bytes(
+    input: &[u8],
+    configs: &[EntropyConfig],
+    store: &Arc<MappingStore>,
+) -> (Vec<u8>, u64) {
+    if configs.is_empty() || input.is_empty() {
+        return (input.to_vec(), 0);
+    }
+
+    let mut output = Vec::with_capacity(input.len());
+    let mut matches: u64 = 0;
+    let mut pos = 0;
+
+    while pos < input.len() {
+        // Find the end of the current token (up to the next delimiter).
+        let token_start = pos;
+        let token_end = input[pos..]
+            .iter()
+            .position(|b| ENTROPY_DELIMITERS.contains(b))
+            .map(|p| pos + p)
+            .unwrap_or(input.len());
+
+        let token = &input[token_start..token_end];
+
+        let replaced = if !token.is_empty() {
+            // Check against each entropy config; first match wins.
+            let hit = configs.iter().find(|cfg| {
+                token.len() >= cfg.min_length
+                    && token.len() <= cfg.max_length
+                    && cfg.charset.matches_all(token)
+                    && shannon_entropy(token) >= cfg.threshold
+            });
+
+            if let Some(cfg) = hit {
+                // Use the store so identical tokens get identical replacements
+                // (important for deterministic mode).
+                if let Ok(token_str) = std::str::from_utf8(token) {
+                    if let Ok(replacement) = store.get_or_insert(&cfg.category, token_str) {
+                        output.extend_from_slice(replacement.as_bytes());
+                    } else {
+                        output.extend_from_slice(token);
+                    }
+                    matches += 1;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !replaced {
+            output.extend_from_slice(token);
+        }
+
+        // Emit the delimiter (if any) verbatim.
+        if token_end < input.len() {
+            output.push(input[token_end]);
+            pos = token_end + 1;
+        } else {
+            pos = token_end;
+        }
+    }
+
+    (output, matches)
+}
+
 fn scanner_fallback(scanner: &StreamScanner, input: &[u8]) -> Result<(Vec<u8>, ScanStats), String> {
     let (output, stats) = scanner
         .scan_bytes(input)
@@ -5131,7 +6431,7 @@ fn build_log_context_config(cli: &Cli) -> LogContextConfig {
         .with_max_matches(cli.max_context_matches)
         .case_sensitive(cli.context_case_sensitive);
     if !cli.context_keywords.is_empty() {
-        config = if cli.context_keywords_only {
+        config = if cli.context_keywords_replace {
             config.with_keywords(cli.context_keywords.iter().cloned())
         } else {
             config.with_extra_keywords(cli.context_keywords.iter().cloned())
@@ -5360,7 +6660,7 @@ fn run() -> Result<(), (String, i32)> {
     let cli = Cli::parse_from(std::iter::once(OsString::from("sanitize")).chain(cleaned_args));
 
     // --- initialise logging -------------------------------------------------
-    init_logging(&cli.log_format);
+    init_logging(cli.effective_log_format());
 
     // --- dispatch subcommands -----------------------------------------------
     match &cli.command {
@@ -5370,6 +6670,11 @@ fn run() -> Result<(), (String, i32)> {
         Some(SubCommand::Guided) => return run_guided(),
         Some(SubCommand::Template(args)) => return run_template(args),
         Some(SubCommand::AllowTest(args)) => return run_allow_test(args),
+        Some(SubCommand::InstallHook(args)) => return run_install_hook(args),
+        Some(SubCommand::Init(args)) => return run_init(args),
+        Some(SubCommand::ShowConfig) => return run_show_config(),
+        Some(SubCommand::Scan(args)) => return run_scan(args),
+        Some(SubCommand::TestPattern(args)) => return run_test_pattern(args),
         None => {} // fall through to default sanitize mode
     }
 
@@ -5377,7 +6682,7 @@ fn run() -> Result<(), (String, i32)> {
 }
 
 fn run_sanitize(
-    cli: Cli,
+    mut cli: Cli,
     pre_resolved_password: Option<Zeroizing<String>>,
     filter_map: HashMap<PathBuf, ArchiveFilter>,
 ) -> Result<(), (String, i32)> {
@@ -5388,11 +6693,101 @@ fn run_sanitize(
         eprintln!("warning: failed to install signal handler: {e}");
     }
 
+    // Snapshot what the user actually typed before config files override anything.
+    let cli_snapshot = CliConfigSnapshot::capture(&cli);
+
+    // --- apply settings.yaml defaults (CLI flags always win) -----------------
+    let settings = load_settings();
+    if cli.app.is_empty() && !settings.app.is_empty() {
+        cli.app = settings.app;
+    }
+    if cli.allow.is_empty() && !settings.allow.is_empty() {
+        cli.allow = settings.allow;
+    }
+    if !cli.fail_on_match {
+        if let Some(v) = settings.fail_on_match {
+            cli.fail_on_match = v;
+        }
+    }
+    if !cli.strict {
+        if let Some(v) = settings.strict {
+            cli.strict = v;
+        }
+    }
+    if !cli.no_update_secrets {
+        if let Some(v) = settings.no_update_secrets {
+            cli.no_update_secrets = v;
+        }
+    }
+    if cli.threads.is_none() {
+        cli.threads = settings.threads;
+    }
+    if cli.log_format.is_none() {
+        cli.log_format = settings.log_format;
+    }
+    if !cli.no_progress {
+        if let Some(v) = settings.no_progress {
+            cli.no_progress = v;
+        }
+    }
+
+    // --- apply .sanitize.toml project config (project > settings, CLI > project) --
+    if let Some(project_config_path) = find_project_config() {
+        let (pc, config_dir) = load_project_config(&project_config_path);
+
+        // App bundles: merge — project bundles extend settings bundles unless
+        // the user already gave --app on the CLI (non-empty after settings apply).
+        for bundle in &pc.app {
+            if !cli.app.contains(bundle) {
+                cli.app.push(bundle.clone());
+            }
+        }
+        // Allow-list: same merge strategy.
+        for val in &pc.allow {
+            if !cli.allow.contains(val) {
+                cli.allow.push(val.clone());
+            }
+        }
+        // secrets_file: project config wins over global default, CLI wins over project.
+        if cli.secrets_file.is_none() {
+            if let Some(rel) = pc.secrets_file {
+                cli.secrets_file = Some(config_dir.join(rel));
+            }
+        }
+        // encrypted_secrets: project config sets it when CLI did not.
+        if !cli.encrypted_secrets {
+            if let Some(v) = pc.encrypted_secrets {
+                cli.encrypted_secrets = v;
+            }
+        }
+        // profile: project config wins over nothing, CLI wins over project.
+        if cli.profile.is_none() {
+            if let Some(rel) = pc.profile {
+                cli.profile = Some(config_dir.join(rel));
+            }
+        }
+        if !cli.fail_on_match {
+            if let Some(v) = pc.fail_on_match {
+                cli.fail_on_match = v;
+            }
+        }
+        if !cli.strict {
+            if let Some(v) = pc.strict {
+                cli.strict = v;
+            }
+        }
+        if !cli.no_update_secrets {
+            if let Some(v) = pc.no_update_secrets {
+                cli.no_update_secrets = v;
+            }
+        }
+    }
+
     // --- validate -----------------------------------------------------------
     validate_args(&cli).map_err(|e| (e, 1))?;
 
     let progress_mode = cli.effective_progress_mode();
-    let progress_context = ProgressContext::detect(&cli.log_format);
+    let progress_context = ProgressContext::detect(cli.effective_log_format());
     let progress_policy = ProgressPolicy::from_mode(progress_mode, progress_context);
     let progress_reporter = if progress_policy.live_updates || progress_policy.milestone_updates {
         Some(Arc::new(Mutex::new(ProgressReporter::new(
@@ -5411,6 +6806,24 @@ fn run_sanitize(
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(thread_count)
         .build_global();
+
+    // --- auto-load global default secrets (before header so path is visible) ----
+    // If the user has not provided --secrets-file but the global default exists
+    // (written by `sanitize install-hook`), use it silently. An explicit
+    // --secrets-file on the CLI always takes precedence.
+    if cli.secrets_file.is_none() {
+        let default_path = global_default_secrets_path();
+        if default_path.exists() {
+            cli.secrets_file = Some(default_path);
+        }
+    }
+
+    // --- print run configuration header to stderr ----------------------------
+    // Only emit when progress is active (interactive TTY or --progress on/ci).
+    // In auto+non-TTY mode (pipes, scripts) we stay silent.
+    if progress_policy.live_updates || progress_policy.milestone_updates || progress_context.json_logs {
+        print_run_header(&cli, &cli_snapshot, progress_context.json_logs);
+    }
 
     info!(
         threads = thread_count,
@@ -5448,13 +6861,26 @@ fn run_sanitize(
         };
 
     // --- compile base patterns from all sources --------------------------------
-    // All sources (--secrets-file, --default, --app) contribute to a single
+    // All sources (--secrets-file, --app) contribute to a single
     // Vec<ScanPattern> that is reused by both the initial scanner and the
     // Phase 2 augmented scanner (which appends profile-discovered literals).
     let mut base_patterns: Vec<ScanPattern> = vec![];
     // Allow patterns accumulate from secrets file + --allow CLI values and are
     // used to build the AllowlistMatcher before constructing the store.
     let mut all_allow_patterns: Vec<String> = cli.allow.clone();
+    // Entropy configs built from kind:entropy secrets entries + --entropy-threshold.
+    let mut entropy_configs: Vec<EntropyConfig> = vec![];
+
+    // Pre-pass: collect allow patterns from --app bundles so they are included
+    // in the allowlist that gates the MappingStore. Without this, app bundle
+    // `kind: allow` entries would never reach the store and profile-discovered
+    // placeholder values (e.g. "token", "secret") would still enter the literal
+    // pool and propagate via the augmented scanner.
+    for app_name in &cli.app {
+        if let Ok(bundle) = load_app_bundle(app_name) {
+            all_allow_patterns.extend(extract_allow_patterns(&bundle.secrets));
+        }
+    }
 
     // 1. From --secrets-file (plaintext or encrypted).
     let secrets_raw_bytes: Option<Vec<u8>> = if let Some(ref secrets_path) = cli.secrets_file {
@@ -5517,15 +6943,49 @@ fn run_sanitize(
         }
         base_patterns.extend(patterns);
         all_allow_patterns.extend(allow_from_secrets);
+
+        // Extract entropy configs from kind:entropy entries in the secrets file.
+        // We re-parse the (possibly decrypted) bytes to get the entries because
+        // load_secrets_auto zeroizes them after pattern compilation.
+        let entropy_plaintext: Option<Zeroizing<Vec<u8>>> = if was_encrypted {
+            effective_password
+                .as_ref()
+                .and_then(|pw| decrypt_secrets(raw_bytes, pw.as_str()).ok())
+        } else {
+            None
+        };
+        let bytes_for_entropy: &[u8] = entropy_plaintext
+            .as_deref()
+            .map_or(raw_bytes.as_slice(), |v| v);
+        if let Ok(ent_entries) = parse_secrets(bytes_for_entropy, None) {
+            entropy_configs.extend(entropy_configs_from_entries(&ent_entries));
+        }
     }
 
-    // 2. From --default or implicitly when --app is used without --secrets-file.
-    //    --app is designed to be zero-setup: users don't need to also add
-    //    --default to get email, IP, JWT, and common token patterns.
+    // --entropy-threshold adds a global catch-all entropy config (alphanumeric,
+    // 20–200 chars) using the user-supplied threshold, unless a kind:entropy entry
+    // with the same label already covers it.
+    if let Some(threshold) = cli.entropy_threshold {
+        if !entropy_configs
+            .iter()
+            .any(|c| c.label == "high_entropy_token")
+        {
+            entropy_configs.push(EntropyConfig {
+                threshold,
+                ..Default::default()
+            });
+        }
+    }
+    let entropy_configs = Arc::new(entropy_configs);
+
+    // 2. Implicit baseline when --app is used without a secrets file, or when a
+    //    profile is active. --app is zero-setup: users get email, IP, JWT, and
+    //    common token patterns automatically even without a secrets file.
     //    Common allow patterns are added here — before the allowlist is built —
     //    so the store is aware of them from the first matched value.
-    let load_defaults =
-        cli.default || (!cli.app.is_empty() && cli.secrets_file.is_none()) || cli.profile.is_some();
+    let load_defaults = cli.use_default
+        || (!cli.app.is_empty() && cli.secrets_file.is_none())
+        || cli.profile.is_some();
     if load_defaults {
         all_allow_patterns.extend(common_allow_patterns());
     }
@@ -5554,17 +7014,10 @@ fn run_sanitize(
 
     if load_defaults {
         let default_patterns = build_default_patterns();
-        if cli.default {
-            info!(
-                patterns = default_patterns.len(),
-                "loaded built-in balanced patterns (--default)"
-            );
-        } else {
-            info!(
-                patterns = default_patterns.len(),
-                "loaded built-in balanced patterns (auto, via --app)"
-            );
-        }
+        info!(
+            patterns = default_patterns.len(),
+            "loaded built-in balanced patterns (auto, via --app)"
+        );
         base_patterns.extend(default_patterns);
     }
 
@@ -5589,7 +7042,7 @@ fn run_sanitize(
     }
 
     if base_patterns.is_empty() && app_profiles.is_empty() {
-        warn!("no --secrets-file, --default, or --app provided; only structured processing will apply");
+        warn!("no secrets file or --app provided; run 'sanitize install-hook' to initialize a default secrets file, or pass --secrets-file / --app explicitly");
     }
 
     let scanner = StreamScanner::new(
@@ -5628,9 +7081,9 @@ fn run_sanitize(
     }
 
     // --- build report builder -----------------------------------------------
-    // Force report building when --llm is active so we can include the
-    // sanitization summary in the generated prompt.
-    let report_enabled = cli.report.is_some() || cli.llm.is_some();
+    // Force report building when --llm or --findings is active so we have
+    // per-file stats available for those output paths.
+    let report_enabled = cli.report.is_some() || cli.llm.is_some() || cli.findings.is_some();
     let report_builder = if report_enabled {
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -5650,11 +7103,7 @@ fn run_sanitize(
             strict: cli.strict,
             chunk_size: cli.chunk_size,
             threads: cli.threads,
-            secrets_file: if cli.default {
-                Some("<built-in:balanced>".into())
-            } else {
-                cli.secrets_file.as_ref().map(|p| p.display().to_string())
-            },
+            secrets_file: cli.secrets_file.as_ref().map(|p| p.display().to_string()),
         }))
     } else {
         None
@@ -5732,6 +7181,7 @@ fn run_sanitize(
                 report_builder.as_ref(),
                 progress_reporter.as_ref(),
                 llm_collector.as_ref(),
+                &entropy_configs,
             )
             .map_err(|e| (e, 1))?;
             had_matches |= result;
@@ -5781,6 +7231,7 @@ fn run_sanitize(
             report_builder.as_ref(),
             progress_reporter.as_ref(),
             llm_collector.as_ref(),
+            &entropy_configs,
         )
         .map_err(|e| (e, 1))?;
         had_matches |= result;
@@ -5852,6 +7303,7 @@ fn run_sanitize(
                 report_builder.as_ref(),
                 progress_reporter.as_ref(),
                 llm_collector.as_ref(),
+                &entropy_configs,
             )
             .map_err(|e| (e, 1))?;
             had_matches |= result;
@@ -5905,6 +7357,7 @@ fn run_sanitize(
                         report_builder.as_ref(),
                         progress_reporter.as_ref(),
                         llm_collector.as_ref(),
+                        &entropy_configs,
                     )
                     .map_err(|e| (e, 1))
                 }
@@ -5951,6 +7404,7 @@ fn run_sanitize(
                         report_builder.as_ref(),
                         progress_reporter.as_ref(),
                         llm_collector.as_ref(),
+                        &entropy_configs,
                     )
                     .map_err(|e| (e, 1))
                 }
@@ -5969,22 +7423,22 @@ fn run_sanitize(
     }
 
     // --- persist discovered secrets (profile active + not suppressed) -------------------
-    // When a profile is active, append literal values found by structured scanning to
-    // the secrets file by default so future runs can match them everywhere they appear.
-    // Pass --no-update-secrets to suppress this write.
+    // When a profile is active and --secrets-file was explicitly provided, append any
+    // literal values found by structured scanning back into that file so future runs can
+    // match them everywhere they appear.  We intentionally skip this when no --secrets-file
+    // was given — writing a surprise file to CWD is worse than doing nothing.
+    // Pass --no-update-secrets to suppress the write even when a secrets file is set.
     if !cli.no_update_secrets && !profiles.is_empty() {
-        let save_path = cli
-            .secrets_file
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("sanitize-discovered.yaml"));
-        match save_discovered_secrets(&store, &save_path) {
-            Ok(0) => {}
-            Ok(n) => info!(
-                path = %save_path.display(),
-                added = n,
-                "saved discovered literals to secrets file"
-            ),
-            Err(e) => warn!("could not save discovered secrets: {e}"),
+        if let Some(save_path) = &cli.secrets_file {
+            match save_discovered_secrets(&store, save_path) {
+                Ok(0) => {}
+                Ok(n) => info!(
+                    path = %save_path.display(),
+                    added = n,
+                    "saved discovered literals to secrets file"
+                ),
+                Err(e) => warn!("could not save discovered secrets: {e}"),
+            }
         }
     }
 
@@ -6032,6 +7486,73 @@ fn run_sanitize(
                 }
             }
         }
+
+        // --- NDJSON findings (--findings / scan --json) ---
+        if let Some(ref findings_path) = cli.findings {
+            let mut lines: Vec<String> = Vec::with_capacity(report.files.len() + 1);
+
+            #[derive(serde::Serialize)]
+            struct FileFinding<'a> {
+                #[serde(rename = "type")]
+                kind: &'static str,
+                file: &'a str,
+                matches: u64,
+                clean: bool,
+                #[serde(skip_serializing_if = "HashMap::is_empty")]
+                patterns: &'a HashMap<String, u64>,
+                bytes_processed: u64,
+            }
+            #[derive(serde::Serialize)]
+            struct SummaryFinding {
+                #[serde(rename = "type")]
+                kind: &'static str,
+                files: u64,
+                matches: u64,
+                clean: bool,
+            }
+
+            for f in &report.files {
+                let line = serde_json::to_string(&FileFinding {
+                    kind: "file",
+                    file: &f.path,
+                    matches: f.matches,
+                    clean: f.matches == 0,
+                    patterns: &f.pattern_counts,
+                    bytes_processed: f.bytes_processed,
+                })
+                .map_err(|e| (format!("failed to serialize finding: {e}"), 1))?;
+                lines.push(line);
+            }
+            lines.push(
+                serde_json::to_string(&SummaryFinding {
+                    kind: "summary",
+                    files: report.summary.total_files,
+                    matches: report.summary.total_matches,
+                    clean: report.summary.total_matches == 0,
+                })
+                .map_err(|e| (format!("failed to serialize findings summary: {e}"), 1))?,
+            );
+
+            let ndjson = lines.join("\n") + "\n";
+
+            if findings_path.to_string_lossy() == "-" {
+                io::stdout()
+                    .lock()
+                    .write_all(ndjson.as_bytes())
+                    .map_err(|e| (format!("failed to write findings to stdout: {e}"), 1))?;
+            } else {
+                atomic_write(findings_path, ndjson.as_bytes()).map_err(|e| {
+                    (
+                        format!(
+                            "failed to write findings to {}: {e}",
+                            findings_path.display()
+                        ),
+                        1,
+                    )
+                })?;
+                info!(findings = %findings_path.display(), files = report.files.len(), "findings written");
+            }
+        }
     }
 
     // --- Performance summary (bench feature) --------------------------------
@@ -6045,6 +7566,869 @@ fn run_sanitize(
     if cli.fail_on_match && had_matches {
         return Err(("matches found (--fail-on-match)".into(), 2));
     }
+
+    Ok(())
+}
+
+// ─── install-hook implementation ─────────────────────────────────────────────
+
+/// Sentinel embedded in every installed hook so we can identify and remove it.
+const HOOK_MARKER: &str = "# installed-by: sanitize-engine";
+
+/// Minimum version string embedded in the hook for runtime compatibility checks.
+const HOOK_MIN_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Run `git <args>` and return trimmed stdout, or an error string.
+fn git_output(args: &[&str]) -> Result<String, String> {
+    let out = process::Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Returns `$XDG_CONFIG_HOME/sanitize/` (or `~/.config/sanitize/` when
+/// XDG_CONFIG_HOME is unset). All per-user sanitize config lives here.
+fn sanitize_config_dir() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
+        });
+    base.join("sanitize")
+}
+
+/// Returns the path to the global default secrets file.
+/// Auto-loaded when no explicit `--secrets-file` is given.
+fn global_default_secrets_path() -> PathBuf {
+    sanitize_config_dir().join("secrets.yaml")
+}
+
+/// Returns the path to the global settings file.
+fn global_settings_path() -> PathBuf {
+    sanitize_config_dir().join("settings.yaml")
+}
+
+
+/// Locate the .git/hooks directory for the current repository.
+fn find_project_hooks_dir() -> Result<PathBuf, (String, i32)> {
+    let git_dir = git_output(&["rev-parse", "--git-dir"])
+        .map_err(|_| ("not inside a git repository".to_string(), 1))?;
+    Ok(PathBuf::from(git_dir).join("hooks"))
+}
+
+/// Locate the global git hooks directory.
+///
+/// Uses `git config --global core.hooksPath` if set; otherwise falls back to
+/// `$XDG_CONFIG_HOME/git/hooks` → `~/.config/git/hooks`.
+fn find_global_hooks_dir() -> Result<PathBuf, (String, i32)> {
+    if let Ok(p) = git_output(&["config", "--global", "core.hooksPath"]) {
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".config")
+        });
+    Ok(base.join("git").join("hooks"))
+}
+
+/// Find the root of the current git repository (the directory containing .git).
+fn find_git_root() -> Result<PathBuf, (String, i32)> {
+    git_output(&["rev-parse", "--show-toplevel"])
+        .map(PathBuf::from)
+        .map_err(|_| ("not inside a git repository".to_string(), 1))
+}
+
+/// Shell-quote a string value for safe embedding in a POSIX sh script.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Build the sanitize flags string for the hook invocation, based on the
+/// configured options.  Values are shell-quoted so paths with spaces work.
+fn build_hook_flags(args: &InstallHookArgs) -> String {
+    let mut flags: Vec<String> = Vec::new();
+    if let Some(ref app) = args.app {
+        flags.push(format!("--app {}", sh_quote(app)));
+    }
+    if let Some(ref s) = args.secrets {
+        flags.push(format!("-s {}", sh_quote(&s.to_string_lossy())));
+    }
+    flags.join(" ")
+}
+
+/// Build the complete POSIX sh hook script for pre-commit scan mode.
+fn hook_script_pre_commit_scan(flags: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+{marker}
+# requires sanitize >= {min_version}
+# Scans staged files for secrets before each commit.
+# Skip for one commit:  SANITIZE_SKIP=1 git commit ...
+# Uninstall:            sanitize install-hook --remove
+
+[ "${{SANITIZE_SKIP:-0}}" = "1" ] && exit 0
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
+[ -z "$STAGED" ] && exit 0
+
+if ! command -v sanitize >/dev/null 2>&1; then
+  printf 'sanitize: not found in PATH — hook skipped\n' >&2
+  exit 0
+fi
+
+_ver=$(sanitize --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+_req="{min_version}"
+if [ -n "$_ver" ] && [ "$(printf '%s\n' "$_req" "$_ver" | sort -V | head -1)" != "$_req" ]; then
+  printf 'sanitize: hook requires >= %s but found %s — update with: cargo install sanitize-engine\n' "$_req" "$_ver" >&2
+  exit 1
+fi
+
+# shellcheck disable=SC2086
+printf '%s\n' "$STAGED" | tr '\n' '\0' | xargs -0 \
+  sanitize --dry-run --fail-on-match {flags}
+
+EXIT=$?
+if [ "$EXIT" -eq 2 ]; then
+  printf '\nsanitize: secrets detected in staged files — commit blocked.\n' >&2
+  printf '  Sanitize the file(s), then re-stage and commit.\n' >&2
+  printf '  Skip once with:  SANITIZE_SKIP=1 git commit ...\n' >&2
+  exit 1
+fi
+[ "$EXIT" -ne 0 ] && printf 'sanitize: unexpected exit code %d\n' "$EXIT" >&2
+exit 0
+"#,
+        marker = HOOK_MARKER,
+        min_version = HOOK_MIN_VERSION,
+        flags = flags,
+    )
+}
+
+/// Build the complete POSIX sh hook script for pre-commit sanitize mode.
+fn hook_script_pre_commit_sanitize(flags: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+{marker}
+# requires sanitize >= {min_version}
+# Sanitizes staged files in place before each commit, then re-stages them.
+# WARNING: the committed content will differ from what you typed.
+# Skip for one commit:  SANITIZE_SKIP=1 git commit ...
+# Uninstall:            sanitize install-hook --remove
+
+[ "${{SANITIZE_SKIP:-0}}" = "1" ] && exit 0
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
+[ -z "$STAGED" ] && exit 0
+
+if ! command -v sanitize >/dev/null 2>&1; then
+  printf 'sanitize: not found in PATH — hook skipped\n' >&2
+  exit 0
+fi
+
+_ver=$(sanitize --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+_req="{min_version}"
+if [ -n "$_ver" ] && [ "$(printf '%s\n' "$_req" "$_ver" | sort -V | head -1)" != "$_req" ]; then
+  printf 'sanitize: hook requires >= %s but found %s — update with: cargo install sanitize-engine\n' "$_req" "$_ver" >&2
+  exit 1
+fi
+
+# shellcheck disable=SC2086
+printf '%s\n' "$STAGED" | tr '\n' '\0' | xargs -0 \
+  sanitize --output . {flags}
+
+EXIT=$?
+if [ "$EXIT" -ne 0 ]; then
+  printf 'sanitize: failed to sanitize staged files (exit %d) — commit blocked\n' "$EXIT" >&2
+  exit 1
+fi
+
+printf '%s\n' "$STAGED" | tr '\n' '\0' | xargs -0 git add
+exit 0
+"#,
+        marker = HOOK_MARKER,
+        min_version = HOOK_MIN_VERSION,
+        flags = flags,
+    )
+}
+
+/// Build the complete POSIX sh hook script for pre-push scan mode.
+fn hook_script_pre_push_scan(flags: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+{marker}
+# requires sanitize >= {min_version}
+# Scans files changed in commits about to be pushed for secrets.
+# Skip for one push:  SANITIZE_SKIP=1 git push ...
+# Uninstall:          sanitize install-hook --hook pre-push --remove
+
+[ "${{SANITIZE_SKIP:-0}}" = "1" ] && exit 0
+
+if ! command -v sanitize >/dev/null 2>&1; then
+  printf 'sanitize: not found in PATH — hook skipped\n' >&2
+  exit 0
+fi
+
+_ver=$(sanitize --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+_req="{min_version}"
+if [ -n "$_ver" ] && [ "$(printf '%s\n' "$_req" "$_ver" | sort -V | head -1)" != "$_req" ]; then
+  printf 'sanitize: hook requires >= %s but found %s — update with: cargo install sanitize-engine\n' "$_req" "$_ver" >&2
+  exit 1
+fi
+
+while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
+  # Skip branch deletions.
+  [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue
+
+  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+    FILES=$(git diff-tree --no-commit-id -r --name-only "$local_sha" 2>/dev/null)
+  else
+    FILES=$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null)
+  fi
+
+  [ -z "$FILES" ] && continue
+
+  # Build a NUL-delimited list of files that exist on disk.
+  EXISTING=$(printf '%s\n' "$FILES" | while IFS= read -r f; do
+    [ -f "$f" ] && printf '%s\0' "$f"
+  done)
+  [ -z "$EXISTING" ] && continue
+
+  # shellcheck disable=SC2086
+  printf '%s' "$EXISTING" | xargs -0 \
+    sanitize --dry-run --fail-on-match {flags}
+
+  EXIT=$?
+  if [ "$EXIT" -eq 2 ]; then
+    printf '\nsanitize: secrets detected — push blocked.\n' >&2
+    printf '  Skip once with:  SANITIZE_SKIP=1 git push ...\n' >&2
+    exit 1
+  fi
+  [ "$EXIT" -ne 0 ] && printf 'sanitize: unexpected exit code %d\n' "$EXIT" >&2
+done
+exit 0
+"#,
+        marker = HOOK_MARKER,
+        min_version = HOOK_MIN_VERSION,
+        flags = flags,
+    )
+}
+
+fn build_hook_script(args: &InstallHookArgs) -> String {
+    let flags = build_hook_flags(args);
+    match (&args.hook, &args.mode) {
+        (HookType::PreCommit, HookMode::Scan) => hook_script_pre_commit_scan(&flags),
+        (HookType::PreCommit, HookMode::Sanitize) => hook_script_pre_commit_sanitize(&flags),
+        (HookType::PrePush, _) => hook_script_pre_push_scan(&flags),
+    }
+}
+
+/// Check for known hook frameworks (husky, lefthook, pre-commit) in the repo
+/// root.  Returns the path to the target hook file if the framework handles
+/// the write itself (husky), or `None` with a printed advisory for frameworks
+/// that require manual config edits (lefthook, pre-commit).
+fn detect_framework_hooks_dir(
+    repo_root: &Path,
+    hook_name: &str,
+) -> Option<PathBuf> {
+    // ── husky ────────────────────────────────────────────────────────────────
+    let husky_dir = repo_root.join(".husky");
+    if husky_dir.is_dir() {
+        eprintln!("Detected husky — writing to .husky/{hook_name}");
+        return Some(husky_dir);
+    }
+
+    // ── lefthook ─────────────────────────────────────────────────────────────
+    let lefthook_files = ["lefthook.yml", "lefthook.yaml", "lefthook.toml"];
+    if lefthook_files.iter().any(|f| repo_root.join(f).exists()) {
+        eprintln!("Detected lefthook — add the following to your lefthook config manually:");
+        eprintln!();
+        eprintln!("  {hook_name}:");
+        eprintln!("    commands:");
+        eprintln!("      sanitize:");
+        eprintln!("        run: sanitize --dry-run --fail-on-match --use-default {{staged_files}}");
+        eprintln!("        glob: '*.{{yaml,yml,json,toml,env,conf,rb,py,go,ts,js}}'");
+        eprintln!();
+        eprintln!("Then re-run `sanitize install-hook` without the lefthook config to install a fallback raw hook,");
+        eprintln!("or skip and rely on lefthook alone.");
+    }
+
+    // ── pre-commit framework ─────────────────────────────────────────────────
+    let precommit_cfg = ["pre-commit-config.yaml", "pre-commit-config.yml"]
+        .iter()
+        .map(|f| repo_root.join(format!(".{f}")))
+        .find(|p| p.exists());
+    if precommit_cfg.is_some() {
+        eprintln!("Detected pre-commit framework — add the following to .pre-commit-config.yaml manually:");
+        eprintln!();
+        eprintln!("  - repo: local");
+        eprintln!("    hooks:");
+        eprintln!("      - id: sanitize-scan");
+        eprintln!("        name: Scan for secrets (sanitize-engine)");
+        eprintln!("        entry: sanitize --dry-run --fail-on-match --use-default");
+        eprintln!("        language: system");
+        eprintln!("        pass_filenames: true");
+        eprintln!();
+    }
+
+    None
+}
+
+/// Remove a hook installed by `sanitize install-hook`.
+/// If the file only contains the sanitize hook (single hook), the file is
+/// deleted.  If it was appended to an existing hook, the sanitize block is
+/// excised and the rest of the file is preserved.
+fn remove_hook(hook_path: &Path, _hook_name: &str) -> Result<(), (String, i32)> {
+    if !hook_path.exists() {
+        eprintln!("No hook found at {}", hook_path.display());
+        return Ok(());
+    }
+    let content = fs::read_to_string(hook_path)
+        .map_err(|e| (format!("failed to read {}: {e}", hook_path.display()), 1))?;
+
+    if !content.contains(HOOK_MARKER) {
+        return Err((
+            format!(
+                "{} was not installed by sanitize (marker not found) — not removing.\n\
+                 Delete it manually if you want to remove it.",
+                hook_path.display()
+            ),
+            1,
+        ));
+    }
+
+    // Count meaningful lines that appear *before* the sanitize marker.
+    // If there are none (only a shebang or whitespace before our block),
+    // the file is entirely ours and should be deleted outright.
+    let lines_before_marker = content
+        .lines()
+        .take_while(|l| !l.contains(HOOK_MARKER))
+        .filter(|l| !l.trim().is_empty() && *l != "#!/bin/sh")
+        .count();
+
+    if lines_before_marker == 0 {
+        fs::remove_file(hook_path)
+            .map_err(|e| (format!("failed to remove {}: {e}", hook_path.display()), 1))?;
+        println!("Removed {}", hook_path.display());
+    } else {
+        // Another hook owns this file — excise only our block (from the
+        // marker line to end-of-file) and leave the rest intact.
+        let trimmed = content
+            .lines()
+            .take_while(|l| !l.contains(HOOK_MARKER))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(hook_path, trimmed.trim_end().to_string() + "\n")
+            .map_err(|e| (format!("failed to write {}: {e}", hook_path.display()), 1))?;
+        println!("Removed sanitize block from {}", hook_path.display());
+    }
+
+    Ok(())
+}
+
+/// Per-user default flag values loaded from `~/.config/sanitize/settings.yaml`.
+/// Each field mirrors a CLI flag. A `None` / empty value means "not set" and
+/// the CLI default applies. An explicit CLI flag always wins over this file.
+#[derive(Debug, Default, serde::Deserialize)]
+struct Settings {
+    /// --app: app bundles to load on every run.
+    #[serde(default)]
+    app: Vec<String>,
+    /// --allow: values to pass through unchanged (exact strings or * globs).
+    #[serde(default)]
+    allow: Vec<String>,
+    /// --fail-on-match: exit 2 when any match is found.
+    #[serde(default)]
+    fail_on_match: Option<bool>,
+    /// --strict: abort on the first error instead of skipping.
+    #[serde(default)]
+    strict: Option<bool>,
+    /// --no-update-secrets: suppress auto-save of discovered literal values.
+    #[serde(default)]
+    no_update_secrets: Option<bool>,
+    /// --threads: worker thread count (null = auto-detect).
+    #[serde(default)]
+    threads: Option<usize>,
+    /// --log-format: "human" or "json".
+    #[serde(default)]
+    log_format: Option<String>,
+    /// --no-progress: disable progress output.
+    #[serde(default)]
+    no_progress: Option<bool>,
+}
+
+/// Load `~/.config/sanitize/settings.yaml` if it exists. Silently returns
+/// defaults when the file is absent or unreadable.
+/// Set `SANITIZE_NO_SETTINGS=1` to skip loading entirely (useful in CI).
+fn load_settings() -> Settings {
+    if std::env::var("SANITIZE_NO_SETTINGS").as_deref() == Ok("1") {
+        return Settings::default();
+    }
+    let path = global_settings_path();
+    if !path.exists() {
+        return Settings::default();
+    }
+    match fs::read_to_string(&path) {
+        Ok(text) => serde_yaml_ng::from_str(&text).unwrap_or_else(|e| {
+            eprintln!(
+                "warning: could not parse {}: {e} — ignoring settings",
+                path.display()
+            );
+            Settings::default()
+        }),
+        Err(e) => {
+            eprintln!(
+                "warning: could not read {}: {e} — ignoring settings",
+                path.display()
+            );
+            Settings::default()
+        }
+    }
+}
+
+// ── Project-level config (.sanitize.toml) ─────────────────────────────────────
+
+/// Per-directory config loaded from a `.sanitize.toml` file found by walking
+/// up from the current working directory.  Applied after `settings.yaml` but
+/// before CLI flags, so project config overrides global defaults while CLI
+/// flags still win over everything.
+///
+/// Override the search entirely with `SANITIZE_CONFIG=/path/to/file.toml`.
+/// Set `SANITIZE_NO_CONFIG=1` to skip project config loading.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ProjectConfig {
+    /// App bundles to load — additive with, not replacing, CLI `--app`.
+    #[serde(default)]
+    app: Vec<String>,
+    /// Allow-list values — additive with CLI `--allow`.
+    #[serde(default)]
+    allow: Vec<String>,
+    /// Path to a secrets file (relative to the `.sanitize.toml` location).
+    secrets_file: Option<PathBuf>,
+    /// Whether the secrets file is AES-GCM encrypted.
+    encrypted_secrets: Option<bool>,
+    /// Path to a profile YAML file (relative to the `.sanitize.toml` location).
+    profile: Option<PathBuf>,
+    /// Exit 2 when any match is found.
+    fail_on_match: Option<bool>,
+    /// Abort on the first error instead of skipping.
+    strict: Option<bool>,
+    /// Suppress auto-save of discovered literal values.
+    no_update_secrets: Option<bool>,
+    /// Path-level exclude patterns (glob). Matched relative to the
+    /// `.sanitize.toml` location; patterns without `/` also match the basename.
+    #[serde(default)]
+    exclude: Vec<String>,
+}
+
+/// Search for `.sanitize.toml` starting from `dir` and walking upward.
+/// Returns the path of the first file found, or `None`.
+fn find_project_config_from(dir: &Path) -> Option<PathBuf> {
+    let mut current = dir.to_path_buf();
+    loop {
+        let candidate = current.join(".sanitize.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        match current.parent() {
+            Some(p) => current = p.to_path_buf(),
+            None => return None,
+        }
+    }
+}
+
+/// Locate the project config to load.
+///
+/// Resolution order:
+/// 1. `SANITIZE_NO_CONFIG=1` → skip entirely (returns `None`).
+/// 2. `SANITIZE_CONFIG=<path>` → use that file if it exists.
+/// 3. Walk up from CWD looking for `.sanitize.toml`.
+fn find_project_config() -> Option<PathBuf> {
+    if std::env::var("SANITIZE_NO_CONFIG").as_deref() == Ok("1") {
+        return None;
+    }
+    if let Ok(explicit) = std::env::var("SANITIZE_CONFIG") {
+        let p = PathBuf::from(&explicit);
+        if p.is_file() {
+            return Some(p);
+        }
+        eprintln!(
+            "warning: SANITIZE_CONFIG={explicit} does not exist — ignoring"
+        );
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    find_project_config_from(&cwd)
+}
+
+/// Parse a `.sanitize.toml` file.  Returns `(config, config_dir)` so that
+/// relative paths inside the file can be resolved against the file's location.
+/// Silently returns defaults on read or parse error.
+fn load_project_config(path: &Path) -> (ProjectConfig, PathBuf) {
+    let config_dir = path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "warning: could not read {}: {e} — ignoring project config",
+                path.display()
+            );
+            return (ProjectConfig::default(), config_dir);
+        }
+    };
+    let cfg: ProjectConfig = match toml::from_str(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "warning: could not parse {}: {e} — ignoring project config",
+                path.display()
+            );
+            return (ProjectConfig::default(), config_dir);
+        }
+    };
+    (cfg, config_dir)
+}
+
+/// Template written to `settings.yaml` by `sanitize init`.
+const SETTINGS_TEMPLATE: &str = "\
+# sanitize settings
+# Values here apply when the corresponding flag is not passed on the command
+# line. All fields are optional — uncomment and edit to activate.
+
+# Load these app bundles on every run (--app).
+# app:
+#   - gitlab
+#   - kubernetes
+
+# Values that pass through unchanged, supports * glob patterns (--allow).
+# allow:
+#   - localhost
+#   - \"*.internal\"
+
+# Exit with code 2 when any secrets are found (--fail-on-match).
+# fail_on_match: false
+
+# Abort on the first error instead of skipping and continuing (--strict).
+# strict: false
+
+# Suppress auto-save of discovered literal values into --secrets-file (--no-update-secrets).
+# no_update_secrets: false
+
+# Worker thread count — omit for auto-detect (--threads).
+# threads: 4
+
+# Log format: \"human\" (default) or \"json\" for SIEM ingestion (--log-format).
+# log_format: human
+
+# Disable progress output (--no-progress).
+# no_progress: false
+";
+
+fn run_show_config() -> Result<(), (String, i32)> {
+    let secrets_path = global_default_secrets_path();
+    let settings_path = global_settings_path();
+    let no_settings = std::env::var("SANITIZE_NO_SETTINGS").as_deref() == Ok("1");
+    let no_config = std::env::var("SANITIZE_NO_CONFIG").as_deref() == Ok("1");
+
+    println!("Config directory: {}", sanitize_config_dir().display());
+    println!();
+
+    // ── secrets file ──────────────────────────────────────────────────────────
+    print!("Secrets:  {}", secrets_path.display());
+    if secrets_path.exists() {
+        println!(" (found — auto-loaded when --secrets-file is not given)");
+    } else {
+        println!(" (not found — run 'sanitize init' to create it)");
+    }
+
+    // ── settings file ─────────────────────────────────────────────────────────
+    println!();
+    print!("Settings: {}", settings_path.display());
+    if no_settings {
+        println!(" (skipped — SANITIZE_NO_SETTINGS=1)");
+    } else if !settings_path.exists() {
+        println!(" (not found — run 'sanitize init' to create it)");
+    } else {
+        println!();
+
+        let settings = load_settings();
+
+        fn show<T: std::fmt::Display>(label: &str, val: Option<T>, default: &str, source: &str) {
+            match val {
+                Some(v) => println!("  {label:<22} {v}  ({source})"),
+                None    => println!("  {label:<22} {default}  (default)"),
+            }
+        }
+        fn show_vec(label: &str, v: &[String], default: &str, source: &str) {
+            if v.is_empty() {
+                println!("  {label:<22} {default}  (default)");
+            } else {
+                println!("  {label:<22} {}  ({source})", v.join(", "));
+            }
+        }
+
+        show_vec("app:",           &settings.app,              "(none)", "from settings");
+        show_vec("allow:",         &settings.allow,            "(none)", "from settings");
+        show("fail_on_match:",     settings.fail_on_match,     "false",  "from settings");
+        show("strict:",            settings.strict,            "false",  "from settings");
+        show("no_update_secrets:", settings.no_update_secrets, "false",  "from settings");
+        show("threads:",           settings.threads,           "(auto)", "from settings");
+        show("log_format:",        settings.log_format.as_deref().map(|s| s.to_string()), "human", "from settings");
+        show("no_progress:",       settings.no_progress,       "false",  "from settings");
+    }
+
+    // ── project config (.sanitize.toml) ──────────────────────────────────────
+    println!();
+    if no_config {
+        println!("Project config: (skipped — SANITIZE_NO_CONFIG=1)");
+        return Ok(());
+    }
+    match find_project_config() {
+        None => {
+            println!("Project config: (none — no .sanitize.toml found in this directory or its parents)");
+        }
+        Some(ref path) => {
+            println!("Project config: {}", path.display());
+            let (pc, config_dir) = load_project_config(path);
+
+            fn show_opt_path(label: &str, val: Option<&Path>, base: &Path) {
+                match val {
+                    Some(p) => {
+                        let resolved = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
+                        println!("  {label:<22} {}", resolved.display());
+                    }
+                    None => println!("  {label:<22} (not set)"),
+                }
+            }
+
+            if pc.app.is_empty() {
+                println!("  {:<22} (not set)", "app:");
+            } else {
+                println!("  {:<22} {}", "app:", pc.app.join(", "));
+            }
+            if pc.allow.is_empty() {
+                println!("  {:<22} (not set)", "allow:");
+            } else {
+                println!("  {:<22} {}", "allow:", pc.allow.join(", "));
+            }
+            if pc.exclude.is_empty() {
+                println!("  {:<22} (none)", "exclude:");
+            } else {
+                println!("  {:<22}", "exclude:");
+                for pat in &pc.exclude {
+                    println!("    - {pat}");
+                }
+            }
+            show_opt_path("secrets_file:", pc.secrets_file.as_deref(), &config_dir);
+            match pc.encrypted_secrets {
+                Some(v) => println!("  {:<22} {v}", "encrypted_secrets:"),
+                None    => println!("  {:<22} (not set)", "encrypted_secrets:"),
+            }
+            show_opt_path("profile:", pc.profile.as_deref(), &config_dir);
+            match pc.fail_on_match {
+                Some(v) => println!("  {:<22} {v}", "fail_on_match:"),
+                None    => println!("  {:<22} (not set)", "fail_on_match:"),
+            }
+            match pc.strict {
+                Some(v) => println!("  {:<22} {v}", "strict:"),
+                None    => println!("  {:<22} (not set)", "strict:"),
+            }
+            match pc.no_update_secrets {
+                Some(v) => println!("  {:<22} {v}", "no_update_secrets:"),
+                None    => println!("  {:<22} (not set)", "no_update_secrets:"),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_init(args: &InitArgs) -> Result<(), (String, i32)> {
+    let secrets_path = global_default_secrets_path();
+    let settings_path = global_settings_path();
+
+    if args.dry_run {
+        println!("Would create (dry-run):");
+        if secrets_path.exists() && !args.force {
+            println!("  {} (already exists — use --force to overwrite)", secrets_path.display());
+        } else {
+            println!("  {} — balanced built-in patterns", secrets_path.display());
+        }
+        if settings_path.exists() && !args.force {
+            println!("  {} (already exists — use --force to overwrite)", settings_path.display());
+        } else {
+            println!("  {} — persistent flag defaults", settings_path.display());
+        }
+        if args.with_hook {
+            println!();
+            let hook_args = InstallHookArgs {
+                hook: args.hook,
+                mode: args.mode,
+                global: args.global,
+                force: args.force,
+                remove: false,
+                app: None,
+                secrets: None,
+                dry_run: true,
+            };
+            run_install_hook(&hook_args)?;
+        }
+        return Ok(());
+    }
+
+    // ── secrets.yaml ──────────────────────────────────────────────────────────
+    if secrets_path.exists() && !args.force {
+        println!("Secrets file already exists: {}", secrets_path.display());
+        println!("  Use --force to overwrite, or edit it directly.");
+    } else {
+        let opts = GuidedOptions {
+            preset: GuidedPreset::Balanced,
+            domains: vec![],
+            providers: vec![],
+            exclude_noise_ids: false,
+            formats: vec![],
+        };
+        let entries = build_guided_entries(&opts);
+        let yaml = serde_yaml_ng::to_string(&entries)
+            .map_err(|e| (format!("failed to serialize default patterns: {e}"), 1))?;
+        if let Some(parent) = secrets_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| (format!("failed to create {}: {e}", parent.display()), 1))?;
+        }
+        fs::write(&secrets_path, &yaml)
+            .map_err(|e| (format!("failed to write {}: {e}", secrets_path.display()), 1))?;
+        println!("Created: {}", secrets_path.display());
+        println!("  Contains the balanced built-in patterns.");
+        println!("  Edit it to add or tune patterns for your environment.");
+    }
+
+    // ── settings.yaml ─────────────────────────────────────────────────────────
+    if settings_path.exists() && !args.force {
+        println!("Settings file already exists: {}", settings_path.display());
+    } else {
+        if let Some(parent) = settings_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| (format!("failed to create {}: {e}", parent.display()), 1))?;
+        }
+        fs::write(&settings_path, SETTINGS_TEMPLATE)
+            .map_err(|e| (format!("failed to write {}: {e}", settings_path.display()), 1))?;
+        println!("Created: {}", settings_path.display());
+        println!("  Uncomment fields to set persistent flag defaults.");
+    }
+
+    if args.with_hook {
+        println!();
+        let hook_args = InstallHookArgs {
+            hook: args.hook,
+            mode: args.mode,
+            global: args.global,
+            force: args.force,
+            remove: false,
+            app: None,
+            secrets: None,
+            dry_run: false,
+        };
+        run_install_hook(&hook_args)?;
+    }
+
+    Ok(())
+}
+
+fn run_install_hook(args: &InstallHookArgs) -> Result<(), (String, i32)> {
+
+    let hook_name = args.hook.hook_name();
+
+    // ── determine target hooks directory ─────────────────────────────────────
+    let hooks_dir = if args.global {
+        find_global_hooks_dir()?
+    } else {
+        // Check for known frameworks first; they may redirect the write path.
+        let repo_root = find_git_root()?;
+        let framework_dir = detect_framework_hooks_dir(&repo_root, hook_name);
+        framework_dir.unwrap_or_else(|| find_project_hooks_dir().unwrap_or_else(|_| repo_root.join(".git").join("hooks")))
+    };
+
+    let hook_path = hooks_dir.join(hook_name);
+
+    // ── remove mode ───────────────────────────────────────────────────────────
+    if args.remove {
+        return remove_hook(&hook_path, hook_name);
+    }
+
+    // ── dry-run ───────────────────────────────────────────────────────────────
+    let script = build_hook_script(args);
+    if args.dry_run {
+        println!("# Would write to: {}", hook_path.display());
+        println!("{script}");
+        return Ok(());
+    }
+
+    // ── check for pre-existing hook ───────────────────────────────────────────
+    if hook_path.exists() && !args.force {
+        let existing = fs::read_to_string(&hook_path).unwrap_or_default();
+        if !existing.contains(HOOK_MARKER) {
+            return Err((
+                format!(
+                    "{} already exists and was not installed by sanitize.\n\
+                     Inspect it first, then use --force to overwrite.",
+                    hook_path.display()
+                ),
+                1,
+            ));
+        }
+        // Our hook — update in place (fall through to write).
+    }
+
+    // ── write the hook ────────────────────────────────────────────────────────
+    fs::create_dir_all(&hooks_dir)
+        .map_err(|e| (format!("failed to create {}: {e}", hooks_dir.display()), 1))?;
+
+    fs::write(&hook_path, &script)
+        .map_err(|e| (format!("failed to write {}: {e}", hook_path.display()), 1))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| (format!("failed to chmod {}: {e}", hook_path.display()), 1))?;
+    }
+
+    // ── success output ────────────────────────────────────────────────────────
+    let mode_label = match args.mode {
+        HookMode::Scan => "scan — blocks commit on detection (staged files not modified)",
+        HookMode::Sanitize => "sanitize — modifies staged files in place before committing",
+    };
+    println!("Installed {hook_name} hook → {}", hook_path.display());
+    println!("  Mode:     {mode_label}");
+    println!("  Patterns: {}", global_default_secrets_path().display());
+    if let Some(ref app) = args.app {
+        println!("  Apps:     {app}");
+    }
+    if let Some(ref s) = args.secrets {
+        println!("  Secrets:  {}", s.display());
+    }
+    println!();
+    println!("Skip one commit:  SANITIZE_SKIP=1 git commit ...");
+    let remove_extra = if args.global { " --global" } else { "" };
+    let hook_extra = if args.hook == HookType::PrePush {
+        " --hook pre-push"
+    } else {
+        ""
+    };
+    println!("Uninstall:        sanitize install-hook --remove{hook_extra}{remove_extra}");
 
     Ok(())
 }
@@ -6645,7 +9029,7 @@ mod tests {
     #[test]
     fn validate_args_rejects_invalid_log_format() {
         let mut cli = real_file_cli();
-        cli.log_format = "xml".into();
+        cli.log_format = Some("xml".into());
         let err = validate_args(&cli).unwrap_err();
         assert!(err.contains("invalid --log-format"), "got: {err}");
     }
@@ -6712,25 +9096,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_default_flag() {
-        let cli = Cli::try_parse_from(["sanitize", "--default", "app.log"]).unwrap();
-        assert!(cli.default);
-        assert!(cli.secrets_file.is_none());
-    }
-
-    #[test]
-    fn cli_default_conflicts_with_secrets_file() {
-        // clap enforces conflicts_with at parse time.
-        let result = Cli::try_parse_from(["sanitize", "--default", "--secrets-file", "s.yaml"]);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("cannot be used with"),
-            "expected conflict error, got: {msg}"
-        );
-    }
-
-    #[test]
     fn build_default_patterns_returns_nonempty_set() {
         let patterns = build_default_patterns();
         assert!(
@@ -6748,5 +9113,125 @@ mod tests {
             labels.contains(&"stripe_key"),
             "expected stripe_key pattern"
         );
+    }
+
+    // ── install-hook tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn hook_script_pre_commit_scan_contains_marker_and_fail_on_match() {
+        let args = InstallHookArgs {
+            hook: HookType::PreCommit,
+            mode: HookMode::Scan,
+            global: false,
+            force: false,
+            remove: false,
+            app: None,
+            secrets: None,
+            dry_run: false,
+        };
+        let script = build_hook_script(&args);
+        assert!(script.contains(HOOK_MARKER), "marker must be present");
+        assert!(script.contains("--dry-run --fail-on-match"), "scan mode must use --dry-run --fail-on-match");
+        assert!(script.contains("SANITIZE_SKIP"), "escape hatch must be present");
+        assert!(script.starts_with("#!/bin/sh"), "must start with POSIX shebang");
+    }
+
+    #[test]
+    fn hook_script_pre_commit_sanitize_uses_output_dot() {
+        let args = InstallHookArgs {
+            hook: HookType::PreCommit,
+            mode: HookMode::Sanitize,
+            global: false,
+            force: false,
+            remove: false,
+            app: None,
+            secrets: None,
+            dry_run: false,
+        };
+        let script = build_hook_script(&args);
+        assert!(script.contains("--output ."), "sanitize mode must write output in place");
+        assert!(script.contains("git add"), "sanitize mode must re-stage files");
+        assert!(!script.contains("--dry-run"), "sanitize mode must not pass --dry-run");
+    }
+
+    #[test]
+    fn hook_script_pre_push_contains_while_read_loop() {
+        let args = InstallHookArgs {
+            hook: HookType::PrePush,
+            mode: HookMode::Scan,
+            global: false,
+            force: false,
+            remove: false,
+            app: Some("gitlab".into()),
+            secrets: None,
+            dry_run: false,
+        };
+        let script = build_hook_script(&args);
+        assert!(script.contains("while IFS=' ' read -r"), "pre-push must iterate stdin");
+        assert!(script.contains("--app 'gitlab'"), "app bundle must be quoted and forwarded");
+    }
+
+    #[test]
+    fn hook_flags_shell_quotes_paths_with_spaces() {
+        let args = InstallHookArgs {
+            hook: HookType::PreCommit,
+            mode: HookMode::Scan,
+            global: false,
+            force: false,
+            remove: false,
+            app: None,
+            secrets: Some(PathBuf::from("my secrets/file.yaml")),
+            dry_run: false,
+        };
+        let flags = build_hook_flags(&args);
+        assert!(
+            flags.contains("-s 'my secrets/file.yaml'"),
+            "space in path must be single-quoted: got {flags}"
+        );
+    }
+
+    #[test]
+    fn sh_quote_escapes_embedded_single_quotes() {
+        assert_eq!(sh_quote("it's a test"), "'it'\\''s a test'");
+        assert_eq!(sh_quote("normal"), "'normal'");
+        assert_eq!(sh_quote("a b c"), "'a b c'");
+    }
+
+    #[test]
+    fn remove_hook_deletes_file_when_entirely_ours() {
+        let dir = tempdir().unwrap();
+        let hook_path = dir.path().join("pre-commit");
+        let script = hook_script_pre_commit_scan("--use-default");
+        fs::write(&hook_path, &script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        remove_hook(&hook_path, "pre-commit").expect("remove should succeed");
+        assert!(!hook_path.exists(), "file should be deleted when it is entirely our hook");
+    }
+
+    #[test]
+    fn remove_hook_strips_block_from_composite_hook() {
+        let dir = tempdir().unwrap();
+        let hook_path = dir.path().join("pre-commit");
+        let pre_existing = "#!/bin/sh\n# other team's linter\nnpm run lint\n";
+        let our_block = hook_script_pre_commit_scan("--use-default");
+        fs::write(&hook_path, format!("{pre_existing}{our_block}")).unwrap();
+        remove_hook(&hook_path, "pre-commit").expect("remove should succeed");
+        assert!(hook_path.exists(), "file should remain when other content is present");
+        let remaining = fs::read_to_string(&hook_path).unwrap();
+        assert!(remaining.contains("npm run lint"), "other hook content must be preserved");
+        assert!(!remaining.contains(HOOK_MARKER), "our marker must be gone");
+    }
+
+    #[test]
+    fn remove_hook_rejects_unrecognised_hook() {
+        let dir = tempdir().unwrap();
+        let hook_path = dir.path().join("pre-commit");
+        fs::write(&hook_path, "#!/bin/sh\necho hello\n").unwrap();
+        let result = remove_hook(&hook_path, "pre-commit");
+        assert!(result.is_err(), "should refuse to remove a hook we didn't install");
     }
 }

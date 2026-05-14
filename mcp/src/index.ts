@@ -9,6 +9,9 @@
  * Environment variables:
  *   SANITIZE_BIN                    path to the `sanitize` binary (default: "sanitize")
  *   SANITIZE_MCP_MAX_CONTENT_BYTES  per-call content size limit in bytes (default: 524288)
+ *   SANITIZE_MCP_TIMEOUT_MS         subprocess timeout in milliseconds (default: 60000)
+ *   SANITIZE_MCP_THREADS            worker thread cap for every sanitize invocation (default: unset = CLI default = logical CPUs)
+ *   SANITIZE_MCP_MAX_ARCHIVE_DEPTH  default maximum archive nesting depth (default: 2; CLI default is 3)
  *   SANITIZE_SECRETS_DIR            base directory for namespace resolution (required for `namespace` param)
  *
  * Namespace directory layout:
@@ -33,8 +36,22 @@ const MAX_CONTENT_BYTES = parseInt(
   Deno.env.get("SANITIZE_MCP_MAX_CONTENT_BYTES") ?? "524288",
   10,
 );
+// MCP default is lower than the CLI default (3) to limit zip-bomb exposure.
+const MAX_ARCHIVE_DEPTH = parseInt(
+  Deno.env.get("SANITIZE_MCP_MAX_ARCHIVE_DEPTH") ?? "2",
+  10,
+);
+// When set, appended to every processing invocation to cap CPU usage.
+const THREADS_ARGS: string[] = (() => {
+  const t = Deno.env.get("SANITIZE_MCP_THREADS");
+  return t ? ["--threads", t] : [];
+})();
 const SANITIZE_SECRETS_DIR = Deno.env.get("SANITIZE_SECRETS_DIR");
-const SERVER_VERSION = "1.0.0";
+// Keep in sync with version field in Cargo.toml.
+const SERVER_VERSION = "0.9.0";
+
+const NO_UPDATE_SECRETS_ARG = "--no-update-secrets";
+const TEMP_PREFIX = "sanitize-mcp-";
 
 // ---------------------------------------------------------------------------
 // Subprocess helpers
@@ -50,36 +67,81 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 /**
- * Spawn the sanitize binary, write `stdinData` to its stdin, and collect
- * stdout/stderr. The subprocess never receives sensitive content via argv —
+ * Spawn the sanitize binary and collect stdout/stderr.
+ * Pass `stdinData` to pipe content through stdin (the "-" input mode).
+ * Pass `null` when the CLI is reading a file directly — stdin is left closed.
+ * The subprocess never receives sensitive content via argv —
  * only via the stdin pipe or a mode-0600 temp file.
  */
+const SUBPROCESS_TIMEOUT_MS = parseInt(
+  Deno.env.get("SANITIZE_MCP_TIMEOUT_MS") ?? "60000",
+  10,
+);
+
+/**
+ * Build a minimal environment for the sanitize subprocess.
+ * We pass only what the binary needs — system paths, locale, temp dirs, and
+ * SANITIZE_* vars — rather than spreading the full parent environment, which
+ * could contain secrets like AWS_SECRET_ACCESS_KEY or DATABASE_URL.
+ */
+function buildSubprocessEnv(extraEnv: Record<string, string>): Record<string, string> {
+  const parent = Deno.env.toObject();
+  const allowed: Record<string, string> = {};
+  // Runtime essentials
+  for (const k of ["PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TEMP", "TMP",
+                    "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SystemRoot", "USERPROFILE"]) {
+    if (parent[k] !== undefined) allowed[k] = parent[k];
+  }
+  // Forward all SANITIZE_* vars so callers can configure via environment
+  for (const [k, v] of Object.entries(parent)) {
+    if (k.startsWith("SANITIZE_")) allowed[k] = v;
+  }
+  return { ...allowed, SANITIZE_LOG: "error", ...extraEnv };
+}
+
 async function runSanitize(
   args: string[],
-  stdinData: string,
+  stdinData: string | null,
   extraEnv: Record<string, string> = {},
 ): Promise<RunResult> {
   const cmd = new Deno.Command(SANITIZE_BIN, {
     args,
-    stdin: "piped",
+    stdin: stdinData !== null ? "piped" : "null",
     stdout: "piped",
     stderr: "piped",
-    env: { ...Deno.env.toObject(), SANITIZE_LOG: "error", ...extraEnv },
+    env: buildSubprocessEnv(extraEnv),
   });
 
   const child = cmd.spawn();
 
-  const writer = child.stdin.getWriter();
-  await writer.write(encoder.encode(stdinData));
-  await writer.close();
+  if (stdinData !== null) {
+    const writer = child.stdin.getWriter();
+    try {
+      await writer.write(encoder.encode(stdinData));
+    } finally {
+      await writer.close();
+    }
+  }
 
-  const { stdout, stderr, code } = await child.output();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { child.kill("SIGKILL"); } catch { /* already exited */ }
+  }, SUBPROCESS_TIMEOUT_MS);
 
-  return {
-    stdout: decoder.decode(stdout),
-    stderr: decoder.decode(stderr),
-    exitCode: code,
-  };
+  try {
+    const { stdout, stderr, code } = await child.output();
+    if (timedOut) {
+      throw new Error(`sanitize subprocess timed out after ${SUBPROCESS_TIMEOUT_MS / 1000}s`);
+    }
+    return {
+      stdout: decoder.decode(stdout),
+      stderr: decoder.decode(stderr),
+      exitCode: code,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Write `data` to a temp file with mode 0o600 inside `dir`. */
@@ -101,16 +163,16 @@ async function writeTempFile(
 }
 
 /**
- * Reject paths that could traverse outside the intended directory.
- * Blocks absolute paths and any ".." segment.
- *
- * Relative paths (including those starting with "./") are permitted because
- * the MCP server runs with the invoking user's own filesystem permissions —
- * there is no privilege boundary to cross. The Rust CLI enforces its own
- * file-existence and format checks on whatever path is passed.
+ * Reject path traversal segments in any path parameter.
+ * When `allowAbsolute` is false (default) also rejects absolute paths —
+ * used for ancillary params like `secrets_file` and `profile` which must stay
+ * relative so they cannot reference system files outside the project.
+ * When `allowAbsolute` is true, absolute paths are permitted — used for the
+ * `files` param where the caller may legitimately target system config files.
+ * The Rust CLI enforces its own existence and format checks on the final path.
  */
-function validateUserPath(p: string, paramName: string): void {
-  if (p.startsWith("/") || p.startsWith("\\")) {
+function validatePath(p: string, paramName: string, allowAbsolute = false): void {
+  if (!allowAbsolute && (p.startsWith("/") || p.startsWith("\\"))) {
     throw new Error(`${paramName} must be a relative path, not an absolute path`);
   }
   const segments = p.replace(/\\/g, "/").split("/");
@@ -128,6 +190,52 @@ function checkContentSize(content: string, label = "content"): void {
         `Increase SANITIZE_MCP_MAX_CONTENT_BYTES to allow larger inputs.`,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Output name prediction + archive detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Replicates the CLI's default_plain_output naming: `{stem}-sanitized.{ext}`.
+ * Rust's Path::file_stem strips only the last extension, so "archive.tar.gz"
+ * → stem "archive.tar", ext "gz" → "archive.tar-sanitized.gz".
+ */
+function predictOutputName(inputPath: string): string {
+  const basename = inputPath.replace(/\\/g, "/").split("/").pop() ?? "output";
+  const dot = basename.lastIndexOf(".");
+  if (dot <= 0) return `${basename}-sanitized`;
+  return `${basename.slice(0, dot)}-sanitized.${basename.slice(dot + 1)}`;
+}
+
+/** Appends _2, _3 … suffixes until the name is unique, mirroring the CLI. */
+function uniquifyName(name: string, used: Set<string>): string {
+  if (!used.has(name)) { used.add(name); return name; }
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  for (let i = 2; ; i++) {
+    const candidate = `${stem}_${i}${ext}`;
+    if (!used.has(candidate)) { used.add(candidate); return candidate; }
+  }
+}
+
+/** Returns true for file extensions the CLI treats as archives. */
+function isArchivePath(p: string): boolean {
+  const lower = p.toLowerCase();
+  return (
+    lower.endsWith(".zip") ||
+    lower.endsWith(".tar") ||
+    lower.endsWith(".tar.gz") ||
+    lower.endsWith(".tgz") ||
+    lower.endsWith(".tar.bz2") ||
+    lower.endsWith(".tar.xz") ||
+    lower.endsWith(".tar.zst") ||
+    lower.endsWith(".gz") ||
+    lower.endsWith(".bz2") ||
+    lower.endsWith(".xz") ||
+    lower.endsWith(".zst")
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -248,18 +356,21 @@ async function resolveNamespace(namespace: string): Promise<ResolvedNamespace> {
 interface InlinePattern {
   name: string;
   pattern: string;
-  category: string;
+  category?: string; // required for regex/literal; ignored (and optional) for allow
   kind?: string;
 }
 
 function buildSecretsJson(patterns: InlinePattern[]): string {
   return JSON.stringify(
-    patterns.map((p) => ({
-      pattern: p.pattern,
-      kind: p.kind ?? "regex",
-      category: p.category,
-      label: p.name,
-    })),
+    patterns.map((p) => {
+      const kind = p.kind ?? "literal";
+      if (kind !== "allow" && !p.category) {
+        throw new Error(`pattern "${p.name}" requires a category when kind is "${kind}"`);
+      }
+      const entry: Record<string, string> = { pattern: p.pattern, kind, label: p.name };
+      if (p.category) entry.category = p.category;
+      return entry;
+    }),
     null,
     2,
   );
@@ -269,13 +380,30 @@ function buildSecretsJson(patterns: InlinePattern[]): string {
 // Tool implementations
 // ---------------------------------------------------------------------------
 
+interface FileResult {
+  input: string;     // original path as passed in `files`
+  file: string;      // sanitized output filename (CLI naming: {stem}-sanitized.{ext})
+  content?: string;  // present for text/structured outputs
+  binary?: boolean;  // true when output is a binary archive — content not returned inline
+  size?: number;     // byte size when binary is true
+}
+
 interface SanitizeResult {
-  content: string;
+  content?: string;       // populated for content-mode (inline text input)
+  results?: FileResult[]; // populated for files-mode (one or more file paths)
   report?: unknown;
 }
 
+interface ArchiveFilter {
+  path: string;
+  only?: string[];
+  exclude?: string[];
+}
+
 async function toolSanitize(params: {
-  content: string;
+  content?: string;
+  files?: string[];
+  archive_filters?: ArchiveFilter[];
   namespace?: string;
   seed?: string;
   patterns?: InlinePattern[];
@@ -285,220 +413,405 @@ async function toolSanitize(params: {
   use_default?: boolean;
   app?: string[];
   allow?: string[];
+  llm_template?: string;
+  force_text?: boolean;
+  include_binary?: boolean;
+  hidden?: boolean;
+  ignore_path?: string[];
+  max_archive_depth?: number;
+  entropy_threshold?: number;
   extract_context?: boolean;
   context_lines?: number;
   context_keywords?: string[];
+  context_keywords_replace?: boolean;
   max_context_matches?: number;
   context_case_sensitive?: boolean;
+  report?: boolean;
+  strict?: boolean;
 }): Promise<SanitizeResult> {
-  checkContentSize(params.content);
-  if (params.secrets_file) validateUserPath(params.secrets_file, "secrets_file");
-  if (params.profile) validateUserPath(params.profile, "profile");
-  if (params.use_default && (params.secrets_file || params.namespace || (params.patterns && params.patterns.length > 0))) {
-    throw new Error("use_default cannot be combined with secrets_file, namespace, or patterns — each supplies its own pattern set");
+  const hasContent = params.content !== undefined;
+  const hasFiles = params.files !== undefined && params.files.length > 0;
+
+  if (!hasContent && !hasFiles) {
+    throw new Error("Either 'content' or 'files' must be provided");
+  }
+  if (hasContent && hasFiles) {
+    throw new Error("'content' and 'files' are mutually exclusive — provide one or the other");
+  }
+  if (hasFiles) {
+    for (const f of params.files!) {
+      validatePath(f, "files", true);
+    }
+  } else {
+    checkContentSize(params.content!);
+  }
+  if (params.secrets_file) validatePath(params.secrets_file, "secrets_file");
+  if (params.profile) validatePath(params.profile, "profile");
+  if (
+    params.use_default &&
+    (params.secrets_file || params.namespace || (params.patterns && params.patterns.length > 0))
+  ) {
+    throw new Error(
+      "use_default cannot be combined with secrets_file, namespace, or patterns — each supplies its own pattern set",
+    );
   }
 
-  const tmpDir = await Deno.makeTempDir({ prefix: "sanitize-mcp-" });
+  const tmpDir = await Deno.makeTempDir({ prefix: TEMP_PREFIX });
   try {
-    const outputPath = join(tmpDir, "output.txt");
-    const args: string[] = ["-", "--output", outputPath];
     const env: Record<string, string> = {};
+    // --no-update-secrets: suppress writing sanitize-discovered.yaml to cwd.
+    const commonArgs: string[] = [NO_UPDATE_SECRETS_ARG];
 
-    if (params.format) {
-      args.push("--format", params.format);
-    }
+    if (params.format) commonArgs.push("--format", params.format);
 
     // Namespace resolution takes priority over secrets_file and patterns.
     if (params.namespace) {
       const ns = await resolveNamespace(params.namespace);
-      args.push("-s", ns.secretsFile);
+      commonArgs.push("-s", ns.secretsFile);
       if (ns.encrypted) {
-        args.push("--encrypted-secrets");
+        commonArgs.push("--encrypted-secrets");
         env.SANITIZE_PASSWORD = ns.password!;
       }
       // Explicit profile param overrides namespace profile.
       const profileToUse = params.profile ?? ns.profileFile;
-      if (profileToUse) {
-        args.push("--profile", profileToUse);
-      }
+      if (profileToUse) commonArgs.push("--profile", profileToUse);
     } else {
-      // Seed/deterministic only applies outside namespace mode (namespace
-      // derives its own key from the per-namespace password).
+      // Seed/deterministic only applies outside namespace mode.
       if (params.seed) {
         env.SANITIZE_PASSWORD = params.seed;
-        args.push("--deterministic");
+        commonArgs.push("--deterministic");
       }
-
-      if (params.profile) {
-        args.push("--profile", params.profile);
-      }
-
-      // secrets_file takes priority over inline patterns.
+      if (params.profile) commonArgs.push("--profile", params.profile);
       if (params.secrets_file) {
-        args.push("-s", params.secrets_file);
+        commonArgs.push("-s", params.secrets_file);
       } else if (params.patterns && params.patterns.length > 0) {
         const secretsPath = await writeTempFile(
           tmpDir,
           "secrets.json",
           buildSecretsJson(params.patterns),
         );
-        args.push("-s", secretsPath);
+        commonArgs.push("-s", secretsPath);
       }
     }
 
-    if (params.use_default) {
-      args.push("--default");
+    if (params.use_default) commonArgs.push("--use-default");
+    if (params.app?.length) commonArgs.push("--app", params.app.join(","));
+    if (params.allow?.length) {
+      for (const pattern of params.allow) commonArgs.push("--allow", pattern);
     }
-    if (params.app && params.app.length > 0) {
-      args.push("--app", params.app.join(","));
+    if (params.force_text) commonArgs.push("--force-text");
+    if (params.include_binary) commonArgs.push("--include-binary");
+    if (params.hidden) commonArgs.push("--hidden");
+    if (params.ignore_path?.length) {
+      for (const pattern of params.ignore_path) commonArgs.push("--ignore-path", pattern);
     }
-    if (params.allow && params.allow.length > 0) {
-      for (const pattern of params.allow) {
-        args.push("--allow", pattern);
-      }
+    if (params.entropy_threshold !== undefined) {
+      commonArgs.push("--entropy-threshold", String(params.entropy_threshold));
     }
+    if (params.llm_template) commonArgs.push("--llm", params.llm_template);
+    if (params.strict) commonArgs.push("--strict");
+    commonArgs.push("--max-archive-depth", String(params.max_archive_depth ?? MAX_ARCHIVE_DEPTH));
+    commonArgs.push(...THREADS_ARGS);
 
+    // A report is generated whenever report:true or extract_context:true.
     let reportPath: string | undefined;
+    if (params.report || params.extract_context) {
+      const rp = join(tmpDir, "report.json");
+      reportPath = rp;
+      commonArgs.push("--report", rp);
+    }
     if (params.extract_context) {
-      reportPath = join(tmpDir, "report.json");
-      args.push("--extract-context", "--report", reportPath);
+      commonArgs.push("--extract-context");
       if (params.context_lines !== undefined) {
-        args.push("--context-lines", String(params.context_lines));
+        commonArgs.push("--context-lines", String(params.context_lines));
       }
-      if (params.context_keywords && params.context_keywords.length > 0) {
-        args.push("--context-keywords", params.context_keywords.join(","));
+      if (params.context_keywords?.length) {
+        commonArgs.push("--context-keywords", params.context_keywords.join(","));
+        if (params.context_keywords_replace) commonArgs.push("--context-keywords-replace");
       }
       if (params.max_context_matches !== undefined) {
-        args.push("--max-context-matches", String(params.max_context_matches));
+        commonArgs.push("--max-context-matches", String(params.max_context_matches));
       }
-      if (params.context_case_sensitive) {
-        args.push("--context-case-sensitive");
-      }
+      if (params.context_case_sensitive) commonArgs.push("--context-case-sensitive");
     }
 
-    const result = await runSanitize(args, params.content, env);
+    // -----------------------------------------------------------------------
+    // Content mode — inline text via stdin
+    // -----------------------------------------------------------------------
+    if (hasContent) {
+      let content: string;
+      if (params.llm_template) {
+        // --llm writes the formatted prompt to stdout instead of the output file.
+        const result = await runSanitize(["-", ...commonArgs], params.content!, env);
+        if (result.exitCode !== 0) {
+          throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+        }
+        content = result.stdout;
+      } else {
+        const outputPath = join(tmpDir, "output.txt");
+        const result = await runSanitize(["-", "--output", outputPath, ...commonArgs], params.content!, env);
+        if (result.exitCode !== 0) {
+          throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+        }
+        content = await Deno.readTextFile(outputPath);
+      }
+      if (reportPath) {
+        return { content, report: JSON.parse(await Deno.readTextFile(reportPath)) };
+      }
+      return { content };
+    }
+
+    // -----------------------------------------------------------------------
+    // Files mode — one or more paths (files, archives)
+    // -----------------------------------------------------------------------
+    const outputDir = join(tmpDir, "out");
+    await Deno.mkdir(outputDir);
+
+    // Build a filter lookup keyed on the path string as given.
+    const filterMap = new Map<string, ArchiveFilter>();
+    for (const f of params.archive_filters ?? []) {
+      filterMap.set(f.path, f);
+    }
+
+    // Interleave --only / --exclude immediately after each archive path, matching
+    // the CLI's pre-parser expectation: `archive.zip --only *.log --exclude *.tmp`.
+    const inputArgs: string[] = [];
+    for (const filePath of params.files!) {
+      inputArgs.push(filePath);
+      const filter = filterMap.get(filePath);
+      if (filter?.only?.length) inputArgs.push("--only", ...filter.only);
+      if (filter?.exclude?.length) inputArgs.push("--exclude", ...filter.exclude);
+    }
+
+    const result = await runSanitize([...inputArgs, "--output", outputDir, ...commonArgs], null, env);
 
     if (result.exitCode !== 0) {
-      throw new Error(
-        `sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`,
-      );
+      throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
     }
 
-    const content = await Deno.readTextFile(outputPath);
+    // When --llm is active, the formatted prompt is on stdout — return it directly.
+    if (params.llm_template) {
+      if (reportPath) {
+        return { content: result.stdout, report: JSON.parse(await Deno.readTextFile(reportPath)) };
+      }
+      return { content: result.stdout };
+    }
+
+    // Build input→output name mapping using the same logic as the CLI so each
+    // result carries the original input path. Process in input order.
+    const usedNames = new Set<string>();
+    const inputToOutput: [string, string][] = params.files!.map((f) => [
+      f,
+      uniquifyName(predictOutputName(f), usedNames),
+    ]);
+
+    const fileResults: FileResult[] = [];
+    for (const [inputPath, outputName] of inputToOutput) {
+      const outPath = join(outputDir, outputName);
+      if (isArchivePath(inputPath)) {
+        // Archives are returned as binary indicators — an LLM can't use a raw
+        // archive blob. Caller can re-process individual entries via files[].
+        const stat = await Deno.stat(outPath);
+        fileResults.push({ input: inputPath, file: outputName, binary: true, size: stat.size });
+      } else {
+        fileResults.push({ input: inputPath, file: outputName, content: await Deno.readTextFile(outPath) });
+      }
+    }
 
     if (reportPath) {
-      const reportJson = await Deno.readTextFile(reportPath);
-      return { content, report: JSON.parse(reportJson) };
+      return { results: fileResults, report: JSON.parse(await Deno.readTextFile(reportPath)) };
     }
-
-    return { content };
+    return { results: fileResults };
   } finally {
     await Deno.remove(tmpDir, { recursive: true });
   }
 }
 
 async function toolScan(params: {
-  content: string;
+  content?: string;
+  files?: string[];
+  archive_filters?: ArchiveFilter[];
   namespace?: string;
   patterns?: InlinePattern[];
   secrets_file?: string;
+  profile?: string;
   format?: string;
   use_default?: boolean;
   app?: string[];
   allow?: string[];
+  fail_on_match?: boolean;
+  force_text?: boolean;
+  include_binary?: boolean;
+  hidden?: boolean;
+  ignore_path?: string[];
+  max_archive_depth?: number;
+  entropy_threshold?: number;
+  strict?: boolean;
 }): Promise<unknown> {
-  checkContentSize(params.content);
-  if (params.secrets_file) validateUserPath(params.secrets_file, "secrets_file");
-  if (params.use_default && (params.secrets_file || params.namespace || (params.patterns && params.patterns.length > 0))) {
-    throw new Error("use_default cannot be combined with secrets_file, namespace, or patterns — each supplies its own pattern set");
+  const hasContent = params.content !== undefined;
+  const hasFiles = params.files !== undefined && params.files.length > 0;
+
+  if (!hasContent && !hasFiles) {
+    throw new Error("Either 'content' or 'files' must be provided");
+  }
+  if (hasContent && hasFiles) {
+    throw new Error("'content' and 'files' are mutually exclusive — provide one or the other");
+  }
+  if (hasFiles) {
+    for (const f of params.files!) validatePath(f, "files", true);
+  } else {
+    checkContentSize(params.content!);
+  }
+  if (params.secrets_file) validatePath(params.secrets_file, "secrets_file");
+  if (params.profile) validatePath(params.profile, "profile");
+  if (
+    params.use_default &&
+    (params.secrets_file || params.namespace || (params.patterns && params.patterns.length > 0))
+  ) {
+    throw new Error(
+      "use_default cannot be combined with secrets_file, namespace, or patterns — each supplies its own pattern set",
+    );
   }
 
-  const tmpDir = await Deno.makeTempDir({ prefix: "sanitize-mcp-" });
+  const tmpDir = await Deno.makeTempDir({ prefix: TEMP_PREFIX });
   try {
     const reportPath = join(tmpDir, "report.json");
-    const outputPath = join(tmpDir, "output.txt");
-    const args: string[] = ["-", "--dry-run", "--report", reportPath, "--output", outputPath];
-    const env: Record<string, string> = {};
 
-    if (params.format) {
-      args.push("--format", params.format);
-    }
+    const env: Record<string, string> = {};
+    const commonArgs: string[] = ["--dry-run", "--report", reportPath, NO_UPDATE_SECRETS_ARG];
+
+    if (params.format) commonArgs.push("--format", params.format);
 
     if (params.namespace) {
       const ns = await resolveNamespace(params.namespace);
-      args.push("-s", ns.secretsFile);
+      commonArgs.push("-s", ns.secretsFile);
       if (ns.encrypted) {
-        args.push("--encrypted-secrets");
+        commonArgs.push("--encrypted-secrets");
         env.SANITIZE_PASSWORD = ns.password!;
       }
-    } else if (params.secrets_file) {
-      args.push("-s", params.secrets_file);
-    } else if (params.patterns && params.patterns.length > 0) {
-      const secretsPath = await writeTempFile(
-        tmpDir,
-        "secrets.json",
-        buildSecretsJson(params.patterns),
-      );
-      args.push("-s", secretsPath);
-    }
-
-    if (params.use_default) {
-      args.push("--default");
-    }
-    if (params.app && params.app.length > 0) {
-      args.push("--app", params.app.join(","));
-    }
-    if (params.allow && params.allow.length > 0) {
-      for (const pattern of params.allow) {
-        args.push("--allow", pattern);
+      // Explicit profile param overrides namespace profile.
+      const profileToUse = params.profile ?? ns.profileFile;
+      if (profileToUse) commonArgs.push("--profile", profileToUse);
+    } else {
+      if (params.profile) commonArgs.push("--profile", params.profile);
+      if (params.secrets_file) {
+        commonArgs.push("-s", params.secrets_file);
+      } else if (params.patterns && params.patterns.length > 0) {
+        const secretsPath = await writeTempFile(tmpDir, "secrets.json", buildSecretsJson(params.patterns));
+        commonArgs.push("-s", secretsPath);
       }
     }
 
-    const result = await runSanitize(args, params.content, env);
+    if (params.use_default) commonArgs.push("--use-default");
+    if (params.app?.length) commonArgs.push("--app", params.app.join(","));
+    if (params.allow?.length) {
+      for (const pattern of params.allow) commonArgs.push("--allow", pattern);
+    }
+    if (params.fail_on_match) commonArgs.push("--fail-on-match");
+    if (params.force_text) commonArgs.push("--force-text");
+    if (params.include_binary) commonArgs.push("--include-binary");
+    if (params.hidden) commonArgs.push("--hidden");
+    if (params.ignore_path?.length) {
+      for (const pattern of params.ignore_path) commonArgs.push("--ignore-path", pattern);
+    }
+    if (params.entropy_threshold !== undefined) {
+      commonArgs.push("--entropy-threshold", String(params.entropy_threshold));
+    }
+    if (params.strict) commonArgs.push("--strict");
+    commonArgs.push("--max-archive-depth", String(params.max_archive_depth ?? MAX_ARCHIVE_DEPTH));
+    commonArgs.push(...THREADS_ARGS);
 
-    if (result.exitCode !== 0) {
-      throw new Error(
-        `sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`,
-      );
+    let inputArgs: string[];
+    let stdinData: string | null;
+
+    if (hasContent) {
+      inputArgs = ["-"];
+      stdinData = params.content!;
+    } else {
+      stdinData = null;
+      const filterMap = new Map<string, ArchiveFilter>();
+      for (const f of params.archive_filters ?? []) filterMap.set(f.path, f);
+
+      inputArgs = [];
+      for (const filePath of params.files!) {
+        inputArgs.push(filePath);
+        const filter = filterMap.get(filePath);
+        if (filter?.only?.length) inputArgs.push("--only", ...filter.only);
+        if (filter?.exclude?.length) inputArgs.push("--exclude", ...filter.exclude);
+      }
     }
 
-    const reportJson = await Deno.readTextFile(reportPath);
-    return JSON.parse(reportJson);
+    const result = await runSanitize([...inputArgs, ...commonArgs], stdinData, env);
+
+    // Exit code 2 means matches found when --fail-on-match is active — not an error.
+    if (result.exitCode === 2 && params.fail_on_match) {
+      return { secrets_detected: true, report: JSON.parse(await Deno.readTextFile(reportPath)) };
+    }
+    if (result.exitCode !== 0) {
+      throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+    }
+
+    const report = JSON.parse(await Deno.readTextFile(reportPath));
+    return params.fail_on_match ? { secrets_detected: false, report } : report;
   } finally {
     await Deno.remove(tmpDir, { recursive: true });
   }
 }
 
 async function toolStripConfigValues(params: {
-  content: string;
+  content?: string;
+  files?: string[];
   delimiter?: string;
   comment_prefix?: string;
-}): Promise<string> {
-  checkContentSize(params.content);
+}): Promise<string | FileResult[]> {
+  const hasContent = params.content !== undefined;
+  const hasFiles = params.files !== undefined && params.files.length > 0;
 
-  const tmpDir = await Deno.makeTempDir({ prefix: "sanitize-mcp-" });
+  if (!hasContent && !hasFiles) {
+    throw new Error("Either 'content' or 'files' must be provided");
+  }
+  if (hasContent && hasFiles) {
+    throw new Error("'content' and 'files' are mutually exclusive — provide one or the other");
+  }
+  if (hasFiles) {
+    for (const f of params.files!) validatePath(f, "files", true);
+  } else {
+    checkContentSize(params.content!);
+  }
+
+  const tmpDir = await Deno.makeTempDir({ prefix: TEMP_PREFIX });
   try {
-    const outputPath = join(tmpDir, "output.txt");
-    const args = [
-      "-",
+    const stripArgs = [
       "--strip-values",
       "--strip-delimiter",
       params.delimiter ?? "=",
       "--strip-comment-prefix",
       params.comment_prefix ?? "#",
-      "--output",
-      outputPath,
     ];
 
-    const result = await runSanitize(args, params.content);
-
-    if (result.exitCode !== 0) {
-      throw new Error(
-        `sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`,
-      );
+    if (hasContent) {
+      const outputPath = join(tmpDir, "output.txt");
+      const result = await runSanitize(["-", "--output", outputPath, ...stripArgs], params.content!);
+      if (result.exitCode !== 0) {
+        throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+      }
+      return await Deno.readTextFile(outputPath);
     }
 
-    return await Deno.readTextFile(outputPath);
+    const outputDir = join(tmpDir, "out");
+    await Deno.mkdir(outputDir);
+    const result = await runSanitize([...params.files!, "--output", outputDir, ...stripArgs], null);
+    if (result.exitCode !== 0) {
+      throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+    }
+
+    const usedNames = new Set<string>();
+    const fileResults: FileResult[] = [];
+    for (const inputPath of params.files!) {
+      const outputName = uniquifyName(predictOutputName(inputPath), usedNames);
+      fileResults.push({ input: inputPath, file: outputName, content: await Deno.readTextFile(join(outputDir, outputName)) });
+    }
+    return fileResults;
   } finally {
     await Deno.remove(tmpDir, { recursive: true });
   }
@@ -521,7 +834,7 @@ async function toolTestAllowlist(params: {
   }
   args.push(...params.values);
 
-  const result = await runSanitize(args, "");
+  const result = await runSanitize(args, null);
 
   if (result.exitCode !== 0) {
     throw new Error(
@@ -532,41 +845,128 @@ async function toolTestAllowlist(params: {
   return JSON.parse(result.stdout);
 }
 
-function toolListProcessors(): unknown {
-  return {
-    processors: [
-      { name: "json",      format_flag: "json",      description: "JSON — field-level replacement using key paths" },
-      { name: "yaml",      format_flag: "yaml",      description: "YAML — field-level replacement using key paths" },
-      { name: "toml",      format_flag: "toml",      description: "TOML — field-level replacement using key paths" },
-      { name: "xml",       format_flag: "xml",       description: "XML — element and attribute replacement" },
-      { name: "csv",       format_flag: "csv",       description: "CSV — column-level replacement by header name" },
-      { name: "jsonl",     format_flag: "jsonl",     description: "NDJSON / JSON Lines — one JSON object per line" },
-      { name: "key_value", format_flag: "key-value", description: "Key-value pairs (nginx, Apache, .conf files)" },
-      { name: "env",       format_flag: "env",       description: ".env files — KEY=VALUE format" },
-      { name: "ini",       format_flag: "ini",       description: "INI files with [sections]" },
-      { name: "log",       format_flag: "log",       description: "Log files — streaming scanner only, no structure" },
-      { name: "text",      format_flag: "text",      description: "Plain text — streaming scanner only, no structure" },
-    ],
-    note: "Pass format_flag as the `format` parameter to force a specific processor when content type cannot be inferred. Processor names are also used in the `processor` field of profile YAML/JSON files.",
-  };
+async function toolListApps(): Promise<string> {
+  const result = await runSanitize(["apps"], null);
+  if (result.exitCode !== 0) {
+    throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+  }
+  return result.stdout;
 }
 
-function toolListTemplates(): unknown {
-  return {
-    templates: [
-      {
-        name: "troubleshoot",
-        description:
-          "Incident triage — analyzes sanitized logs to identify root cause, event sequence, and remediation steps.",
-      },
-      {
-        name: "review-config",
-        description:
-          "Configuration review — identifies misconfigurations, security concerns, and best practice violations.",
-      },
-    ],
-    note: "Pass a filesystem path instead of a name to use a custom template file.",
-  };
+interface BuildSecretsEntry {
+  label: string;
+  pattern: string;
+  kind?: "regex" | "literal" | "entropy";
+  category?: string;
+}
+
+async function toolBuildSecrets(params: {
+  output_path: string;
+  entries?: BuildSecretsEntry[];
+  preset?: string;
+  overwrite?: boolean;
+}): Promise<string> {
+  validatePath(params.output_path, "output_path", true);
+
+  if (!params.overwrite && await fileExists(params.output_path)) {
+    throw new Error(
+      `File already exists: ${params.output_path}. Pass overwrite: true to replace it.`,
+    );
+  }
+
+  let content: string;
+
+  if (params.preset) {
+    const args = ["template", "--preset", params.preset, "--output", params.output_path, "--overwrite"];
+    const result = await runSanitize(args, null);
+    if (result.exitCode !== 0) {
+      throw new Error(`sanitize template failed: ${result.stderr.trim()}`);
+    }
+    content = await Deno.readTextFile(params.output_path);
+  } else {
+    content =
+      "# sanitize secrets file\n" +
+      "# Generated by build_secrets. Edit patterns as needed.\n" +
+      "# Run: sanitize <input> -s " +
+      params.output_path +
+      " -o <output>\n\nsecrets:\n";
+  }
+
+  if (params.entries && params.entries.length > 0) {
+    content += "\n  # Custom entries\n";
+    for (const e of params.entries) {
+      const kind = e.kind ?? "literal";
+      const patEscaped = e.pattern.replace(/'/g, "''");
+      content += `  - label: ${e.label}\n`;
+      content += `    kind: ${kind}\n`;
+      content += `    pattern: '${patEscaped}'\n`;
+      if (e.category) content += `    category: ${e.category}\n`;
+      content += "\n";
+    }
+  }
+
+  await Deno.writeTextFile(params.output_path, content);
+  return content;
+}
+
+async function toolTestPattern(params: {
+  values: string[];
+  secrets_file?: string;
+  app?: string[];
+  patterns?: InlinePattern[];
+  namespace?: string;
+}): Promise<unknown> {
+  if (params.values.length === 0) {
+    throw new Error("at least one value is required");
+  }
+  if (params.secrets_file) validatePath(params.secrets_file, "secrets_file");
+  if (
+    params.namespace &&
+    (params.secrets_file || (params.patterns && params.patterns.length > 0))
+  ) {
+    throw new Error("namespace cannot be combined with secrets_file or patterns");
+  }
+
+  const tmpDir = await Deno.makeTempDir({ prefix: TEMP_PREFIX });
+  try {
+    const env: Record<string, string> = {};
+    const args: string[] = ["test-pattern", "--json"];
+
+    if (params.namespace) {
+      const ns = await resolveNamespace(params.namespace);
+      args.push("-s", ns.secretsFile);
+      if (ns.encrypted) {
+        args.push("--encrypted-secrets");
+        env.SANITIZE_PASSWORD = ns.password!;
+      }
+    } else {
+      if (params.secrets_file) {
+        args.push("-s", params.secrets_file);
+      } else if (params.patterns && params.patterns.length > 0) {
+        const secretsPath = await writeTempFile(
+          tmpDir,
+          "secrets.json",
+          buildSecretsJson(params.patterns),
+        );
+        args.push("-s", secretsPath);
+      }
+    }
+
+    if (params.app?.length) args.push("--app", params.app.join(","));
+    args.push(...params.values);
+
+    const result = await runSanitize(args, null, env);
+    // Exit code 1 with "some values did not match" is informational — the JSON is still valid.
+    const isPartialMatch =
+      result.exitCode === 1 &&
+      result.stderr.includes("some values did not match any pattern");
+    if (result.exitCode !== 0 && !isPartialMatch) {
+      throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+    }
+    return JSON.parse(result.stdout);
+  } finally {
+    await Deno.remove(tmpDir, { recursive: true });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -578,20 +978,21 @@ const InlinePatternSchema = z.object({
   pattern: z.string().describe('Regular expression (or literal string when kind is "literal"). For kind "allow", supports exact strings and * glob wildcards.'),
   category: z
     .string()
+    .optional()
     .describe(
-      'Replacement category: "email", "ipv4", "ipv6", "hostname", "name", "uuid", "hash", "path", "url", "generic". Ignored for kind "allow".',
+      'Replacement category. Required when kind is "regex" or "literal"; ignored (and may be omitted) when kind is "allow". Built-in: "email", "name", "phone", "ipv4", "ipv6", "hostname", "mac_address", "uuid", "jwt", "auth_token", "credit_card", "ssn", "container_id", "file_path", "windows_sid", "url", "aws_arn", "azure_resource_id". Use "custom:<tag>" for anything else.',
     ),
   kind: z
     .enum(["regex", "literal", "allow"])
     .optional()
-    .describe('Match kind: "regex" (default), "literal" for exact string matching, or "allow" to pass the value through unchanged (not replaced, not recorded in the mapping store).'),
+    .describe('Match kind: "literal" (default) for exact string matching, "regex" for regular expression matching, or "allow" to pass the value through unchanged (not replaced, not recorded in the mapping store).'),
 });
 
 const FormatSchema = z
-  .enum(["text", "json", "yaml", "xml", "csv", "key-value", "toml", "env", "ini", "jsonl", "log"])
+  .enum(["text", "json", "jsonl", "ndjson", "yaml", "yml", "xml", "csv", "tsv", "key-value", "toml", "env", "ini", "log"])
   .optional()
   .describe(
-    "Force input format, overriding file-extension detection. Required when the content type cannot be inferred from a filename. Use list_processors for descriptions of each format.",
+    "Force input format, overriding file-extension detection. Required when the content type cannot be inferred from a filename. When used with `files`, applies to every file in the list — only set this when all inputs are the same format. Aliases: `yml` = `yaml`, `ndjson` = `jsonl`, `tsv` = `csv` with tab delimiter. Supported formats: json, yaml, toml, xml, csv, jsonl, key-value, env, ini, log, text.",
   );
 
 const NamespaceSchema = z
@@ -601,8 +1002,28 @@ const NamespaceSchema = z
     "Customer or tenant namespace. Resolves secrets, profile, and password from $SANITIZE_SECRETS_DIR/{namespace}/. Takes priority over secrets_file and patterns. Must be alphanumeric with hyphens/underscores only.",
   );
 
+const ArchiveFilterSchema = z.object({
+  path: z.string().describe(
+    "Path to the archive file this filter applies to. Must match exactly how the path appears in `files`.",
+  ),
+  only: z.array(z.string()).optional().describe(
+    "Glob patterns for archive entries to include. Only entries matching at least one pattern are processed. Directory prefixes end with '/' (e.g. 'logs/'). Equivalent to the CLI --only flag.",
+  ),
+  exclude: z.array(z.string()).optional().describe(
+    "Glob patterns for archive entries to exclude. Matched entries are skipped entirely. Equivalent to the CLI --exclude flag.",
+  ),
+});
+
 const SanitizeSchema = {
-  content: z.string().describe("The text content to sanitize"),
+  content: z.string().optional().describe(
+    "Inline text content to sanitize. Mutually exclusive with `files`. Either this or `files` must be provided.",
+  ),
+  files: z.array(z.string()).optional().describe(
+    "One or more paths to sanitize (absolute or relative). Accepts plain files, archives (.zip, .tar.gz, etc.), or a mix. Archives are extracted and sanitized recursively. Use `archive_filters` to restrict which entries inside an archive are processed. Mutually exclusive with `content`. Raw file content never enters the LLM context — the sanitize engine processes files directly.",
+  ),
+  archive_filters: z.array(ArchiveFilterSchema).optional().describe(
+    "Per-archive entry filters. Each entry pairs an archive path (must match exactly what appears in `files`) with --only and/or --exclude glob patterns. Non-archive paths in `files` are unaffected.",
+  ),
   namespace: NamespaceSchema,
   seed: z
     .string()
@@ -659,7 +1080,13 @@ const SanitizeSchema = {
     .array(z.string())
     .optional()
     .describe(
-      "Additional keywords to flag (merged with built-in defaults: error, failure, warning, warn, fatal, exception, critical). Only used when extract_context is true.",
+      "Additional keywords to flag. Merged with built-in defaults (error, failure, warning, warn, fatal, exception, critical) unless context_keywords_only is true. Only used when extract_context is true.",
+    ),
+  context_keywords_replace: z
+    .boolean()
+    .optional()
+    .describe(
+      "When true, context_keywords replaces the built-in default keyword list entirely instead of being merged with it. Only used when extract_context and context_keywords are both set.",
     ),
   max_context_matches: z
     .number()
@@ -675,10 +1102,77 @@ const SanitizeSchema = {
     .describe(
       "When true, keyword matching is case-sensitive. Default: false (ERROR, error, and Error all match).",
     ),
+  llm_template: z
+    .string()
+    .optional()
+    .describe(
+      "Format the sanitized output as an LLM-ready prompt and return it instead of raw sanitized bytes. Built-in templates: 'troubleshoot' (incident triage), 'review-config' (configuration audit). Pass a filesystem path for a custom template file. Combine with extract_context to include notable log events in the prompt.",
+    ),
+  force_text: z
+    .boolean()
+    .optional()
+    .describe(
+      "Bypass all structured processors (JSON, YAML, XML, TOML, etc.) and run only the streaming scanner on every file. Use when format is uncertain or when guaranteed full-byte pattern coverage is required.",
+    ),
+  include_binary: z
+    .boolean()
+    .optional()
+    .describe(
+      "Process binary entries inside archives (default: skip). Enable when archives contain binary files that should be scanned.",
+    ),
+  hidden: z
+    .boolean()
+    .optional()
+    .describe(
+      "Also walk hidden files and directories (names starting with '.'). By default dot-files are skipped when expanding directories.",
+    ),
+  ignore_path: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Glob patterns for paths to exclude from processing. Matched relative to the input; patterns without '/' also match the basename. E.g. ['*.test.yaml', 'fixtures/**'].",
+    ),
+  entropy_threshold: z
+    .number()
+    .min(0)
+    .max(8)
+    .optional()
+    .describe(
+      "Shannon entropy threshold for high-entropy token detection (0–8 bits per character). Strings whose entropy exceeds this value are treated as secrets and replaced. Typical secrets sit above 4.5; random UUIDs sit around 3.8. Only applied when no secrets entry with kind: entropy already exists.",
+    ),
+  max_archive_depth: z
+    .number()
+    .int()
+    .min(1)
+    .max(10)
+    .optional()
+    .describe(
+      `Maximum nesting depth for recursive archive processing (default: ${MAX_ARCHIVE_DEPTH}). Increase for deeply nested archives; decrease to tighten zip-bomb protection.`,
+    ),
+  report: z
+    .boolean()
+    .optional()
+    .describe(
+      "When true, also generate a JSON scan report alongside the sanitized output. The response becomes { content/results, report } instead of plain text. Use extract_context instead if you also want per-match log context.",
+    ),
+  strict: z
+    .boolean()
+    .optional()
+    .describe(
+      "Abort on the first processing error instead of skipping and continuing. Useful in CI pipelines where a partial result is worse than a failure.",
+    ),
 };
 
 const ScanSchema = {
-  content: z.string().describe("The text content to scan"),
+  content: z.string().optional().describe(
+    "Inline text content to scan. Mutually exclusive with `files`. Either this or `files` must be provided.",
+  ),
+  files: z.array(z.string()).optional().describe(
+    "One or more paths to scan (absolute or relative). Accepts plain files, archives, or a mix. Use `archive_filters` to restrict which archive entries are scanned. Mutually exclusive with `content`.",
+  ),
+  archive_filters: z.array(ArchiveFilterSchema).optional().describe(
+    "Per-archive entry filters applied during scanning. Same semantics as on the sanitize tool.",
+  ),
   namespace: NamespaceSchema,
   patterns: z
     .array(InlinePatternSchema)
@@ -688,6 +1182,12 @@ const ScanSchema = {
     .string()
     .optional()
     .describe("Path to a secrets file. Takes priority over patterns."),
+  profile: z
+    .string()
+    .optional()
+    .describe(
+      "Path to a field-level profile YAML/JSON file defining which structured fields to scan. Overrides the namespace profile when both are present.",
+    ),
   use_default: z
     .boolean()
     .optional()
@@ -707,10 +1207,66 @@ const ScanSchema = {
       "Values to exclude from the scan report. Supports exact strings and * glob patterns. Useful for suppressing known-safe values that would otherwise appear as false positives.",
     ),
   format: FormatSchema,
+  fail_on_match: z
+    .boolean()
+    .optional()
+    .describe(
+      "When true, the response includes a `secrets_detected` boolean flag. If any secrets are found the flag is true (CLI exits with code 2); if none are found it is false. Useful for security-gate workflows where callers need a simple yes/no without parsing the full report.",
+    ),
+  force_text: z
+    .boolean()
+    .optional()
+    .describe(
+      "Bypass all structured processors and run only the streaming scanner. Use when format is uncertain or guaranteed full-byte coverage is required.",
+    ),
+  include_binary: z
+    .boolean()
+    .optional()
+    .describe("Process binary entries inside archives (default: skip)."),
+  hidden: z
+    .boolean()
+    .optional()
+    .describe(
+      "Also walk hidden files and directories (names starting with '.'). By default dot-files are skipped when expanding directories.",
+    ),
+  ignore_path: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Glob patterns for paths to exclude from scanning. Matched relative to the input; patterns without '/' also match the basename.",
+    ),
+  entropy_threshold: z
+    .number()
+    .min(0)
+    .max(8)
+    .optional()
+    .describe(
+      "Shannon entropy threshold for high-entropy token detection (0–8 bits per character). Strings whose entropy exceeds this value are flagged as secrets.",
+    ),
+  max_archive_depth: z
+    .number()
+    .int()
+    .min(1)
+    .max(10)
+    .optional()
+    .describe(
+      `Maximum nesting depth for recursive archive processing (default: ${MAX_ARCHIVE_DEPTH}).`,
+    ),
+  strict: z
+    .boolean()
+    .optional()
+    .describe(
+      "Abort on the first processing error instead of skipping and continuing.",
+    ),
 };
 
 const StripSchema = {
-  content: z.string().describe("The configuration file content to strip values from"),
+  content: z.string().optional().describe(
+    "Inline configuration content to strip values from. Mutually exclusive with `files`. Either this or `files` must be provided.",
+  ),
+  files: z.array(z.string()).optional().describe(
+    "One or more paths to strip values from (absolute or relative). Mutually exclusive with `content`.",
+  ),
   delimiter: z.string().optional().describe('Key-value delimiter (default: "=")'),
   comment_prefix: z.string().optional().describe('Comment prefix character (default: "#")'),
 };
@@ -730,14 +1286,15 @@ const server = new McpServer({
 
 server.tool(
   "sanitize",
-  "Sanitize sensitive values in text content. Structured fields (passwords, tokens, API keys) are replaced with __SANITIZED-<hash>__ markers. Typed values (emails, IPs, hostnames) are replaced with realistic-looking substitutes of the same format. Supply a seed for consistent replacements across multiple calls in a session.",
+  "Sanitize sensitive values in text content or files before the LLM reads them. The primary MCP use case: pipe logs or configs through this tool, then reason over the safe output. Set `llm_template: 'troubleshoot'` to get a fully-formatted incident-triage prompt ready to paste; set `llm_template: 'review-config'` for a configuration-audit prompt — these are the two most common end-to-end workflows. Structured fields (passwords, tokens, API keys) are replaced with __SANITIZED-<hash>__ markers; typed values (emails, IPs) get realistic-looking substitutes of the same format. Use `files` to process paths directly so raw content never enters the LLM context. Archives are extracted and sanitized recursively. Supply a `seed` for consistent replacements across multiple calls in a session.",
   SanitizeSchema,
   async (params: SanitizeParams) => {
     try {
       const result = await toolSanitize(params);
-      const text = result.report !== undefined
+      // files-mode returns `results` array; content-mode returns plain `content`.
+      const text = result.results !== undefined || result.report !== undefined
         ? JSON.stringify(result, null, 2)
-        : result.content;
+        : result.content!;
       return { content: [{ type: "text" as const, text }] };
     } catch (err) {
       return {
@@ -750,7 +1307,7 @@ server.tool(
 
 server.tool(
   "scan",
-  "Scan text content for sensitive values and return a structured report of what was found — without modifying the content. Useful for auditing before committing to full sanitization.",
+  "Scan text content or one or more files for sensitive values and return a structured report — without modifying anything. Accepts the same `files` and `archive_filters` inputs as the sanitize tool. Use `fail_on_match` for security-gate workflows: the response includes a `secrets_detected` boolean so callers can branch without parsing the full report. Useful for auditing what would be replaced before committing to full sanitization.",
   ScanSchema,
   async (params: ScanParams) => {
     try {
@@ -767,12 +1324,13 @@ server.tool(
 
 server.tool(
   "strip_config_values",
-  "Strip values from a key=value configuration file, preserving only keys, comments, section headers, and delimiters. Useful for sharing config structure without exposing secrets.",
+  "Strip values from key=value configuration files, preserving only keys, comments, section headers, and delimiters. Accepts inline `content` or one or more file paths via `files`. Useful for sharing config structure without exposing secrets.",
   StripSchema,
   async (params: StripParams) => {
     try {
       const stripped = await toolStripConfigValues(params);
-      return { content: [{ type: "text" as const, text: stripped }] };
+      const text = typeof stripped === "string" ? stripped : JSON.stringify(stripped, null, 2);
+      return { content: [{ type: "text" as const, text }] };
     } catch (err) {
       return {
         content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
@@ -809,14 +1367,13 @@ server.tool(
 );
 
 server.tool(
-  "list_processors",
-  "List the available content processors and their format flag values. Use this to know what to pass as the `format` parameter on sanitize/scan, or as the `processor` field in a profile YAML file.",
+  "list_apps",
+  "List all available app bundles (built-in and user-defined) that can be passed to the `app` parameter. Shows bundle names, descriptions, and the user apps directory path.",
   {},
-  () => {
+  async () => {
     try {
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(toolListProcessors(), null, 2) }],
-      };
+      const text = await toolListApps();
+      return { content: [{ type: "text" as const, text }] };
     } catch (err) {
       return {
         content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
@@ -827,14 +1384,143 @@ server.tool(
 );
 
 server.tool(
-  "list_templates",
-  "List the available built-in LLM prompt templates for use with the sanitize CLI's --llm flag.",
-  {},
-  () => {
+  "init",
+  "Create a starter secrets file on disk at the specified path. Use this to set up sanitize-engine for a project in one step — generates a ready-to-use YAML secrets file with patterns appropriate for the chosen preset. Call this when the user wants to start using sanitize-engine or asks how to create a secrets file.",
+  {
+    output_path: z
+      .string()
+      .describe("Absolute or relative path where the secrets YAML file should be written (e.g. 'secrets.yaml' or '/home/user/project/secrets.yaml')."),
+    preset: z
+      .enum(["generic", "web", "k8s", "database", "aws"])
+      .optional()
+      .describe("Pattern preset to use. One of: generic (default, common tokens/emails/IPs), web (JWTs/sessions/emails), k8s (service accounts/tokens), database (passwords/connection strings), aws (access keys/ARNs)."),
+    overwrite: z
+      .boolean()
+      .optional()
+      .describe("Overwrite the file if it already exists. Defaults to false."),
+  },
+  async (params: {
+    output_path: string;
+    preset?: "generic" | "web" | "k8s" | "database" | "aws";
+    overwrite?: boolean;
+  }) => {
     try {
+      const args = ["template", "--output", params.output_path];
+      if (params.preset) args.push("--preset", params.preset);
+      if (params.overwrite) args.push("--overwrite");
+      const result = await runSanitize(args, null);
+      if (result.exitCode !== 0) {
+        throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+      }
+      const preset = params.preset ?? "generic";
+      let fileContent = "";
+      try {
+        fileContent = await Deno.readTextFile(params.output_path);
+      } catch {
+        // Non-fatal: file read failure just omits the content preview.
+      }
+      const preview = fileContent ? `\n\n--- ${params.output_path} ---\n${fileContent}` : "";
+      const text = `Created secrets file: ${params.output_path}\nPreset: ${preset}\n\nNext steps:\n  1. Edit the file to add patterns specific to your environment\n  2. Run: sanitize <files> -s ${params.output_path}\n  3. Or encrypt it: sanitize encrypt ${params.output_path} ${params.output_path}.enc --password${preview}`;
+      return { content: [{ type: "text" as const, text }] };
+    } catch (err) {
       return {
-        content: [{ type: "text" as const, text: JSON.stringify(toolListTemplates(), null, 2) }],
+        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
       };
+    }
+  },
+);
+
+server.tool(
+  "test_pattern",
+  "Test which values are matched and replaced by a given secrets file, app bundle, or inline pattern set — without modifying any files. Returns a per-value result showing which pattern matched and what replacement category was applied. Use this when authoring a secrets file to verify coverage before running a full sanitization.",
+  {
+    values: z
+      .array(z.string())
+      .min(1)
+      .describe("Values to test. Each value is checked against all active patterns."),
+    secrets_file: z
+      .string()
+      .optional()
+      .describe("Path to a secrets YAML/JSON/TOML file. Takes priority over patterns."),
+    app: z
+      .array(z.string())
+      .optional()
+      .describe("Built-in app bundle names to load (e.g. ['gitlab', 'nginx'])."),
+    patterns: z
+      .array(InlinePatternSchema)
+      .optional()
+      .describe("Inline patterns to test against. Ignored when secrets_file is supplied."),
+    namespace: NamespaceSchema,
+  },
+  async (params: {
+    values: string[];
+    secrets_file?: string;
+    app?: string[];
+    patterns?: InlinePattern[];
+    namespace?: string;
+  }) => {
+    try {
+      const report = await toolTestPattern(params);
+      return { content: [{ type: "text" as const, text: JSON.stringify(report, null, 2) }] };
+    } catch (err) {
+      return {
+        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "build_secrets",
+  "Build a tailored secrets file from specific patterns and write it to disk. Use this after scanning content and identifying what the default patterns missed — supply the exact literals or regexes you need and optionally start from a preset template. Returns the written file content. The workflow: scan with use_default → observe gaps → build_secrets to capture the missing patterns → sanitize with the new file.",
+  {
+    output_path: z
+      .string()
+      .describe("Path where the secrets YAML file should be written."),
+    entries: z
+      .array(
+        z.object({
+          label: z.string().describe("Human-readable name shown in reports."),
+          pattern: z.string().describe("The literal string or regex pattern to match."),
+          kind: z
+            .enum(["literal", "regex", "entropy"])
+            .optional()
+            .describe("Match kind. 'literal' (default) for exact strings, 'regex' for patterns, 'entropy' for high-entropy token detection."),
+          category: z
+            .string()
+            .optional()
+            .describe(
+              "Replacement category. Required for regex/literal. Built-in: email, name, ipv4, ipv6, hostname, uuid, jwt, auth_token, url, aws_arn, custom:<tag>.",
+            ),
+        }),
+      )
+      .optional()
+      .describe("Specific patterns to include. Can be combined with a preset — custom entries are appended after the preset patterns."),
+    preset: z
+      .enum(["generic", "web", "k8s", "database", "aws"])
+      .optional()
+      .describe("Start from this built-in template. Omit to create a file with only the entries you specify."),
+    overwrite: z
+      .boolean()
+      .optional()
+      .describe("Overwrite the file if it already exists. Defaults to false."),
+  },
+  async (params: {
+    output_path: string;
+    entries?: BuildSecretsEntry[];
+    preset?: "generic" | "web" | "k8s" | "database" | "aws";
+    overwrite?: boolean;
+  }) => {
+    try {
+      const content = await toolBuildSecrets(params);
+      const preset = params.preset ? `\nPreset: ${params.preset}` : "";
+      const custom = params.entries?.length
+        ? `\nCustom entries added: ${params.entries.length}`
+        : "";
+      const text = `Created secrets file: ${params.output_path}${preset}${custom}\n\n--- ${params.output_path} ---\n${content}`;
+      return { content: [{ type: "text" as const, text }] };
     } catch (err) {
       return {
         content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],

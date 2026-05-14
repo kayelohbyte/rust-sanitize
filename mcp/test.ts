@@ -198,21 +198,6 @@ function toolText(result: unknown): string {
 // Tests
 // ---------------------------------------------------------------------------
 
-test("list_templates returns both built-in templates", async (s) => {
-  const result = toolText(await s.send("tools/call", { name: "list_templates", arguments: {} }));
-  const parsed = JSON.parse(result);
-  assert(Array.isArray(parsed.templates), "templates should be an array");
-  assert(parsed.templates.length === 2, "should have 2 templates");
-  assert(
-    parsed.templates.some((t: { name: string }) => t.name === "troubleshoot"),
-    "should include troubleshoot",
-  );
-  assert(
-    parsed.templates.some((t: { name: string }) => t.name === "review-config"),
-    "should include review-config",
-  );
-});
-
 test("sanitize replaces email address", async (s) => {
   const result = toolText(
     await s.send("tools/call", {
@@ -220,7 +205,7 @@ test("sanitize replaces email address", async (s) => {
       arguments: {
         content: "Contact alice@example.com for help.",
         patterns: [
-          { name: "email", pattern: "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}", category: "email" },
+          { name: "email", pattern: "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}", category: "email", kind: "regex" },
         ],
       },
     }),
@@ -262,7 +247,7 @@ test("scan returns structured report with match counts", async (s) => {
       arguments: {
         content: "pass = hunter2\napi_key = s3cr3t",
         patterns: [
-          { name: "val", pattern: "hunter2|s3cr3t", category: "generic" },
+          { name: "val", pattern: "hunter2|s3cr3t", category: "generic", kind: "regex" },
         ],
       },
     }),
@@ -505,16 +490,118 @@ test("extract_context respects context_lines", async (s) => {
   assert(match.after[0] === "d", `expected 'd', got '${match.after[0]}'`);
 });
 
-test("list_processors returns all processors with format flags", async (s) => {
-  const result = toolText(await s.send("tools/call", { name: "list_processors", arguments: {} }));
+test("sanitize use_default replaces known patterns without a secrets file", async (s) => {
+  const result = toolText(
+    await s.send("tools/call", {
+      name: "sanitize",
+      arguments: {
+        content: "user bob@example.com connected from 10.0.0.1",
+        use_default: true,
+      },
+    }),
+  );
+  assertNotContains(result, "bob@example.com");
+  assertNotContains(result, "10.0.0.1");
+});
+
+test("test_pattern matched value returns exit 0 via MCP", async (s) => {
+  const result = toolText(
+    await s.send("tools/call", {
+      name: "test_pattern",
+      arguments: {
+        values: ["hunter2"],
+        patterns: [{ name: "pw", pattern: "hunter2", category: "custom:pass" }],
+      },
+    }),
+  );
   const parsed = JSON.parse(result);
-  assert(Array.isArray(parsed.processors), "should have processors array");
-  const names = parsed.processors.map((p: { name: string }) => p.name);
-  for (const expected of ["json", "yaml", "toml", "xml", "csv", "env", "jsonl"]) {
-    assert(names.includes(expected), `should include processor '${expected}'`);
+  assert(parsed.results[0].matched === true, "hunter2 should match");
+  assert(parsed.summary.matched === 1, "1 value should match");
+});
+
+test("test_pattern unmatched value shows in results", async (s) => {
+  const result = toolText(
+    await s.send("tools/call", {
+      name: "test_pattern",
+      arguments: {
+        values: ["notasecret"],
+        patterns: [{ name: "pw", pattern: "hunter2", category: "custom:pass" }],
+      },
+    }),
+  );
+  const parsed = JSON.parse(result);
+  assert(parsed.results[0].matched === false, "notasecret should not match");
+  assert(parsed.summary.unmatched === 1, "1 value should be unmatched");
+});
+
+test("list_apps returns app names", async (s) => {
+  const result = toolText(await s.send("tools/call", { name: "list_apps", arguments: {} }));
+  assertContains(result, "gitlab");
+  assertContains(result, "nginx");
+});
+
+test("build_secrets creates a file and returns content", async (s) => {
+  const tmpPath = await Deno.makeTempFile({ suffix: ".yaml" });
+  try {
+    const result = toolText(
+      await s.send("tools/call", {
+        name: "build_secrets",
+        arguments: {
+          output_path: tmpPath,
+          entries: [
+            { label: "my_token", pattern: "sk-test-[a-z0-9]+", kind: "regex", category: "auth_token" },
+          ],
+          overwrite: true,
+        },
+      }),
+    );
+    assertContains(result, "my_token");
+    assertContains(result, "sk-test-");
+    const written = await Deno.readTextFile(tmpPath);
+    assertContains(written, "my_token");
+  } finally {
+    await Deno.remove(tmpPath).catch(() => {});
   }
-  const jsonProc = parsed.processors.find((p: { name: string }) => p.name === "json");
-  assert(jsonProc.format_flag === "json", "json processor should have format_flag 'json'");
+});
+
+test("build_secrets with preset creates file containing preset patterns", async (s) => {
+  const tmpPath = await Deno.makeTempFile({ suffix: ".yaml" });
+  try {
+    const result = toolText(
+      await s.send("tools/call", {
+        name: "build_secrets",
+        arguments: {
+          output_path: tmpPath,
+          preset: "generic",
+          overwrite: true,
+        },
+      }),
+    );
+    assertContains(result, "secrets:");
+    assertContains(result, "pattern:");
+  } finally {
+    await Deno.remove(tmpPath).catch(() => {});
+  }
+});
+
+test("init creates file and returns content", async (s) => {
+  const tmpPath = await Deno.makeTempFile({ suffix: ".yaml" });
+  try {
+    const result = toolText(
+      await s.send("tools/call", {
+        name: "init",
+        arguments: {
+          output_path: tmpPath,
+          preset: "web",
+          overwrite: true,
+        },
+      }),
+    );
+    assertContains(result, "secrets:");
+    assertContains(result, "jwt");
+  } finally {
+    await Deno.remove(tmpPath).catch(() => {});
+  }
 });
 
 test("namespace end-to-end: resolves plaintext secrets and sanitizes content", async (_s) => {

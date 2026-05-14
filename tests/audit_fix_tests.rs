@@ -330,6 +330,10 @@ fn s1_secret_entry_implements_drop_zeroize() {
         category: "email".into(),
         label: Some("test_label".into()),
         values: vec![],
+        min_length: None,
+        max_length: None,
+        threshold: None,
+        charset: None,
     };
     drop(entry);
     // If we get here, the Zeroize-on-Drop implementation works without panic.
