@@ -278,11 +278,7 @@ impl SanitizeReport {
             let rows: String = sorted_patterns
                 .iter()
                 .map(|(pat, count)| {
-                    format!(
-                        "<tr><td>{}</td><td>{}</td></tr>\n",
-                        html_escape(pat),
-                        count
-                    )
+                    format!("<tr><td>{}</td><td>{}</td></tr>\n", html_escape(pat), count)
                 })
                 .collect();
             format!(
@@ -928,7 +924,10 @@ mod tests {
         let sarif = rich_report().to_sarif().unwrap();
         let v: serde_json::Value = serde_json::from_str(&sarif).unwrap();
         assert_eq!(v["version"], "2.1.0");
-        assert_eq!(v["$schema"], "https://json.schemastore.org/sarif-2.1.0.json");
+        assert_eq!(
+            v["$schema"],
+            "https://json.schemastore.org/sarif-2.1.0.json"
+        );
     }
 
     #[test]
@@ -1077,7 +1076,9 @@ mod tests {
     fn html_no_external_resources() {
         let html = rich_report().to_html();
         // No CDN links, no external stylesheets, no external scripts.
-        assert!(!html.contains("http://") || html.contains("https://json.schemastore.org") == false);
+        assert!(
+            !html.contains("http://") || html.contains("https://json.schemastore.org") == false
+        );
         assert!(!html.contains("cdn."));
         assert!(!html.contains("src=\"http"));
         assert!(!html.contains("href=\"http"));

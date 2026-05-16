@@ -64,7 +64,6 @@ pub(crate) fn global_settings_path() -> PathBuf {
     sanitize_config_dir().join("settings.yaml")
 }
 
-
 /// Locate the .git/hooks directory for the current repository.
 pub(crate) fn find_project_hooks_dir() -> Result<PathBuf, (String, i32)> {
     let git_dir = git_output(&["rev-parse", "--git-dir"])
@@ -304,10 +303,7 @@ pub(crate) fn build_hook_script(args: &InstallHookArgs) -> String {
 /// root.  Returns the path to the target hook file if the framework handles
 /// the write itself (husky), or `None` with a printed advisory for frameworks
 /// that require manual config edits (lefthook, pre-commit).
-fn detect_framework_hooks_dir(
-    repo_root: &Path,
-    hook_name: &str,
-) -> Option<PathBuf> {
+fn detect_framework_hooks_dir(repo_root: &Path, hook_name: &str) -> Option<PathBuf> {
     // ── husky ────────────────────────────────────────────────────────────────
     let husky_dir = repo_root.join(".husky");
     if husky_dir.is_dir() {
@@ -404,7 +400,6 @@ pub(crate) fn remove_hook(hook_path: &Path, _hook_name: &str) -> Result<(), (Str
 }
 
 pub(crate) fn run_install_hook(args: &InstallHookArgs) -> Result<(), (String, i32)> {
-
     let hook_name = args.hook.hook_name();
 
     // ── determine target hooks directory ─────────────────────────────────────
@@ -414,7 +409,9 @@ pub(crate) fn run_install_hook(args: &InstallHookArgs) -> Result<(), (String, i3
         // Check for known frameworks first; they may redirect the write path.
         let repo_root = find_git_root()?;
         let framework_dir = detect_framework_hooks_dir(&repo_root, hook_name);
-        framework_dir.unwrap_or_else(|| find_project_hooks_dir().unwrap_or_else(|_| repo_root.join(".git").join("hooks")))
+        framework_dir.unwrap_or_else(|| {
+            find_project_hooks_dir().unwrap_or_else(|_| repo_root.join(".git").join("hooks"))
+        })
     };
 
     let hook_path = hooks_dir.join(hook_name);

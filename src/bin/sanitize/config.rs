@@ -1,7 +1,7 @@
 use crate::hooks::{
     global_default_secrets_path, global_settings_path, run_install_hook, sanitize_config_dir,
 };
-use crate::{GuidedOptions, GuidedPreset, InitArgs, InstallHookArgs, build_guided_entries};
+use crate::{build_guided_entries, GuidedOptions, GuidedPreset, InitArgs, InstallHookArgs};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -136,9 +136,7 @@ pub(crate) fn find_project_config() -> Option<PathBuf> {
         if p.is_file() {
             return Some(p);
         }
-        eprintln!(
-            "warning: SANITIZE_CONFIG={explicit} does not exist — ignoring"
-        );
+        eprintln!("warning: SANITIZE_CONFIG={explicit} does not exist — ignoring");
         return None;
     }
     let cwd = std::env::current_dir().ok()?;
@@ -149,10 +147,7 @@ pub(crate) fn find_project_config() -> Option<PathBuf> {
 /// relative paths inside the file can be resolved against the file's location.
 /// Silently returns defaults on read or parse error.
 pub(crate) fn load_project_config(path: &Path) -> (ProjectConfig, PathBuf) {
-    let config_dir = path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
+    let config_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
@@ -251,7 +246,7 @@ pub(crate) fn run_show_config() -> Result<(), (String, i32)> {
         fn show<T: std::fmt::Display>(label: &str, val: Option<T>, default: &str, source: &str) {
             match val {
                 Some(v) => println!("  {label:<22} {v}  ({source})"),
-                None    => println!("  {label:<22} {default}  (default)"),
+                None => println!("  {label:<22} {default}  (default)"),
             }
         }
         fn show_vec(label: &str, v: &[String], default: &str, source: &str) {
@@ -262,14 +257,34 @@ pub(crate) fn run_show_config() -> Result<(), (String, i32)> {
             }
         }
 
-        show_vec("app:",           &settings.app,              "(none)", "from settings");
-        show_vec("allow:",         &settings.allow,            "(none)", "from settings");
-        show("fail_on_match:",     settings.fail_on_match,     "false",  "from settings");
-        show("strict:",            settings.strict,            "false",  "from settings");
-        show("no_structured_handoff:", settings.no_structured_handoff, "false",  "from settings");
-        show("threads:",           settings.threads,           "(auto)", "from settings");
-        show("log_format:",        settings.log_format.as_deref().map(|s| s.to_string()), "human", "from settings");
-        show("no_progress:",       settings.no_progress,       "false",  "from settings");
+        show_vec("app:", &settings.app, "(none)", "from settings");
+        show_vec("allow:", &settings.allow, "(none)", "from settings");
+        show(
+            "fail_on_match:",
+            settings.fail_on_match,
+            "false",
+            "from settings",
+        );
+        show("strict:", settings.strict, "false", "from settings");
+        show(
+            "no_structured_handoff:",
+            settings.no_structured_handoff,
+            "false",
+            "from settings",
+        );
+        show("threads:", settings.threads, "(auto)", "from settings");
+        show(
+            "log_format:",
+            settings.log_format.as_deref().map(|s| s.to_string()),
+            "human",
+            "from settings",
+        );
+        show(
+            "no_progress:",
+            settings.no_progress,
+            "false",
+            "from settings",
+        );
     }
 
     // ── project config (.sanitize.toml) ──────────────────────────────────────
@@ -280,7 +295,9 @@ pub(crate) fn run_show_config() -> Result<(), (String, i32)> {
     }
     match find_project_config() {
         None => {
-            println!("Project config: (none — no .sanitize.toml found in this directory or its parents)");
+            println!(
+                "Project config: (none — no .sanitize.toml found in this directory or its parents)"
+            );
         }
         Some(ref path) => {
             println!("Project config: {}", path.display());
@@ -289,7 +306,11 @@ pub(crate) fn run_show_config() -> Result<(), (String, i32)> {
             fn show_opt_path(label: &str, val: Option<&Path>, base: &Path) {
                 match val {
                     Some(p) => {
-                        let resolved = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
+                        let resolved = if p.is_absolute() {
+                            p.to_path_buf()
+                        } else {
+                            base.join(p)
+                        };
                         println!("  {label:<22} {}", resolved.display());
                     }
                     None => println!("  {label:<22} (not set)"),
@@ -317,20 +338,20 @@ pub(crate) fn run_show_config() -> Result<(), (String, i32)> {
             show_opt_path("secrets_file:", pc.secrets_file.as_deref(), &config_dir);
             match pc.encrypted_secrets {
                 Some(v) => println!("  {:<22} {v}", "encrypted_secrets:"),
-                None    => println!("  {:<22} (not set)", "encrypted_secrets:"),
+                None => println!("  {:<22} (not set)", "encrypted_secrets:"),
             }
             show_opt_path("profile:", pc.profile.as_deref(), &config_dir);
             match pc.fail_on_match {
                 Some(v) => println!("  {:<22} {v}", "fail_on_match:"),
-                None    => println!("  {:<22} (not set)", "fail_on_match:"),
+                None => println!("  {:<22} (not set)", "fail_on_match:"),
             }
             match pc.strict {
                 Some(v) => println!("  {:<22} {v}", "strict:"),
-                None    => println!("  {:<22} (not set)", "strict:"),
+                None => println!("  {:<22} (not set)", "strict:"),
             }
             match pc.no_structured_handoff {
                 Some(v) => println!("  {:<22} {v}", "no_structured_handoff:"),
-                None    => println!("  {:<22} (not set)", "no_structured_handoff:"),
+                None => println!("  {:<22} (not set)", "no_structured_handoff:"),
             }
         }
     }
@@ -345,12 +366,18 @@ pub(crate) fn run_init(args: &InitArgs) -> Result<(), (String, i32)> {
     if args.dry_run {
         println!("Would create (dry-run):");
         if secrets_path.exists() && !args.force {
-            println!("  {} (already exists — use --force to overwrite)", secrets_path.display());
+            println!(
+                "  {} (already exists — use --force to overwrite)",
+                secrets_path.display()
+            );
         } else {
             println!("  {} — balanced built-in patterns", secrets_path.display());
         }
         if settings_path.exists() && !args.force {
-            println!("  {} (already exists — use --force to overwrite)", settings_path.display());
+            println!(
+                "  {} (already exists — use --force to overwrite)",
+                settings_path.display()
+            );
         } else {
             println!("  {} — persistent flag defaults", settings_path.display());
         }
@@ -390,8 +417,12 @@ pub(crate) fn run_init(args: &InitArgs) -> Result<(), (String, i32)> {
             fs::create_dir_all(parent)
                 .map_err(|e| (format!("failed to create {}: {e}", parent.display()), 1))?;
         }
-        fs::write(&secrets_path, &yaml)
-            .map_err(|e| (format!("failed to write {}: {e}", secrets_path.display()), 1))?;
+        fs::write(&secrets_path, &yaml).map_err(|e| {
+            (
+                format!("failed to write {}: {e}", secrets_path.display()),
+                1,
+            )
+        })?;
         println!("Created: {}", secrets_path.display());
         println!("  Contains the balanced built-in patterns.");
         println!("  Edit it to add or tune patterns for your environment.");
@@ -405,8 +436,12 @@ pub(crate) fn run_init(args: &InitArgs) -> Result<(), (String, i32)> {
             fs::create_dir_all(parent)
                 .map_err(|e| (format!("failed to create {}: {e}", parent.display()), 1))?;
         }
-        fs::write(&settings_path, SETTINGS_TEMPLATE)
-            .map_err(|e| (format!("failed to write {}: {e}", settings_path.display()), 1))?;
+        fs::write(&settings_path, SETTINGS_TEMPLATE).map_err(|e| {
+            (
+                format!("failed to write {}: {e}", settings_path.display()),
+                1,
+            )
+        })?;
         println!("Created: {}", settings_path.display());
         println!("  Uncomment fields to set persistent flag defaults.");
     }
@@ -428,4 +463,3 @@ pub(crate) fn run_init(args: &InitArgs) -> Result<(), (String, i32)> {
 
     Ok(())
 }
-

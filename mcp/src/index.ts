@@ -436,6 +436,7 @@ async function toolSanitize(params: {
   max_context_matches?: number;
   context_case_sensitive?: boolean;
   report?: boolean;
+  report_format?: "json" | "sarif" | "html";
   strict?: boolean;
 }): Promise<SanitizeResult> {
   const hasContent = params.content !== undefined;

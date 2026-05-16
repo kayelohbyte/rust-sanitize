@@ -771,16 +771,14 @@ EXAMPLES:\n  \
     /// Equivalent to running the default sanitize mode with --dry-run and
     /// --fail-on-match, but discoverable as a dedicated subcommand. Designed
     /// for CI pipelines where you want detection without rewriting files.
-    #[command(
-        after_help = "\
+    #[command(after_help = "\
 EXAMPLES:\n  \
   sanitize scan app.log -s secrets.yaml              # scan a log file\n  \
   sanitize scan ./logs/ -s secrets.yaml              # scan a directory\n  \
   sanitize scan app.log --app gitlab                 # scan using an app bundle\n  \
   sanitize scan . --ignore-path tests/fixtures/      # skip test fixtures\n  \
   git diff HEAD | sanitize scan                      # scan a patch from stdin\n  \
-  sanitize scan app.log -s s.enc --encrypted-secrets -p  # encrypted secrets"
-    )]
+  sanitize scan app.log -s s.enc --encrypted-secrets -p  # encrypted secrets")]
     Scan(ScanArgs),
 
     /// Test whether secrets patterns match example values.
@@ -1196,12 +1194,24 @@ pub(crate) struct InitArgs {
     pub(crate) with_hook: bool,
 
     /// Hook type to install when --with-hook is set.
-    #[arg(long, value_enum, default_value = "pre-commit", value_name = "HOOK", requires = "with_hook")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "pre-commit",
+        value_name = "HOOK",
+        requires = "with_hook"
+    )]
     pub(crate) hook: HookType,
 
     /// Hook behaviour when --with-hook is set: scan blocks the commit without
     /// modifying files; sanitize rewrites staged files in place.
-    #[arg(long, value_enum, default_value = "scan", value_name = "MODE", requires = "with_hook")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "scan",
+        value_name = "MODE",
+        requires = "with_hook"
+    )]
     pub(crate) mode: HookMode,
 
     /// When --with-hook is set, install the hook globally (all repositories).
@@ -1216,7 +1226,6 @@ pub(crate) struct InitArgs {
     #[arg(long)]
     pub(crate) dry_run: bool,
 }
-
 
 fn run_scan(args: &ScanArgs) -> Result<(), (String, i32)> {
     // Resolve password before building Cli so interactive prompts fire before
@@ -1287,7 +1296,11 @@ fn run_scan(args: &ScanArgs) -> Result<(), (String, i32)> {
         llm: None,
         app: args.app.clone(),
         allow: args.allow.clone(),
-        findings: if args.json { Some(PathBuf::from("-")) } else { None },
+        findings: if args.json {
+            Some(PathBuf::from("-"))
+        } else {
+            None
+        },
         entropy_threshold: args.entropy_threshold,
         use_default: args.use_default,
     };
@@ -1316,8 +1329,8 @@ fn run_test_pattern(args: &TestPatternArgs) -> Result<(), (String, i32)> {
 
     // 2. --secrets-file.
     if let Some(ref path) = args.secrets_file {
-        let bytes = fs::read(path)
-            .map_err(|e| (format!("failed to read {}: {e}", path.display()), 1))?;
+        let bytes =
+            fs::read(path).map_err(|e| (format!("failed to read {}: {e}", path.display()), 1))?;
         let format = SecretsFormat::from_extension(path.to_string_lossy().as_ref());
         let mut file_entries = parse_secrets(&bytes, format)
             .map_err(|e| (format!("failed to parse {}: {e}", path.display()), 1))?;
@@ -1527,7 +1540,10 @@ fn run_test_pattern(args: &TestPatternArgs) -> Result<(), (String, i32)> {
                 println!("✓  {}", r.value);
                 for h in &r.hits {
                     let span_note = if h.partial {
-                        format!("bytes {}..{} (partial — prefix/suffix preserved)", h.start, h.end)
+                        format!(
+                            "bytes {}..{} (partial — prefix/suffix preserved)",
+                            h.start, h.end
+                        )
                     } else {
                         format!("bytes {}..{} (full match)", h.start, h.end)
                     };
@@ -1539,11 +1555,7 @@ fn run_test_pattern(args: &TestPatternArgs) -> Result<(), (String, i32)> {
                 println!();
             }
         }
-        println!(
-            "{}/{} values matched",
-            total_matched,
-            results.len()
-        );
+        println!("{}/{} values matched", total_matched, results.len());
     }
 
     // Exit 1 if any value was unmatched — useful for scripting / CI.
@@ -1642,7 +1654,6 @@ fn run_allow_test(args: &AllowTestArgs) -> Result<(), (String, i32)> {
 
     Ok(())
 }
-
 
 fn run_template(args: &TemplateArgs) -> Result<(), (String, i32)> {
     let preset = parse_template_preset(&args.preset).map_err(|e| (e, 1))?;
@@ -2225,7 +2236,6 @@ fn build_default_patterns() -> Vec<ScanPattern> {
     patterns
 }
 
-
 // ---------------------------------------------------------------------------
 // Built-in field-name signals
 // ---------------------------------------------------------------------------
@@ -2573,16 +2583,11 @@ struct ExpandedInput {
 fn walk_dir(dir: &Path, include_hidden: bool) -> Result<Vec<PathBuf>, String> {
     use walkdir::WalkDir;
     let mut files = Vec::new();
-    let walker = WalkDir::new(dir)
-        .follow_links(false)
-        .sort_by_file_name();
+    let walker = WalkDir::new(dir).follow_links(false).sort_by_file_name();
 
     for entry in walker {
         let entry = entry.map_err(|e| format!("error walking {}: {e}", dir.display()))?;
-        let name = entry
-            .file_name()
-            .to_str()
-            .unwrap_or("");
+        let name = entry.file_name().to_str().unwrap_or("");
 
         // Skip VCS dirs (filter on the directory entry so the entire subtree
         // is pruned, not just the top-level dir itself).
@@ -2592,10 +2597,7 @@ fn walk_dir(dir: &Path, include_hidden: bool) -> Result<Vec<PathBuf>, String> {
 
         // Skip hidden entries unless --hidden is set.  The walk root itself
         // may be hidden (e.g. `sanitize .hidden-dir/`) — allow it through.
-        if !include_hidden
-            && entry.depth() > 0
-            && name.starts_with('.')
-        {
+        if !include_hidden && entry.depth() > 0 && name.starts_with('.') {
             continue;
         }
 
@@ -2769,7 +2771,10 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
             }
             info!(dir = %input.display(), files = files.len(), excluded = before - files.len(), "expanding directory input");
             for f in files {
-                expanded.push(ExpandedInput { path: f, dir_root: Some(input.clone()) });
+                expanded.push(ExpandedInput {
+                    path: f,
+                    dir_root: Some(input.clone()),
+                });
             }
         } else {
             // Explicit file path: warn when excluded rather than silently drop,
@@ -2778,7 +2783,10 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
                 warn!(path = %input.display(), "explicitly specified file matches an exclude pattern — skipping");
                 continue;
             }
-            expanded.push(ExpandedInput { path: input.clone(), dir_root: None });
+            expanded.push(ExpandedInput {
+                path: input.clone(),
+                dir_root: None,
+            });
         }
     }
 
@@ -2818,9 +2826,8 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
                 // --output <dir>: out_root/relative/path/file (exact name, no suffix)
                 let dest = out_root.join(rel);
                 if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent).map_err(|e| {
-                        format!("failed to create {}: {e}", parent.display())
-                    })?;
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
                 }
                 uniquify_output_path(dest, &mut used_outputs)
             } else {
@@ -3199,29 +3206,29 @@ fn resolve_thread_count(requested: Option<usize>) -> usize {
 /// Used to annotate the run header with `[config]` for values that came from a
 /// config file rather than the command line.
 struct CliConfigSnapshot {
-    had_secrets:       bool,
-    had_profile:       bool,
-    apps:              Vec<String>,
-    allow:             Vec<String>,
-    strict:            bool,
-    fail_on_match:     bool,
+    had_secrets: bool,
+    had_profile: bool,
+    apps: Vec<String>,
+    allow: Vec<String>,
+    strict: bool,
+    fail_on_match: bool,
     no_structured_handoff: bool,
-    deterministic:     bool,
-    dry_run:           bool,
+    deterministic: bool,
+    dry_run: bool,
 }
 
 impl CliConfigSnapshot {
     fn capture(cli: &Cli) -> Self {
         Self {
-            had_secrets:       cli.secrets_file.is_some(),
-            had_profile:       cli.profile.is_some(),
-            apps:              cli.app.clone(),
-            allow:             cli.allow.clone(),
-            strict:            cli.strict,
-            fail_on_match:     cli.fail_on_match,
+            had_secrets: cli.secrets_file.is_some(),
+            had_profile: cli.profile.is_some(),
+            apps: cli.app.clone(),
+            allow: cli.allow.clone(),
+            strict: cli.strict,
+            fail_on_match: cli.fail_on_match,
             no_structured_handoff: cli.no_structured_handoff,
-            deterministic:     cli.deterministic,
-            dry_run:           cli.dry_run,
+            deterministic: cli.deterministic,
+            dry_run: cli.dry_run,
         }
     }
 }
@@ -3292,19 +3299,39 @@ fn print_run_header(cli: &Cli, snap: &CliConfigSnapshot, json_logs: bool) {
     // Non-default boolean flags
     let mut flags: Vec<String> = Vec::new();
     if cli.strict {
-        flags.push(if !snap.strict { "--strict  [config]".into() } else { "--strict".into() });
+        flags.push(if !snap.strict {
+            "--strict  [config]".into()
+        } else {
+            "--strict".into()
+        });
     }
     if cli.fail_on_match {
-        flags.push(if !snap.fail_on_match { "--fail-on-match  [config]".into() } else { "--fail-on-match".into() });
+        flags.push(if !snap.fail_on_match {
+            "--fail-on-match  [config]".into()
+        } else {
+            "--fail-on-match".into()
+        });
     }
     if cli.no_structured_handoff {
-        flags.push(if !snap.no_structured_handoff { "--no-structured-handoff  [config]".into() } else { "--no-structured-handoff".into() });
+        flags.push(if !snap.no_structured_handoff {
+            "--no-structured-handoff  [config]".into()
+        } else {
+            "--no-structured-handoff".into()
+        });
     }
     if cli.deterministic {
-        flags.push(if !snap.deterministic { "--deterministic  [config]".into() } else { "--deterministic".into() });
+        flags.push(if !snap.deterministic {
+            "--deterministic  [config]".into()
+        } else {
+            "--deterministic".into()
+        });
     }
     if cli.dry_run {
-        flags.push(if !snap.dry_run { "--dry-run  [config]".into() } else { "--dry-run".into() });
+        flags.push(if !snap.dry_run {
+            "--dry-run  [config]".into()
+        } else {
+            "--dry-run".into()
+        });
     }
     if !flags.is_empty() {
         eprintln!("  flags:    {}", flags.join(", "));
@@ -4563,7 +4590,6 @@ fn build_format_preserving_scanner(
     base_scanner.for_structured_pass(extra)
 }
 
-
 /// Process an archive file. Returns `true` if entries were processed.
 #[allow(clippy::too_many_arguments)]
 fn process_archive(
@@ -5206,7 +5232,10 @@ fn run_sanitize(
     // --- print run configuration header to stderr ----------------------------
     // Only emit when progress is active (interactive TTY or --progress on/ci).
     // In auto+non-TTY mode (pipes, scripts) we stay silent.
-    if progress_policy.live_updates || progress_policy.milestone_updates || progress_context.json_logs {
+    if progress_policy.live_updates
+        || progress_policy.milestone_updates
+        || progress_context.json_logs
+    {
         print_run_header(&cli, &cli_snapshot, progress_context.json_logs);
     }
 
@@ -5478,7 +5507,10 @@ fn run_sanitize(
             if let Ok(entries) = parse_secrets(bytes, None) {
                 let user_signals = field_signals_from_entries(&entries);
                 if !user_signals.is_empty() {
-                    info!(count = user_signals.len(), "loaded user-defined field-name signals");
+                    info!(
+                        count = user_signals.len(),
+                        "loaded user-defined field-name signals"
+                    );
                 }
                 active_signals.extend(user_signals);
             }
@@ -6003,7 +6035,6 @@ fn run_sanitize(
 
     Ok(())
 }
-
 
 fn main() {
     match run() {
@@ -6708,9 +6739,18 @@ mod tests {
         };
         let script = build_hook_script(&args);
         assert!(script.contains(HOOK_MARKER), "marker must be present");
-        assert!(script.contains("--dry-run --fail-on-match"), "scan mode must use --dry-run --fail-on-match");
-        assert!(script.contains("SANITIZE_SKIP"), "escape hatch must be present");
-        assert!(script.starts_with("#!/bin/sh"), "must start with POSIX shebang");
+        assert!(
+            script.contains("--dry-run --fail-on-match"),
+            "scan mode must use --dry-run --fail-on-match"
+        );
+        assert!(
+            script.contains("SANITIZE_SKIP"),
+            "escape hatch must be present"
+        );
+        assert!(
+            script.starts_with("#!/bin/sh"),
+            "must start with POSIX shebang"
+        );
     }
 
     #[test]
@@ -6726,9 +6766,18 @@ mod tests {
             dry_run: false,
         };
         let script = build_hook_script(&args);
-        assert!(script.contains("--output ."), "sanitize mode must write output in place");
-        assert!(script.contains("git add"), "sanitize mode must re-stage files");
-        assert!(!script.contains("--dry-run"), "sanitize mode must not pass --dry-run");
+        assert!(
+            script.contains("--output ."),
+            "sanitize mode must write output in place"
+        );
+        assert!(
+            script.contains("git add"),
+            "sanitize mode must re-stage files"
+        );
+        assert!(
+            !script.contains("--dry-run"),
+            "sanitize mode must not pass --dry-run"
+        );
     }
 
     #[test]
@@ -6744,8 +6793,14 @@ mod tests {
             dry_run: false,
         };
         let script = build_hook_script(&args);
-        assert!(script.contains("while IFS=' ' read -r"), "pre-push must iterate stdin");
-        assert!(script.contains("--app 'gitlab'"), "app bundle must be quoted and forwarded");
+        assert!(
+            script.contains("while IFS=' ' read -r"),
+            "pre-push must iterate stdin"
+        );
+        assert!(
+            script.contains("--app 'gitlab'"),
+            "app bundle must be quoted and forwarded"
+        );
     }
 
     #[test]
@@ -6786,7 +6841,10 @@ mod tests {
             fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         remove_hook(&hook_path, "pre-commit").expect("remove should succeed");
-        assert!(!hook_path.exists(), "file should be deleted when it is entirely our hook");
+        assert!(
+            !hook_path.exists(),
+            "file should be deleted when it is entirely our hook"
+        );
     }
 
     #[test]
@@ -6797,9 +6855,15 @@ mod tests {
         let our_block = hook_script_pre_commit_scan("--use-default");
         fs::write(&hook_path, format!("{pre_existing}{our_block}")).unwrap();
         remove_hook(&hook_path, "pre-commit").expect("remove should succeed");
-        assert!(hook_path.exists(), "file should remain when other content is present");
+        assert!(
+            hook_path.exists(),
+            "file should remain when other content is present"
+        );
         let remaining = fs::read_to_string(&hook_path).unwrap();
-        assert!(remaining.contains("npm run lint"), "other hook content must be preserved");
+        assert!(
+            remaining.contains("npm run lint"),
+            "other hook content must be preserved"
+        );
         assert!(!remaining.contains(HOOK_MARKER), "our marker must be gone");
     }
 
@@ -6809,6 +6873,9 @@ mod tests {
         let hook_path = dir.path().join("pre-commit");
         fs::write(&hook_path, "#!/bin/sh\necho hello\n").unwrap();
         let result = remove_hook(&hook_path, "pre-commit");
-        assert!(result.is_err(), "should refuse to remove a hook we didn't install");
+        assert!(
+            result.is_err(),
+            "should refuse to remove a hook we didn't install"
+        );
     }
 }
