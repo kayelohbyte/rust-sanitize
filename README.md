@@ -254,10 +254,12 @@ For project-stable allowlist entries, add them directly to your secrets file usi
 
 ### Quick Start — Stdin Pipes
 
-You can pipe data directly into `sanitize`:
+When reading from stdin (no file arguments, or explicit `-` marker), sanitized
+output goes to **stdout** automatically. File inputs always produce a
+`<stem>-sanitized.<ext>` sibling file unless `-o` overrides the destination.
 
 ```bash
-# Pipe from grep with a plaintext secrets file:
+# Pipe from grep → sanitized output on stdout:
 grep "error" app.log | sanitize -s secrets.yaml
 
 # Pipe from grep with an encrypted secrets file (use env var since stdin is a pipe):
@@ -265,14 +267,25 @@ export SANITIZE_PASSWORD="my-password"
 grep "error" app.log | sanitize -s secrets.enc --encrypted-secrets
 
 # Read from stdin, write sanitized output to a file (plaintext secrets):
+# -f is required when the format cannot be inferred from a filename.
 cat data.csv | sanitize -s secrets.yaml -f csv -o clean.csv
 
-# Chain with other tools:
+# Explicit stdout for a file input (-o with no PATH, or -o -):
+sanitize data.log -s secrets.yaml -o -
+sanitize data.log -s secrets.yaml --output -
+
+# Chain with other tools (stdin → stdout → gzip):
 mysqldump mydb | sanitize -s secrets.yaml | gzip > dump.sql.gz
 
-# Mix stdin with file and archive inputs (stdin → stdout; files get per-file outputs):
+# Mix stdin with file and archive inputs:
+# stdin → stdout; file inputs → per-file <stem>-sanitized.<ext> siblings.
 cat extra.log | sanitize - backup.zip config.yaml -s secrets.yaml
 ```
+
+> **Format detection with stdin**: when the format cannot be inferred from a
+> filename (because there is none), use `-f`/`--format` to specify it:
+> `-f yaml`, `-f json`, `-f csv`, `-f log`, etc. Without `-f`, the scanner
+> falls back to byte-level pattern matching only (no structured field rules).
 
 ### Quick Start — Archive Entry Filtering (`--only` / `--exclude`)
 
@@ -1113,6 +1126,24 @@ sanitize data.csv -s s.enc --password -d
 sanitize config.yaml -s s.enc -P /run/secrets/pw --fail-on-match
 ```
 
+**Stream per-match findings as NDJSON for CI integration:**
+
+`--findings` emits one JSON object per file plus a summary line, suitable
+for `jq` filtering, SIEM ingest, or counting leaks by pattern label.
+Use an explicit path when sanitizing to stdout so the two streams don't mix:
+
+```bash
+# Write findings to a file, sanitized content to stdout:
+sanitize app.log -s secrets.yaml --findings findings.ndjson
+
+# Write findings to stdout only (dry-run or scan mode):
+sanitize app.log -s secrets.yaml --dry-run --findings
+
+# Count matches per pattern label in CI:
+sanitize app.log -s secrets.yaml --dry-run --findings | \
+  jq -r 'select(.type=="file") | .pattern_counts | to_entries[] | "\(.value)\t\(.key)"' | sort -rn
+```
+
 **Shannon entropy detection (catches high-entropy tokens beyond pattern matching):**
 
 ```bash
@@ -1180,12 +1211,13 @@ See [docs/cli-reference.md](docs/cli-reference.md) for the complete set of examp
 
 ## Limitations
 
+- **Structured-to-scanner handoff.** When a field-level profile is active and a `--secrets-file` is provided, values discovered in typed fields are automatically appended to that secrets file as `kind: literal` entries so the scanner pass can catch those same values in logs, comments, and unstructured text. This is intentional — disabling it weakens coverage. Pass `--no-structured-handoff` to suppress the write if needed. In CI pipelines, consider setting `no_structured_handoff: true` in `settings.yaml` or `.sanitize.toml`.
+
 - **No restore.** Replacements are one-way by design. There is no undo, decrypt-output, or reverse-mapping capability.
 - **Deterministic mode caveats.** Deterministic replacements require the same secrets key and the same secret values to produce identical output. Changing the secrets file or key produces entirely different replacements.
-- **Structured fallback.** Files exceeding structured processor size limits silently fall back to the streaming scanner. The streaming scanner performs byte-level regex replacement and does not understand document structure — it may match inside JSON keys, XML tags, or other structural elements.
-- **Structured file size limit.** Files exceeding `--max-structured-size` (default 256 MiB) fall back to the streaming scanner, which does not understand document structure.
+- **Structured processor size limit.** Files exceeding 256 MiB (archive entries) or `--max-structured-size` (standalone files) fall back to the streaming scanner. The scanner performs byte-level regex replacement without document awareness — it may match inside JSON keys or XML tags rather than just field values. In practice this limit is never reached by real configuration files; it is only relevant for large data dumps or log files serialized as JSON, which are better handled by the scanner anyway.
 - **Zeroization scope.** Zeroization covers secrets, HMAC keys, and mapping store keys. It does not cover incidental copies the Rust compiler may create (e.g. during optimization passes). This is an inherent limitation of safe Rust zeroization.
-- **Sequential archive processing.** Archive entries are processed sequentially (not in parallel) to preserve deterministic ordering.
+- **Large archive sequential fallback.** Zip and tar archives whose total uncompressed content exceeds 256 MiB are processed sequentially rather than in parallel to avoid holding the entire archive in memory. Output entry order is always deterministic regardless of thread count.
 - **Binary detection.** Entries detected as binary are skipped by default. Use `--include-binary` to override.
 
 ---

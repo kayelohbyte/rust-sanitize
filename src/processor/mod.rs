@@ -53,7 +53,7 @@ pub mod xml_proc;
 pub mod yaml_proc;
 
 // Re-export core types.
-pub use profile::{FieldRule, FileTypeProfile};
+pub use profile::{FieldNameSignal, FieldRule, FileTypeProfile, DEFAULT_FIELD_SIGNAL_THRESHOLD};
 pub use registry::ProcessorRegistry;
 
 use crate::category::Category;
@@ -245,6 +245,61 @@ pub(crate) fn pattern_matches(pattern: &str, key_path: &str) -> bool {
 
 use crate::allowlist::glob_matches;
 
+/// Compute Shannon entropy of `data` in bits per character.
+///
+/// Returns `0.0` for empty input. Uses a fixed 256-element frequency table
+/// so the cost is O(n) time and O(1) space regardless of alphabet size.
+#[inline]
+pub(crate) fn shannon_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for &b in data {
+        counts[b as usize] += 1;
+    }
+    let len = data.len() as f64;
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// Return the first [`FieldNameSignal`] whose key pattern matches `key`.
+///
+/// `key` is the **bare** field name (leaf key only, not the full dot-path).
+#[must_use]
+pub(crate) fn find_field_signal<'a>(
+    key: &str,
+    signals: &'a [FieldNameSignal],
+) -> Option<&'a FieldNameSignal> {
+    signals.iter().find(|sig| sig.matches_key(key))
+}
+
+/// Replace `value` via the mapping store when its entropy meets the signal's gate.
+///
+/// Returns `Some(replacement)` when the value's Shannon entropy is at or above
+/// `sig.threshold`, or `None` when the entropy is too low to be a real secret
+/// (e.g. `"Bearer"`, `"basic"`, `"true"`).
+pub(crate) fn replace_by_signal(
+    value: &str,
+    sig: &FieldNameSignal,
+    store: &MappingStore,
+) -> Result<Option<String>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if shannon_entropy(value.as_bytes()) < sig.threshold {
+        return Ok(None);
+    }
+    let replaced = store.get_or_insert(&sig.category, value)?;
+    Ok(Some(replaced.to_string()))
+}
+
 /// Return the first rule in `profile` whose pattern matches `key_path`.
 ///
 /// Supports exact matches and glob patterns — see [`pattern_matches`] for the
@@ -319,12 +374,21 @@ pub(crate) fn walk_tree<V: TreeNode>(
         if let Some(s) = v.as_str_mut() {
             if let Some(rule) = find_matching_rule(&path, profile) {
                 *s = replace_value(s, rule, store)?;
+            } else if let Some(sig) = find_field_signal(key, &profile.field_name_signals) {
+                if let Some(replaced) = replace_by_signal(s, sig, store)? {
+                    *s = replaced;
+                }
             }
         } else if v.is_scalar() {
             if let Some(rule) = find_matching_rule(&path, profile) {
                 let repr = v.scalar_to_string();
                 let replaced = replace_value(&repr, rule, store)?;
                 v.set_string(replaced);
+            } else if let Some(sig) = find_field_signal(key, &profile.field_name_signals) {
+                let repr = v.scalar_to_string();
+                if let Some(replaced) = replace_by_signal(&repr, sig, store)? {
+                    v.set_string(replaced);
+                }
             }
         } else {
             walk_tree(v, &path, profile, store, depth + 1, format_name)?;
@@ -332,4 +396,129 @@ pub(crate) fn walk_tree<V: TreeNode>(
         Ok(())
     })?;
     value.for_each_seq_item(|item| walk_tree(item, prefix, profile, store, depth + 1, format_name))
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::category::Category;
+
+    // ── shannon_entropy ──────────────────────────────────────────────────────
+
+    #[test]
+    fn entropy_empty_is_zero() {
+        assert_eq!(shannon_entropy(b""), 0.0);
+    }
+
+    #[test]
+    fn entropy_single_byte_is_zero() {
+        // All characters the same → zero entropy.
+        assert_eq!(shannon_entropy(b"aaaa"), 0.0);
+    }
+
+    #[test]
+    fn entropy_two_equal_symbols_is_one_bit() {
+        // "ab" repeated — 2 equally likely symbols → exactly 1.0 bit.
+        assert!((shannon_entropy(b"abababab") - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn entropy_high_for_random_hex() {
+        // 32-char hex string should be well above 3.5 bits/char.
+        let h = shannon_entropy(b"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1");
+        assert!(h > 3.5, "expected entropy > 3.5, got {h}");
+    }
+
+    #[test]
+    fn entropy_low_for_word() {
+        // "Bearer" uses only 5 distinct chars, should be below 3.0.
+        let h = shannon_entropy(b"Bearer");
+        assert!(h < 3.0, "expected entropy < 3.0, got {h}");
+    }
+
+    // ── FieldNameSignal::matches_key ─────────────────────────────────────────
+
+    #[test]
+    fn signal_matches_exact_key() {
+        let sig = FieldNameSignal::new("^password$", Category::AuthToken, None, 3.5).unwrap();
+        assert!(sig.matches_key("password"));
+        assert!(!sig.matches_key("db_password"));
+        assert!(!sig.matches_key("PASSWORD_HASH"));
+    }
+
+    #[test]
+    fn signal_match_is_case_insensitive() {
+        let sig = FieldNameSignal::new("^password$", Category::AuthToken, None, 3.5).unwrap();
+        assert!(sig.matches_key("PASSWORD"));
+        assert!(sig.matches_key("Password"));
+    }
+
+    #[test]
+    fn signal_alternation_pattern() {
+        let sig = FieldNameSignal::new(
+            r"^(password|secret|token)$",
+            Category::AuthToken,
+            None,
+            3.5,
+        )
+        .unwrap();
+        assert!(sig.matches_key("password"));
+        assert!(sig.matches_key("secret"));
+        assert!(sig.matches_key("token"));
+        assert!(!sig.matches_key("token_type"));
+    }
+
+    #[test]
+    fn signal_invalid_regex_returns_error() {
+        let result = FieldNameSignal::new("[invalid(", Category::AuthToken, None, 3.5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn signal_default_label_derived_from_pattern() {
+        let sig = FieldNameSignal::new("^secret$", Category::AuthToken, None, 3.5).unwrap();
+        assert_eq!(sig.label, "field-signal:^secret$");
+    }
+
+    #[test]
+    fn signal_custom_label_preserved() {
+        let sig = FieldNameSignal::new(
+            "^secret$",
+            Category::AuthToken,
+            Some("my-label".into()),
+            3.5,
+        )
+        .unwrap();
+        assert_eq!(sig.label, "my-label");
+    }
+
+    // ── find_field_signal ────────────────────────────────────────────────────
+
+    #[test]
+    fn find_returns_none_for_empty_signals() {
+        assert!(find_field_signal("password", &[]).is_none());
+    }
+
+    #[test]
+    fn find_returns_first_matching_signal() {
+        let s1 = FieldNameSignal::new("^password$", Category::AuthToken, Some("s1".into()), 3.0)
+            .unwrap();
+        let s2 =
+            FieldNameSignal::new("^token$", Category::AuthToken, Some("s2".into()), 3.5).unwrap();
+        let signals = vec![s1, s2];
+
+        let found = find_field_signal("token", &signals).unwrap();
+        assert_eq!(found.label, "s2");
+    }
+
+    #[test]
+    fn find_returns_none_when_no_match() {
+        let sig =
+            FieldNameSignal::new("^password$", Category::AuthToken, None, 3.5).unwrap();
+        assert!(find_field_signal("hostname", &[sig]).is_none());
+    }
 }

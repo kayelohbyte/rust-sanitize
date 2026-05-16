@@ -1,4 +1,4 @@
-//! Integration tests for the `--app` flag in the main sanitize flow and `--no-update-secrets`.
+//! Integration tests for the `--app` flag in the main sanitize flow and `--no-structured-handoff`.
 
 use std::fs;
 use std::process::Command;
@@ -139,11 +139,11 @@ fn app_bundle_unknown_name_fails() {
     );
 }
 
-/// 4. --no-update-secrets suppresses writing of any discovered-secrets file.
+/// 4. --no-structured-handoff suppresses writing of any discovered-secrets file.
 ///    With no -s flag, the tool should not write a sanitize-discovered.yaml
 ///    (or any similar auto-save file) into the working directory.
 #[test]
-fn no_update_secrets_does_not_write_discovered_file() {
+fn no_structured_handoff_does_not_write_discovered_file() {
     let dir = tempdir().unwrap();
     let profile = write_kv_profile(dir.path(), "profile.json");
     let input = write_cfg_input(dir.path(), "input.cfg");
@@ -154,7 +154,7 @@ fn no_update_secrets_does_not_write_discovered_file() {
             input.to_str().unwrap(),
             "--profile",
             profile.to_str().unwrap(),
-            "--no-update-secrets",
+            "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
         ])
@@ -166,22 +166,22 @@ fn no_update_secrets_does_not_write_discovered_file() {
 
     assert!(
         out.status.success(),
-        "expected exit 0 with --profile --no-update-secrets; stderr: {}",
+        "expected exit 0 with --profile --no-structured-handoff; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
     // No sanitize-discovered.yaml (or similar) should have been created in the
-    // temp dir since no --secrets-file was supplied and --no-update-secrets is set.
+    // temp dir since no --secrets-file was supplied and --no-structured-handoff is set.
     assert!(
         !dir.path().join("sanitize-discovered.yaml").exists(),
-        "sanitize-discovered.yaml should not be written when --no-update-secrets is set"
+        "sanitize-discovered.yaml should not be written when --no-structured-handoff is set"
     );
 }
 
-/// 5. --no-update-secrets with an existing secrets file leaves that file
+/// 5. --no-structured-handoff with an existing secrets file leaves that file
 ///    byte-for-byte identical after the run.
 #[test]
-fn no_update_secrets_with_secrets_file_does_not_mutate_secrets_file() {
+fn no_structured_handoff_with_secrets_file_does_not_mutate_secrets_file() {
     let dir = tempdir().unwrap();
     let profile = write_kv_profile(dir.path(), "profile.json");
     let input = write_cfg_input(dir.path(), "input.cfg");
@@ -198,7 +198,7 @@ fn no_update_secrets_with_secrets_file_does_not_mutate_secrets_file() {
             profile.to_str().unwrap(),
             "-s",
             secrets.to_str().unwrap(),
-            "--no-update-secrets",
+            "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
         ])
@@ -215,7 +215,7 @@ fn no_update_secrets_with_secrets_file_does_not_mutate_secrets_file() {
     let after_content = fs::read(&secrets).unwrap();
     assert_eq!(
         original_content, after_content,
-        "secrets file content should be unchanged when --no-update-secrets is set"
+        "secrets file content should be unchanged when --no-structured-handoff is set"
     );
 }
 

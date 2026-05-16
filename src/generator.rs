@@ -125,7 +125,7 @@ impl Default for RandomGenerator {
 
 impl ReplacementGenerator for RandomGenerator {
     fn generate(&self, category: &Category, original: &str) -> String {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut hash = [0u8; 32];
         rng.fill(&mut hash);
         format_replacement(category, &hash, original)

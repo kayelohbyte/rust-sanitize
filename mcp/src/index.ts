@@ -50,7 +50,7 @@ const SANITIZE_SECRETS_DIR = Deno.env.get("SANITIZE_SECRETS_DIR");
 // Keep in sync with version field in Cargo.toml.
 const SERVER_VERSION = "0.9.0";
 
-const NO_UPDATE_SECRETS_ARG = "--no-update-secrets";
+const NO_STRUCTURED_HANDOFF_ARG = "--no-structured-handoff";
 const TEMP_PREFIX = "sanitize-mcp-";
 
 // ---------------------------------------------------------------------------
@@ -97,6 +97,15 @@ function buildSubprocessEnv(extraEnv: Record<string, string>): Record<string, st
     if (k.startsWith("SANITIZE_")) allowed[k] = v;
   }
   return { ...allowed, SANITIZE_LOG: "error", ...extraEnv };
+}
+
+/**
+ * Read a report file produced by --report. JSON and SARIF are parsed into
+ * objects; HTML is returned as a raw string so the caller receives it intact.
+ */
+async function readReport(path: string, format?: string): Promise<unknown> {
+  const text = await Deno.readTextFile(path);
+  return format === "html" ? text : JSON.parse(text);
 }
 
 async function runSanitize(
@@ -459,8 +468,8 @@ async function toolSanitize(params: {
   const tmpDir = await Deno.makeTempDir({ prefix: TEMP_PREFIX });
   try {
     const env: Record<string, string> = {};
-    // --no-update-secrets: suppress writing sanitize-discovered.yaml to cwd.
-    const commonArgs: string[] = [NO_UPDATE_SECRETS_ARG];
+    // --no-structured-handoff: suppress writing sanitize-discovered.yaml to cwd.
+    const commonArgs: string[] = [NO_STRUCTURED_HANDOFF_ARG];
 
     if (params.format) commonArgs.push("--format", params.format);
 
@@ -516,9 +525,13 @@ async function toolSanitize(params: {
     // A report is generated whenever report:true or extract_context:true.
     let reportPath: string | undefined;
     if (params.report || params.extract_context) {
-      const rp = join(tmpDir, "report.json");
+      const ext = params.report_format === "sarif" ? "sarif"
+                : params.report_format === "html"  ? "html"
+                : "json";
+      const rp = join(tmpDir, `report.${ext}`);
       reportPath = rp;
       commonArgs.push("--report", rp);
+      if (params.report_format) commonArgs.push("--report-format", params.report_format);
     }
     if (params.extract_context) {
       commonArgs.push("--extract-context");
@@ -556,7 +569,7 @@ async function toolSanitize(params: {
         content = await Deno.readTextFile(outputPath);
       }
       if (reportPath) {
-        return { content, report: JSON.parse(await Deno.readTextFile(reportPath)) };
+        return { content, report: await readReport(reportPath, params.report_format) };
       }
       return { content };
     }
@@ -592,7 +605,7 @@ async function toolSanitize(params: {
     // When --llm is active, the formatted prompt is on stdout — return it directly.
     if (params.llm_template) {
       if (reportPath) {
-        return { content: result.stdout, report: JSON.parse(await Deno.readTextFile(reportPath)) };
+        return { content: result.stdout, report: await readReport(reportPath, params.report_format) };
       }
       return { content: result.stdout };
     }
@@ -619,7 +632,7 @@ async function toolSanitize(params: {
     }
 
     if (reportPath) {
-      return { results: fileResults, report: JSON.parse(await Deno.readTextFile(reportPath)) };
+      return { results: fileResults, report: await readReport(reportPath, params.report_format) };
     }
     return { results: fileResults };
   } finally {
@@ -678,7 +691,7 @@ async function toolScan(params: {
     const reportPath = join(tmpDir, "report.json");
 
     const env: Record<string, string> = {};
-    const commonArgs: string[] = ["--dry-run", "--report", reportPath, NO_UPDATE_SECRETS_ARG];
+    const commonArgs: string[] = ["--dry-run", "--report", reportPath, NO_STRUCTURED_HANDOFF_ARG];
 
     if (params.format) commonArgs.push("--format", params.format);
 
@@ -1153,7 +1166,13 @@ const SanitizeSchema = {
     .boolean()
     .optional()
     .describe(
-      "When true, also generate a JSON scan report alongside the sanitized output. The response becomes { content/results, report } instead of plain text. Use extract_context instead if you also want per-match log context.",
+      "When true, also generate a scan report alongside the sanitized output. The response becomes { content/results, report } instead of plain text. Use extract_context instead if you also want per-match log context.",
+    ),
+  report_format: z
+    .enum(["json", "sarif", "html"])
+    .optional()
+    .describe(
+      "Output format for the report (requires report: true). json (default): structured JSON; sarif: SARIF 2.1.0 for GitHub Advanced Security / VS Code / SIEMs; html: self-contained human-readable summary.",
     ),
   strict: z
     .boolean()

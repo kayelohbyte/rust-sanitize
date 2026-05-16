@@ -17,18 +17,24 @@ After scanning a chunk, only the overlap window is retained; the rest is flushed
 
 ### Archive Streaming
 
-Archives (tar, tar.gz, zip) are processed **entry-by-entry**:
+Archives (tar, tar.gz, zip) are processed entry-by-entry:
 
 1. Each entry is matched against file-type profiles for structured processing.
-2. If a structured processor matches and the entry is within `MAX_STRUCTURED_ENTRY_SIZE` (256 MiB), the entry is parsed and field values are replaced.
+2. If a structured processor matches and the entry is within `STRUCTURED_ENTRY_SIZE` (256 MiB), the entry is parsed and field values are replaced.
 3. Otherwise the entry is piped through the streaming scanner in chunks — no full-entry buffering.
 4. The archive is rebuilt with sanitized content and preserved metadata (timestamps, permissions, uid/gid).
 
-Archive entries are **sanitized in parallel** via rayon when the entry count meets the threshold (default: 4 file entries) and the archive is a top-level input (not a nested archive). The rebuilt archive is always written in the original entry order, so output is fully deterministic regardless of thread count. When multiple files are being processed in parallel at the file level (multi-input), per-entry parallelism is suppressed to avoid oversubscribing the thread pool.
+**Parallel processing.** Entries are sanitized concurrently via rayon when the archive's total uncompressed file data fits within the parallel cap (256 MiB) and the entry count meets the minimum threshold (default: 4). The rebuilt archive is always written in the original entry order — output is fully deterministic regardless of thread count.
+
+For archives exceeding the parallel cap, entries are processed sequentially. Tar archives use a speculative-buffer strategy: entries are buffered until the cap is reached, at which point already-buffered entries are processed from memory and the remainder stream directly without additional buffering. This bounds peak RAM to approximately `cap + one entry` regardless of total archive size.
+
+Per-entry parallelism is suppressed when multiple archive files are already being processed in parallel at the file level, to avoid oversubscribing the rayon thread pool.
 
 ### Structured File Size Caps
 
 Files exceeding the structured processor's size limit are automatically demoted to the streaming scanner. This ensures bounded memory regardless of individual file size.
+
+The 256 MiB cap is intentionally generous relative to real-world config files. No production configuration file (GitLab `gitlab.rb`, Kubernetes manifests, Terraform state, `docker-compose.yml`, `.env` files) approaches this size. Files that do exceed the limit in practice are typically large JSON log dumps, database exports, or ML datasets — none of which have the named secret fields that structured processing is designed for. The streaming scanner is the correct tool for those inputs: it catches API keys, JWTs, emails, and other typed secrets by pattern regardless of document structure.
 
 ### Pattern Count Limits
 
@@ -44,7 +50,7 @@ For 20–100 GB plain-text files, the streaming scanner maintains constant memor
 
 | Limit | Default Value | Configurable | Notes |
 |-------|---------------|--------------|-------|
-| Max structured file size | 256 MiB | `--max-structured-size` | Applies to JSON, YAML, XML, CSV, and archive entries routed to structured processors. Oversized files fall back to streaming. |
+| Max structured file size | 256 MiB | `--max-structured-size` | Applies to standalone JSON, YAML, XML, CSV files and archive entries routed to structured processors. Oversized inputs fall back to the streaming scanner. Real config files never approach this limit; the fallback is only relevant for large data dumps and log files. |
 | Max pattern count | 10 000 | Compile-time (`DEFAULT_MAX_PATTERNS`) | Bounds matcher automaton memory (`RegexSet` + Aho-Corasick). |
 | Max mapping store entries | 10 000 000 | `--max-mappings` | Prevents unbounded heap growth. |
 | Regex automaton size | 1 MiB | Compile-time (`REGEX_SIZE_LIMIT`) | Per-pattern limit. |

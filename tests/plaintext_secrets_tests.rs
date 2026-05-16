@@ -273,7 +273,7 @@ fn plaintext_load_bad_regex_returns_warnings() {
 #[test]
 fn plaintext_secrets_replace_email() {
     let store = make_hmac_store();
-    let (scanner, _) = StreamScanner::from_plaintext_secrets(
+    let (scanner, _, _) = StreamScanner::from_plaintext_secrets(
         sample_json().as_bytes(),
         Some(SecretsFormat::Json),
         store,
@@ -293,7 +293,7 @@ fn plaintext_secrets_replace_email() {
 #[test]
 fn plaintext_secrets_replace_literal() {
     let store = make_hmac_store();
-    let (scanner, _) = StreamScanner::from_plaintext_secrets(
+    let (scanner, _, _) = StreamScanner::from_plaintext_secrets(
         sample_json().as_bytes(),
         Some(SecretsFormat::Json),
         store,
@@ -313,7 +313,7 @@ fn plaintext_secrets_replace_literal() {
 #[test]
 fn plaintext_secrets_same_value_same_replacement() {
     let store = make_hmac_store();
-    let (scanner, _) = StreamScanner::from_plaintext_secrets(
+    let (scanner, _, _) = StreamScanner::from_plaintext_secrets(
         sample_json().as_bytes(),
         Some(SecretsFormat::Json),
         store,
@@ -334,7 +334,7 @@ fn plaintext_secrets_same_value_same_replacement() {
 #[test]
 fn plaintext_secrets_no_match_passes_through() {
     let store = make_hmac_store();
-    let (scanner, _) = StreamScanner::from_plaintext_secrets(
+    let (scanner, _, _) = StreamScanner::from_plaintext_secrets(
         sample_json().as_bytes(),
         Some(SecretsFormat::Json),
         store,
@@ -358,7 +358,7 @@ fn plaintext_deterministic_same_seed_same_output() {
     let build_scanner = || {
         let gen = Arc::new(HmacGenerator::new([99u8; 32]));
         let store = Arc::new(MappingStore::new(gen, None));
-        let (scanner, _) = StreamScanner::from_plaintext_secrets(
+        let (scanner, _, _) = StreamScanner::from_plaintext_secrets(
             sample_json().as_bytes(),
             Some(SecretsFormat::Json),
             store,
@@ -385,7 +385,7 @@ fn plaintext_deterministic_different_seeds_different_output() {
     let build_scanner_with_seed = |seed: [u8; 32]| {
         let gen = Arc::new(HmacGenerator::new(seed));
         let store = Arc::new(MappingStore::new(gen, None));
-        let (scanner, _) = StreamScanner::from_plaintext_secrets(
+        let (scanner, _, _) = StreamScanner::from_plaintext_secrets(
             sample_json().as_bytes(),
             Some(SecretsFormat::Json),
             store,
@@ -414,7 +414,7 @@ fn plaintext_deterministic_different_seeds_different_output() {
 #[test]
 fn plaintext_random_mode_replaces_correctly() {
     let store = make_random_store();
-    let (scanner, _) = StreamScanner::from_plaintext_secrets(
+    let (scanner, _, _) = StreamScanner::from_plaintext_secrets(
         sample_json().as_bytes(),
         Some(SecretsFormat::Json),
         store,
@@ -463,7 +463,7 @@ fn plaintext_and_encrypted_produce_same_patterns() {
 #[test]
 fn plaintext_secrets_detects_matches_for_fail_on_match() {
     let store = make_hmac_store();
-    let (scanner, _) = StreamScanner::from_plaintext_secrets(
+    let (scanner, _, _) = StreamScanner::from_plaintext_secrets(
         sample_json().as_bytes(),
         Some(SecretsFormat::Json),
         store,
@@ -482,7 +482,7 @@ fn plaintext_secrets_detects_matches_for_fail_on_match() {
 
     // Input without secrets.
     let store2 = make_hmac_store();
-    let (scanner2, _) = StreamScanner::from_plaintext_secrets(
+    let (scanner2, _, _) = StreamScanner::from_plaintext_secrets(
         sample_json().as_bytes(),
         Some(SecretsFormat::Json),
         store2,
@@ -535,7 +535,7 @@ fn plaintext_secrets_with_extra_patterns() {
     let extra = ScanPattern::from_regex(r"\b\d{3}-\d{2}-\d{4}\b", Category::Ssn, "ssn").unwrap();
 
     let store = make_hmac_store();
-    let (scanner, _) = StreamScanner::from_plaintext_secrets(
+    let (scanner, _, _) = StreamScanner::from_plaintext_secrets(
         sample_json().as_bytes(),
         Some(SecretsFormat::Json),
         store,
@@ -564,7 +564,7 @@ fn plaintext_secrets_concurrent_scans() {
     use std::thread;
 
     let store = make_hmac_store();
-    let (scanner, _) = StreamScanner::from_plaintext_secrets(
+    let (scanner, _, _) = StreamScanner::from_plaintext_secrets(
         sample_json().as_bytes(),
         Some(SecretsFormat::Json),
         Arc::clone(&store),
@@ -616,7 +616,7 @@ fn file_backed_plaintext_secrets() {
     // Load directly — no encryption step.
     let data = fs::read(&secrets_path).unwrap();
     let store = make_hmac_store();
-    let (scanner, warnings) = StreamScanner::from_plaintext_secrets(
+    let (scanner, warnings, _allow) = StreamScanner::from_plaintext_secrets(
         &data,
         Some(SecretsFormat::Json),
         store,
@@ -667,7 +667,7 @@ fn load_auto_toml_plaintext() {
 #[test]
 fn plaintext_secrets_large_file_processing() {
     let store = make_hmac_store();
-    let (scanner, _) = StreamScanner::from_plaintext_secrets(
+    let (scanner, _, _) = StreamScanner::from_plaintext_secrets(
         sample_json().as_bytes(),
         Some(SecretsFormat::Json),
         store,

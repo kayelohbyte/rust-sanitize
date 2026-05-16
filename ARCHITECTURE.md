@@ -1,6 +1,6 @@
 # Architecture
 
-> **sanitize-engine** v0.2.0 — Deterministic, one-way data sanitization.
+> **sanitize-engine** v0.9.0 — Deterministic, one-way data sanitization.
 
 This document describes the internal architecture of the sanitization
 engine.  It is aimed at contributors and operators who need to
@@ -87,6 +87,44 @@ Both subcommands resolve the password through a unified chain:
 `--password-file` (with Unix permission enforcement) →
 `SANITIZE_PASSWORD` env var → automatic interactive terminal prompt
 (masked input via `rpassword`).
+
+### MCP server
+
+The `mcp/` directory contains a TypeScript/Deno wrapper that exposes
+the CLI as a Model Context Protocol server:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  MCP client (Claude Code / Cursor / Claude.ai)      │
+└─────────────────────┬───────────────────────────────┘
+                      │  stdio (JSON-RPC 2.0)
+┌─────────────────────▼───────────────────────────────┐
+│  mcp/src/index.ts  (Deno / TypeScript)              │
+│  • Validates inputs with Zod schemas                │
+│  • Writes sensitive data to mode-0600 temp files    │
+│  • Spawns `sanitize` binary as a subprocess         │
+│  • Reads sanitized output from temp files           │
+│  • Returns results via MCP protocol                 │
+└─────────────────────┬───────────────────────────────┘
+                      │  subprocess (execve)
+┌─────────────────────▼───────────────────────────────┐
+│  sanitize  (Rust CLI binary)                        │
+│  All sensitive data processing happens here         │
+└─────────────────────────────────────────────────────┘
+```
+
+**Security boundary:** The TypeScript layer never inspects, logs, or
+retains the content it proxies. Sensitive data reaches the Rust binary
+via stdin or a temp file (never via argv), and leaves only via a
+temp-file path that the TypeScript layer reads once and then deletes.
+The Rust binary is the only component with access to secrets files,
+decryption keys, and pattern-matched values.
+
+**Namespace support:** When `SANITIZE_SECRETS_DIR` is set, the MCP
+server resolves a `namespace` parameter to a per-tenant directory
+containing `secrets.yaml` and an optional `profile.yaml`. Password
+files must be mode `0600` or `0400`. This enables safe multi-tenant
+deployments without exposing credentials to clients.
 
 ---
 

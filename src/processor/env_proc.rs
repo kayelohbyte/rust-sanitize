@@ -30,7 +30,10 @@
 
 use crate::error::{Result, SanitizeError};
 use crate::processor::limits::DEFAULT_INPUT_SIZE;
-use crate::processor::{find_matching_rule, replace_value, FileTypeProfile, Processor};
+use crate::processor::{
+    find_field_signal, find_matching_rule, replace_by_signal, replace_value, FileTypeProfile,
+    Processor,
+};
 use crate::store::MappingStore;
 
 /// Structured processor for `.env` / shell environment files.
@@ -131,6 +134,26 @@ impl Processor for EnvProcessor {
                     output.push_str(&replaced);
                 }
                 output.push('\n');
+            } else if let Some(sig) = find_field_signal(key, &profile.field_name_signals) {
+                if let Some(replaced) = replace_by_signal(inner_value, sig, store)? {
+                    output.push_str(indent);
+                    if has_export {
+                        output.push_str("export ");
+                    }
+                    output.push_str(key);
+                    output.push('=');
+                    if let Some(q) = quote_char {
+                        output.push(q);
+                        output.push_str(&replaced);
+                        output.push(q);
+                    } else {
+                        output.push_str(&replaced);
+                    }
+                    output.push('\n');
+                } else {
+                    output.push_str(line);
+                    output.push('\n');
+                }
             } else {
                 output.push_str(line);
                 output.push('\n');

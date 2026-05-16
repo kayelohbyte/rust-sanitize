@@ -81,6 +81,12 @@ const REGEX_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
 /// Maximum DFA cache size (bytes) per regex.
 const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
 
+/// Hard ceiling on the combined RegexSet automaton budget.
+/// The per-pattern limit is multiplied by the pattern count so that a large
+/// pattern set can still compile, but without this cap a pathological secrets
+/// file with 10 000 patterns could claim up to ~20 GiB of automaton memory.
+const REGEX_SET_SIZE_CAP: usize = 256 * 1024 * 1024; // 256 MiB
+
 /// Maximum number of patterns allowed in a single scanner (F-05 fix).
 /// The `RegexSet` automaton memory scales linearly with pattern count.
 /// With 1 MiB size/DFA limits per pattern, 10 000 patterns could
@@ -88,6 +94,14 @@ const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
 /// accidental resource exhaustion.  Override via
 /// [`StreamScanner::new_with_max_patterns`] if needed.
 const DEFAULT_MAX_PATTERNS: usize = 10_000;
+
+/// Label suffix that marks patterns as key-value-only.
+///
+/// Patterns whose label ends with this suffix are excluded from the streaming
+/// scanner pass (`for_structured_pass`) because the key-value processor
+/// resolves their values structurally and the scanner would produce spurious
+/// duplicate replacements on the surrounding syntax.
+pub const KV_LABEL_SUFFIX: &str = "_kv";
 
 /// Configuration for the streaming scanner.
 ///
@@ -194,6 +208,11 @@ pub struct ScanPattern {
     /// Stored so `StreamScanner` can build an Aho-Corasick automaton for
     /// fast SIMD literal matching instead of running the regex engine.
     literal: Option<String>,
+    /// Minimum window size (bytes) required to produce a match.
+    /// For literal patterns this equals the byte length of the literal itself.
+    /// For regex patterns this is `0` (no guaranteed minimum).
+    /// Used to skip `captures_iter` when the window is provably too short.
+    pub min_length: usize,
 }
 
 impl std::fmt::Debug for ScanPattern {
@@ -203,6 +222,7 @@ impl std::fmt::Debug for ScanPattern {
             .field("category", &self.category)
             .field("label", &self.label)
             .field("literal", &self.literal.as_deref())
+            .field("min_length", &self.min_length)
             .finish()
     }
 }
@@ -214,6 +234,7 @@ impl Clone for ScanPattern {
             category: self.category.clone(),
             label: self.label.clone(),
             literal: self.literal.clone(),
+            min_length: self.min_length,
         }
     }
 }
@@ -271,6 +292,7 @@ impl ScanPattern {
             category,
             label: label.into(),
             literal: None,
+            min_length: 0,
         })
     }
 
@@ -310,6 +332,7 @@ impl ScanPattern {
             regex,
             category,
             label: label.into(),
+            min_length: literal.len(),
             literal: Some(literal.to_owned()),
         })
     }
@@ -497,6 +520,13 @@ pub struct StreamScanner {
     config: ScanConfig,
 }
 
+/// Return type for scanner factory methods that load a secrets file.
+///
+/// Contains `(scanner, warnings, allow_patterns)` where `warnings` are
+/// non-fatal parse errors and `allow_patterns` are raw strings from
+/// `kind: allow` entries.
+type SecretsLoadResult = Result<(StreamScanner, Vec<(usize, SanitizeError)>, Vec<String>)>;
+
 impl StreamScanner {
     /// Create a new streaming scanner.
     ///
@@ -582,8 +612,10 @@ impl StreamScanner {
                 .map_err(compile_err)?
         } else {
             RegexSetBuilder::new(&regex_strs)
-                .size_limit(REGEX_SIZE_LIMIT * regex_strs.len().max(1))
-                .dfa_size_limit(REGEX_DFA_SIZE_LIMIT * regex_strs.len().max(1))
+                .size_limit((REGEX_SIZE_LIMIT * regex_strs.len().max(1)).min(REGEX_SET_SIZE_CAP))
+                .dfa_size_limit(
+                    (REGEX_DFA_SIZE_LIMIT * regex_strs.len().max(1)).min(REGEX_SET_SIZE_CAP),
+                )
                 .build()
                 .map_err(compile_err)?
         };
@@ -633,7 +665,7 @@ impl StreamScanner {
         let mut patterns: Vec<ScanPattern> = self
             .patterns
             .iter()
-            .filter(|p| !p.label.ends_with("_kv"))
+            .filter(|p| !p.label.ends_with(KV_LABEL_SUFFIX))
             .cloned()
             .collect();
         patterns.extend(extra);
@@ -892,8 +924,11 @@ impl StreamScanner {
     ///
     /// # Returns
     ///
-    /// `(scanner, warnings)` where `warnings` lists entries that
-    /// failed to compile (index + error).
+    /// `(scanner, warnings, allow_patterns)` where `warnings` lists entries
+    /// that failed to compile (index + error) and `allow_patterns` are the
+    /// raw strings from `kind: allow` entries — pass these to
+    /// [`AllowlistMatcher::new`](crate::allowlist::AllowlistMatcher) to
+    /// suppress replacements for known-safe values.
     ///
     /// # Errors
     ///
@@ -906,17 +941,24 @@ impl StreamScanner {
         store: Arc<MappingStore>,
         config: ScanConfig,
         extra_patterns: Vec<ScanPattern>,
-    ) -> Result<(Self, Vec<(usize, SanitizeError)>)> {
-        let ((mut patterns, warnings), _allow) =
+    ) -> SecretsLoadResult {
+        let ((mut patterns, warnings), allow) =
             crate::secrets::load_encrypted_secrets(encrypted_bytes, password, format)?;
         patterns.extend(extra_patterns);
         let scanner = Self::new(patterns, store, config)?;
-        Ok((scanner, warnings))
+        Ok((scanner, warnings, allow))
     }
 
     /// Create a scanner from a plaintext secrets file.
     ///
     /// Convenience for development / testing without encryption.
+    ///
+    /// # Returns
+    ///
+    /// `(scanner, warnings, allow_patterns)` where `allow_patterns` are the
+    /// raw strings from `kind: allow` entries — pass these to
+    /// [`AllowlistMatcher::new`](crate::allowlist::AllowlistMatcher) to
+    /// suppress replacements for known-safe values.
     ///
     /// # Errors
     ///
@@ -928,12 +970,12 @@ impl StreamScanner {
         store: Arc<MappingStore>,
         config: ScanConfig,
         extra_patterns: Vec<ScanPattern>,
-    ) -> Result<(Self, Vec<(usize, SanitizeError)>)> {
-        let ((mut patterns, warnings), _allow) =
+    ) -> SecretsLoadResult {
+        let ((mut patterns, warnings), allow) =
             crate::secrets::load_plaintext_secrets(plaintext, format)?;
         patterns.extend(extra_patterns);
         let scanner = Self::new(patterns, store, config)?;
-        Ok((scanner, warnings))
+        Ok((scanner, warnings, allow))
     }
 
     // ---- Internal helpers ----
@@ -986,6 +1028,9 @@ impl StreamScanner {
         // replacing the full match.
         for rs_idx in self.regex_set.matches(window) {
             let pattern_idx = self.regex_indices[rs_idx];
+            if window.len() < self.patterns[pattern_idx].min_length {
+                continue;
+            }
             for cap in self.patterns[pattern_idx].regex.captures_iter(window) {
                 let full = cap.get(0).expect("group 0 always exists");
                 let capture = cap.get(1).map(|g| (g.start(), g.end()));

@@ -105,6 +105,360 @@ impl SanitizeReport {
     pub fn to_json_pretty(&self) -> serde_json::Result<String> {
         serde_json::to_string_pretty(self)
     }
+
+    /// Serialize the report as SARIF 2.1.0 JSON.
+    ///
+    /// SARIF (Static Analysis Results Interchange Format) is consumed natively
+    /// by GitHub Advanced Security, VS Code Problems panel, and most SIEM
+    /// tooling. Results are file-level (no line numbers — the sanitize engine
+    /// operates on byte streams and does not record source positions).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`serde_json::Error`] if serialization fails.
+    pub fn to_sarif(&self) -> serde_json::Result<String> {
+        use serde_json::json;
+
+        // Collect unique named pattern IDs in sorted order → one SARIF rule each.
+        // When structured-processor-only runs produce matches without named patterns,
+        // add the synthetic "sensitive_value" rule to cover those results.
+        let needs_generic = self
+            .files
+            .iter()
+            .any(|f| f.matches > 0 && f.pattern_counts.is_empty());
+
+        let mut rule_ids: Vec<&str> = self
+            .summary
+            .pattern_counts
+            .keys()
+            .map(String::as_str)
+            .collect();
+        rule_ids.sort_unstable();
+        if needs_generic {
+            rule_ids.push("sensitive_value");
+        }
+
+        let rules: Vec<serde_json::Value> = rule_ids
+            .iter()
+            .map(|&id| {
+                let (short, full) = if id == "sensitive_value" {
+                    (
+                        "Sensitive value detected".to_owned(),
+                        "One or more sensitive values were detected during sanitization and \
+                         replaced with safe substitutes. No original values are stored. \
+                         Run with a secrets file or --use-default for per-pattern breakdown."
+                            .to_owned(),
+                    )
+                } else {
+                    (
+                        format!("Sensitive value of type '{}' detected", id),
+                        format!(
+                            "A sensitive value of type '{}' was detected during sanitization \
+                             and replaced with a safe substitute. No original value is stored.",
+                            id
+                        ),
+                    )
+                };
+                json!({
+                    "id": id,
+                    "name": sarif_rule_name(id),
+                    "shortDescription": { "text": short },
+                    "fullDescription": { "text": full },
+                    "defaultConfiguration": { "level": sarif_level(id) },
+                    "properties": { "tags": ["security"] }
+                })
+            })
+            .collect();
+
+        // One SARIF result per (file, pattern) pair where count > 0.
+        // Files with matches but no named breakdown emit a single generic result.
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        for f in &self.files {
+            let uri = path_to_sarif_uri(&f.path);
+            let location = json!([{
+                "physicalLocation": {
+                    "artifactLocation": { "uri": uri, "uriBaseId": "%SRCROOT%" }
+                }
+            }]);
+            if f.matches > 0 && f.pattern_counts.is_empty() {
+                results.push(json!({
+                    "ruleId": "sensitive_value",
+                    "level": "warning",
+                    "message": {
+                        "text": format!(
+                            "{} sensitive value(s) detected and sanitized.",
+                            f.matches
+                        )
+                    },
+                    "locations": location
+                }));
+            } else {
+                for (pattern, &count) in &f.pattern_counts {
+                    if count == 0 {
+                        continue;
+                    }
+                    results.push(json!({
+                        "ruleId": pattern,
+                        "level": sarif_level(pattern),
+                        "message": {
+                            "text": format!(
+                                "{} sensitive value(s) of type '{}' detected and sanitized.",
+                                count, pattern
+                            )
+                        },
+                        "locations": location
+                    }));
+                }
+            }
+        }
+
+        let artifacts: Vec<serde_json::Value> = self
+            .files
+            .iter()
+            .map(|f| {
+                let uri = path_to_sarif_uri(&f.path);
+                json!({ "location": { "uri": uri, "uriBaseId": "%SRCROOT%" } })
+            })
+            .collect();
+
+        let sarif = json!({
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {
+                    "driver": {
+                        "name": "sanitize-engine",
+                        "version": self.metadata.version,
+                        "informationUri": "https://github.com/kayelohbyte/sanitize-engine",
+                        "rules": rules
+                    }
+                },
+                "invocations": [{
+                    "executionSuccessful": true,
+                    "endTimeUtc": self.metadata.timestamp
+                }],
+                "results": results,
+                "artifacts": artifacts
+            }]
+        });
+
+        serde_json::to_string_pretty(&sarif)
+    }
+
+    /// Render the report as a self-contained HTML document.
+    ///
+    /// The output has no external dependencies (no CDN, no external fonts).
+    /// Includes a summary dashboard, per-pattern totals, and a per-file table.
+    /// Dark mode is supported via `prefers-color-scheme`.
+    #[must_use]
+    pub fn to_html(&self) -> String {
+        let s = &self.summary;
+        let m = &self.metadata;
+
+        // --- summary cards ---------------------------------------------------
+        let cards = format!(
+            r#"<div class="cards">
+  <div class="card"><div class="card-label">Files</div><div class="card-value">{}</div></div>
+  <div class="card"><div class="card-label">Matches</div><div class="card-value">{}</div></div>
+  <div class="card"><div class="card-label">Replacements</div><div class="card-value">{}</div></div>
+  <div class="card"><div class="card-label">Input</div><div class="card-value">{}</div></div>
+  <div class="card"><div class="card-label">Duration</div><div class="card-value">{} ms</div></div>
+</div>"#,
+            s.total_files,
+            s.total_matches,
+            s.total_replacements,
+            fmt_bytes(s.total_bytes_processed),
+            s.duration_ms,
+        );
+
+        // --- pattern breakdown table (only when there are matches) -----------
+        let patterns_section = if s.total_matches > 0 {
+            let mut sorted_patterns: Vec<(&String, &u64)> = s.pattern_counts.iter().collect();
+            sorted_patterns.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            let rows: String = sorted_patterns
+                .iter()
+                .map(|(pat, count)| {
+                    format!(
+                        "<tr><td>{}</td><td>{}</td></tr>\n",
+                        html_escape(pat),
+                        count
+                    )
+                })
+                .collect();
+            format!(
+                r#"<div class="section">
+<h2>Patterns detected</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Pattern</th><th>Total matches</th></tr></thead>
+<tbody>{}</tbody>
+</table></div></div>"#,
+                rows
+            )
+        } else {
+            String::new()
+        };
+
+        // --- per-file table --------------------------------------------------
+        let file_rows: String = self
+            .files
+            .iter()
+            .map(|f| {
+                let badges: String = {
+                    let mut pairs: Vec<(&String, &u64)> = f.pattern_counts.iter().collect();
+                    pairs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    pairs
+                        .iter()
+                        .filter(|(_, &c)| c > 0)
+                        .map(|(pat, count)| {
+                            format!(
+                                r#"<span class="badge {}">{}: {}</span>"#,
+                                sarif_badge_class(pat),
+                                html_escape(pat),
+                                count
+                            )
+                        })
+                        .collect()
+                };
+                let match_class = if f.matches > 0 { "count-positive" } else { "count-zero" };
+                format!(
+                    "<tr><td><code>{}</code></td><td class=\"{}\">{}</td><td>{}</td><td>{}</td></tr>\n",
+                    html_escape(&f.path),
+                    match_class,
+                    f.matches,
+                    html_escape(&f.method),
+                    badges,
+                )
+            })
+            .collect();
+
+        format!(
+            r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>sanitize-engine report</title>
+<style>
+:root{{--bg:#f8f9fa;--surface:#fff;--border:#dee2e6;--text:#212529;--muted:#6c757d;--accent:#0d6efd;--danger:#dc3545;--warn-col:#fd7e14;--success:#198754;--badge:#e9ecef;--code-bg:#f1f3f4}}
+@media(prefers-color-scheme:dark){{:root{{--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--danger:#f85149;--warn-col:#d29922;--success:#3fb950;--badge:#21262d;--code-bg:#1c2128}}}}
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.5;font-size:14px}}
+.container{{max-width:1100px;margin:0 auto;padding:24px 16px}}
+header{{margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}}
+h1{{font-size:1.4rem;font-weight:600}}
+.meta{{font-size:.8rem;color:var(--muted);margin-top:4px}}
+.section{{margin-bottom:28px}}
+h2{{font-size:.95rem;font-weight:600;margin-bottom:10px}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px}}
+.card{{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px}}
+.card-label{{font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}}
+.card-value{{font-size:1.4rem;font-weight:600;margin-top:2px}}
+.table-wrap{{overflow-x:auto}}
+table{{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:.85rem}}
+th{{text-align:left;padding:9px 12px;border-bottom:1px solid var(--border);font-weight:600;color:var(--muted);white-space:nowrap}}
+td{{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:top}}
+tr:last-child td{{border-bottom:none}}
+tr:hover td{{background:var(--badge)}}
+code{{background:var(--code-bg);border-radius:3px;padding:1px 4px;font-size:.8rem;word-break:break-all}}
+.badge{{display:inline-block;padding:1px 7px;border-radius:12px;font-size:.72rem;font-weight:500;background:var(--badge);margin:1px}}
+.badge-pii{{background:rgba(220,53,69,.12);color:var(--danger)}}
+.badge-warn{{background:rgba(253,126,20,.12);color:var(--warn-col)}}
+.count-zero{{color:var(--muted)}}
+.count-positive{{font-weight:600}}
+footer{{margin-top:40px;padding-top:16px;border-top:1px solid var(--border);font-size:.75rem;color:var(--muted)}}
+</style>
+</head>
+<body>
+<div class="container">
+<header>
+<h1>sanitize-engine report</h1>
+<div class="meta">version {version}&nbsp;·&nbsp;{timestamp}&nbsp;·&nbsp;{duration_ms} ms total</div>
+</header>
+{cards}
+{patterns_section}
+<div class="section">
+<h2>Files</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Path</th><th>Matches</th><th>Method</th><th>Patterns</th></tr></thead>
+<tbody>{file_rows}</tbody>
+</table></div></div>
+<footer>Generated by <strong>sanitize-engine {version}</strong> on {timestamp}</footer>
+</div>
+</body>
+</html>"#,
+            version = html_escape(&m.version),
+            timestamp = html_escape(&m.timestamp),
+            duration_ms = s.duration_ms,
+            cards = cards,
+            patterns_section = patterns_section,
+            file_rows = file_rows,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+/// Map a pattern name to a SARIF severity level.
+/// PII and credential categories → "error"; everything else → "warning".
+fn sarif_level(pattern: &str) -> &'static str {
+    match pattern {
+        "email" | "name" | "phone" | "credit_card" | "ssn" | "auth_token" | "jwt" => "error",
+        _ => "warning",
+    }
+}
+
+/// Convert a pattern name to a CamelCase SARIF rule name.
+/// e.g. "auth_token" → "AuthToken", "custom:password" → "CustomPassword"
+fn sarif_rule_name(pattern: &str) -> String {
+    pattern
+        .split(|c: char| c == '_' || c == ':' || c == '-')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        })
+        .collect()
+}
+
+/// Convert a file path to a SARIF URI (forward slashes, no percent-encoding).
+fn path_to_sarif_uri(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// CSS badge class for a pattern in the HTML report.
+fn sarif_badge_class(pattern: &str) -> &'static str {
+    match pattern {
+        "email" | "name" | "phone" | "credit_card" | "ssn" | "auth_token" | "jwt" => "badge-pii",
+        _ => "badge-warn",
+    }
+}
+
+/// Format a byte count as a human-readable string.
+fn fmt_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Escape HTML special characters to prevent injection in the HTML report.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// Tool metadata embedded in every report.
@@ -540,5 +894,219 @@ mod tests {
         let report = builder.finish();
         assert_eq!(report.summary.total_files, 5);
         assert_eq!(report.summary.total_matches, 10);
+    }
+
+    // ---- SARIF output ----
+
+    fn rich_report() -> SanitizeReport {
+        let builder = ReportBuilder::new(sample_metadata());
+        builder.record_file(FileReport {
+            path: "config.yaml".into(),
+            matches: 3,
+            replacements: 3,
+            bytes_processed: 1024,
+            bytes_output: 1100,
+            pattern_counts: HashMap::from([("auth_token".into(), 2u64), ("email".into(), 1u64)]),
+            method: "structured:yaml".into(),
+            log_context: None,
+        });
+        builder.record_file(FileReport {
+            path: "logs/app.log".into(),
+            matches: 0,
+            replacements: 0,
+            bytes_processed: 512,
+            bytes_output: 512,
+            pattern_counts: HashMap::new(),
+            method: "scanner".into(),
+            log_context: None,
+        });
+        builder.finish()
+    }
+
+    #[test]
+    fn sarif_is_valid_json() {
+        let sarif = rich_report().to_sarif().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+        assert_eq!(v["version"], "2.1.0");
+        assert_eq!(v["$schema"], "https://json.schemastore.org/sarif-2.1.0.json");
+    }
+
+    #[test]
+    fn sarif_contains_one_run() {
+        let v: serde_json::Value =
+            serde_json::from_str(&rich_report().to_sarif().unwrap()).unwrap();
+        assert_eq!(v["runs"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sarif_driver_name_and_version() {
+        let v: serde_json::Value =
+            serde_json::from_str(&rich_report().to_sarif().unwrap()).unwrap();
+        let driver = &v["runs"][0]["tool"]["driver"];
+        assert_eq!(driver["name"], "sanitize-engine");
+        assert_eq!(driver["version"], "0.2.0");
+    }
+
+    #[test]
+    fn sarif_rules_one_per_pattern() {
+        let v: serde_json::Value =
+            serde_json::from_str(&rich_report().to_sarif().unwrap()).unwrap();
+        let rules = v["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
+        // Two patterns: auth_token, email.
+        assert_eq!(rules.len(), 2);
+        let ids: Vec<&str> = rules.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"auth_token"));
+        assert!(ids.contains(&"email"));
+    }
+
+    #[test]
+    fn sarif_results_only_for_nonzero_counts() {
+        let v: serde_json::Value =
+            serde_json::from_str(&rich_report().to_sarif().unwrap()).unwrap();
+        let results = v["runs"][0]["results"].as_array().unwrap();
+        // logs/app.log has 0 matches → 0 results for it; config.yaml has 2 patterns.
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn sarif_result_level_pii_is_error() {
+        let v: serde_json::Value =
+            serde_json::from_str(&rich_report().to_sarif().unwrap()).unwrap();
+        let results = v["runs"][0]["results"].as_array().unwrap();
+        let email_result = results
+            .iter()
+            .find(|r| r["ruleId"] == "email")
+            .expect("email result missing");
+        assert_eq!(email_result["level"], "error");
+    }
+
+    #[test]
+    fn sarif_result_has_file_uri() {
+        let v: serde_json::Value =
+            serde_json::from_str(&rich_report().to_sarif().unwrap()).unwrap();
+        let results = v["runs"][0]["results"].as_array().unwrap();
+        for result in results {
+            let uri = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+                .as_str()
+                .unwrap();
+            assert_eq!(uri, "config.yaml");
+        }
+    }
+
+    #[test]
+    fn sarif_artifacts_all_files() {
+        let v: serde_json::Value =
+            serde_json::from_str(&rich_report().to_sarif().unwrap()).unwrap();
+        let artifacts = v["runs"][0]["artifacts"].as_array().unwrap();
+        assert_eq!(artifacts.len(), 2);
+        let uris: Vec<&str> = artifacts
+            .iter()
+            .map(|a| a["location"]["uri"].as_str().unwrap())
+            .collect();
+        assert!(uris.contains(&"config.yaml"));
+        assert!(uris.contains(&"logs/app.log"));
+    }
+
+    #[test]
+    fn sarif_windows_paths_use_forward_slash() {
+        let builder = ReportBuilder::new(sample_metadata());
+        builder.record_file(FileReport {
+            path: r"src\secrets\config.json".into(),
+            matches: 1,
+            replacements: 1,
+            bytes_processed: 100,
+            bytes_output: 110,
+            pattern_counts: HashMap::from([("auth_token".into(), 1u64)]),
+            method: "structured:json".into(),
+            log_context: None,
+        });
+        let report = builder.finish();
+        let v: serde_json::Value = serde_json::from_str(&report.to_sarif().unwrap()).unwrap();
+        let uri = v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
+            ["artifactLocation"]["uri"]
+            .as_str()
+            .unwrap();
+        assert_eq!(uri, "src/secrets/config.json");
+    }
+
+    // ---- HTML output ----
+
+    #[test]
+    fn html_is_valid_document() {
+        let html = rich_report().to_html();
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.contains("</html>"));
+        assert!(html.contains("<title>sanitize-engine report</title>"));
+    }
+
+    #[test]
+    fn html_contains_summary_stats() {
+        let html = rich_report().to_html();
+        // 1 file with matches + 1 clean file = 2 files total.
+        assert!(html.contains(">2<"), "file count missing");
+        // 3 total matches.
+        assert!(html.contains(">3<"), "match count missing");
+    }
+
+    #[test]
+    fn html_contains_file_paths() {
+        let html = rich_report().to_html();
+        assert!(html.contains("config.yaml"));
+        assert!(html.contains("logs/app.log"));
+    }
+
+    #[test]
+    fn html_escapes_special_chars() {
+        let builder = ReportBuilder::new(sample_metadata());
+        builder.record_file(FileReport {
+            path: "<script>alert(1)</script>".into(),
+            matches: 0,
+            replacements: 0,
+            bytes_processed: 0,
+            bytes_output: 0,
+            pattern_counts: HashMap::new(),
+            method: "scanner".into(),
+            log_context: None,
+        });
+        let html = builder.finish().to_html();
+        assert!(!html.contains("<script>alert(1)</script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn html_no_external_resources() {
+        let html = rich_report().to_html();
+        // No CDN links, no external stylesheets, no external scripts.
+        assert!(!html.contains("http://") || html.contains("https://json.schemastore.org") == false);
+        assert!(!html.contains("cdn."));
+        assert!(!html.contains("src=\"http"));
+        assert!(!html.contains("href=\"http"));
+    }
+
+    // ---- helpers ----
+
+    #[test]
+    fn sarif_rule_name_camel_case() {
+        assert_eq!(sarif_rule_name("auth_token"), "AuthToken");
+        assert_eq!(sarif_rule_name("email"), "Email");
+        assert_eq!(sarif_rule_name("custom:password"), "CustomPassword");
+        assert_eq!(sarif_rule_name("aws_arn"), "AwsArn");
+    }
+
+    #[test]
+    fn fmt_bytes_human_readable() {
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(1024), "1.0 KiB");
+        assert_eq!(fmt_bytes(1536), "1.5 KiB");
+        assert_eq!(fmt_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(fmt_bytes(1024 * 1024 * 1024), "1.0 GiB");
+    }
+
+    #[test]
+    fn html_escape_special_chars() {
+        assert_eq!(html_escape("a&b"), "a&amp;b");
+        assert_eq!(html_escape("<tag>"), "&lt;tag&gt;");
+        assert_eq!(html_escape("\"quote\""), "&quot;quote&quot;");
+        assert_eq!(html_escape("normal"), "normal");
     }
 }

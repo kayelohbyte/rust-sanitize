@@ -167,7 +167,7 @@ impl StrategyGenerator {
             }
             EntropyMode::Random => {
                 let mut buf = [0u8; 32];
-                rand::thread_rng().fill(&mut buf);
+                rand::rng().fill(&mut buf);
                 buf
             }
         }

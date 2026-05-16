@@ -3,10 +3,6 @@
 
 [advisories]
 version = 2
-# rand 0.8 unsoundness only triggers with a custom logger calling rand::rng()
-# during reseeding — this crate uses tracing (not log) and never calls rand
-# from a logger. Will upgrade to rand 0.9+ in a future release.
-ignore = ["RUSTSEC-2026-0097"]
 
 [licenses]
 version = 2

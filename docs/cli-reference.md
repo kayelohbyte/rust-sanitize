@@ -381,7 +381,11 @@ The directory name is the app name. `SANITIZE_APPS_DIR` overrides the default lo
 
 ### `sanitize init`
 
-One-time machine setup. Creates `~/.config/sanitize/secrets.yaml` (the auto-loaded default patterns file) and `~/.config/sanitize/settings.yaml` (persistent flag defaults). Run this once on a new machine; use `sanitize install-hook` to add a git hook to each repository separately.
+One-time machine setup. Creates the default patterns file and persistent settings file. Run this once on a new machine; use `sanitize install-hook` to add a git hook to each repository separately.
+
+Config directory locations:
+- **Unix/macOS**: `$XDG_CONFIG_HOME/sanitize/` → `~/.config/sanitize/`
+- **Windows**: `%APPDATA%\sanitize\` → `%USERPROFILE%\.config\sanitize\`
 
 ```
 sanitize init [OPTIONS]
@@ -434,7 +438,7 @@ sanitize scan [OPTIONS] [INPUT]...
 | `-p, --password` | Prompt for decryption password interactively. |
 | `-P, --password-file <FILE>` | Read decryption password from a file (0600/0400 only). |
 | `--app <APPS>` | App bundle(s) to load. Comma-separated. Repeatable. |
-| `--allow <PATTERN>` | Allow values through unchanged. Repeatable. |
+| `--allow <PATTERN>` | Allow values through unchanged. Repeatable. Supports exact strings, `*` glob wildcards, and `regex:<pattern>` for full regex matching. |
 | `--profile <FILE>` | Field-level profile for structured files. |
 | `--hidden` | Walk hidden files and directories. |
 | `--ignore-path <GLOB>` | Exclude paths by glob pattern. Repeatable. |
@@ -545,6 +549,8 @@ Example:
 
 Install a git hook that scans staged files for secrets before each commit (or push). Run `sanitize init` first to create the default secrets file that the hook relies on. The installed script is plain POSIX sh — no external dependencies beyond `sanitize` itself. If `sanitize` is not in PATH the hook silently passes so teammates who haven't installed the tool are unaffected.
 
+**Windows note:** The hook script uses POSIX sh syntax and requires [Git for Windows](https://git-scm.com/download/win) (which bundles Git Bash). It will not execute under cmd.exe or PowerShell directly. Git for Windows is the standard git installation on Windows and executes hooks via its bundled shell automatically.
+
 ```
 sanitize install-hook [OPTIONS]
 ```
@@ -588,7 +594,7 @@ sanitize install-hook --hook pre-push --remove   # remove a pre-push hook
 sanitize install-hook --global --remove          # remove a global hook
 ```
 
-#### Settings file (`~/.config/sanitize/settings.yaml`)
+#### Settings file
 
 Created by `sanitize init`. Provides persistent defaults for CLI flags — values here apply when the corresponding flag is not passed on the command line. An explicit CLI flag always wins.
 
@@ -600,10 +606,12 @@ Created by `sanitize init`. Provides persistent defaults for CLI flags — value
 #   - gitlab
 #   - kubernetes
 
-# Values that pass through unchanged; supports * glob patterns (--allow).
+# Values that pass through unchanged (--allow).
+# Supports exact strings, * glob wildcards, and regex:<pattern> for regex matching.
 # allow:
 #   - localhost
 #   - "*.internal"
+#   - "regex:^10\\.[0-9]+\\.[0-9]+\\.[0-9]+$"
 
 # Exit with code 2 when any secrets are found (--fail-on-match).
 # fail_on_match: false
@@ -611,8 +619,8 @@ Created by `sanitize init`. Provides persistent defaults for CLI flags — value
 # Abort on the first error instead of skipping (--strict).
 # strict: false
 
-# Suppress auto-save of discovered literal values (--no-update-secrets).
-# no_update_secrets: false
+# Suppress the structured-to-scanner value handoff (--no-structured-handoff).
+# no_structured_handoff: false
 
 # Worker thread count — omit for auto-detect (--threads).
 # threads: 4
@@ -656,8 +664,8 @@ secrets_file = "secrets.yaml"
 # Abort on first error instead of skipping (--strict).
 # strict = false
 
-# Suppress auto-save of discovered literal values (--no-update-secrets).
-# no_update_secrets = false
+# Suppress the structured-to-scanner value handoff (--no-structured-handoff).
+# no_structured_handoff = false
 
 # Path-level exclusions — matched relative to this file's location.
 # Patterns without a `/` also match the bare filename anywhere in the tree.
@@ -673,7 +681,7 @@ secrets_file = "secrets.yaml"
 
 **Apply order (lowest to highest precedence):**
 1. Built-in defaults
-2. `~/.config/sanitize/settings.yaml` (global, per-machine)
+2. `settings.yaml` in the sanitize config directory (global, per-machine)
 3. `.sanitize.toml` (per-project, committed to the repo)
 4. CLI flags (always win)
 
@@ -694,7 +702,7 @@ sanitize allow-test --allow <PATTERN>... [VALUE]...
 
 | Flag / Argument | Description |
 |-----------------|-------------|
-| `--allow <PATTERN>` | Allowlist pattern to test (repeatable). Supports exact strings and `*` glob wildcards. |
+| `--allow <PATTERN>` | Allowlist pattern to test (repeatable). Supports exact strings, `*` glob wildcards, and `regex:<pattern>` for regex matching. |
 | `[VALUE]...` | Values to test. If omitted, values are read from stdin one per line. |
 | `--json` | Output results as JSON instead of human-readable text. |
 | `-h, --help` | Print help. |
@@ -794,11 +802,11 @@ sanitize template --preset aws --overwrite
 | `-r, --report [PATH]` | `-r` | Write a JSON report to `PATH` (or stderr if no path given). Use `--report -` to write the report to stdout. The report includes: `metadata` (tool version, flags), `summary` (totals, `duration_ms`, `pattern_counts`), and a `files` array with per-file `matches`, `replacements`, byte counts, `pattern_counts`, and `method`. `pattern_counts` maps each pattern `label` to its scanner hit count; it is empty (`{}`) when all matches came from the structured-processor pass or when patterns have no label. |
 | `--strict` | | Abort on the first error instead of skipping and continuing. |
 | `-d, --deterministic` | `-d` | Use HMAC-deterministic replacements (reproducible across runs with the same password). Requires a password via `SANITIZE_PASSWORD`, `--password-file`, or `-p`. |
-| `--no-update-secrets` | | Suppress the automatic save of values discovered during a profile-driven run. By default, when a profile is active (`--profile` or `--app` with a profile) and `--secrets-file` is provided, any field values found are appended to that file as `kind: literal` entries so future runs can match them without re-running the profile. Pass this flag to disable that write. |
+| `--no-structured-handoff` | | Suppress the structured-to-scanner value handoff. By default, when a profile is active (`--profile` or `--app` with a profile) and `--secrets-file` is provided, values discovered in typed fields are appended to that file as `kind: literal` entries so the scanner pass can catch those same values in logs, comments, and unstructured text. Disabling this weakens coverage — the scanner will no longer see values that were only found by the structured pass. |
 | `--include-binary` | | Process entries that appear to be binary data (default: skip). |
 | `--threads <N>` | | Number of worker threads. When multiple input files are given, files are processed in parallel up to this limit. For a single archive input, entries are sanitized in parallel using the same budget. Defaults to the number of logical CPUs. Capped to available parallelism. |
 | `--max-archive-depth <N>` | | Maximum nesting depth for recursive archive processing (default: `3`, max: `10`). Each nesting level may buffer up to 256 MiB. Advanced flag — hidden from `--help` but works at runtime. |
-| `--profile <FILE>` | | Path to a file-type profile (JSON or YAML). Enables structured field-level sanitization for matched files. Discovered field values are automatically saved to the secrets file after the run (see `--no-update-secrets`). Loads common allow patterns (loopback IPs, `localhost`, `example.com`, nil UUID, etc.) so those values are never replaced. See [Structured Processing](structured-processing.md). |
+| `--profile <FILE>` | | Path to a file-type profile (JSON or YAML). Enables structured field-level sanitization for matched files. Discovered field values are automatically saved to the secrets file after the run (see `--no-structured-handoff`). Loads common allow patterns (loopback IPs, `localhost`, `example.com`, nil UUID, etc.) so those values are never replaced. See [Structured Processing](structured-processing.md). |
 | `--use-default` | | Use built-in balanced detection patterns without a secrets file. Covers API keys (AWS, GCP, GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab, SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM headers, password/secret key=value pairs, and credential URLs. Loads common allow patterns so loopback IPs, `localhost`, `example.com`, etc. are never replaced. Additive with `--secrets-file`, `--app`, and `--profile`. |
 | `--app <APPS>` | | Load built-in secrets patterns and structured field profiles for one or more applications. Comma-separated app names (e.g. `--app gitlab` or `--app gitlab,nginx`). Additive with `--use-default`, `--secrets-file`, and `--profile`. Loads common allow patterns. Run `sanitize apps` to list available app names. |
 | `--allow <PATTERN>` | | Allow a specific value through unchanged (repeatable). Matched values are not replaced and not recorded in the mapping store — they will pass through in every file processed in the same run. Supports exact strings and `*` glob patterns. Matching is **case-insensitive** by default (patterns and values are lowercased before comparison). Examples: `--allow localhost`, `--allow "*.internal"`, `--allow "192.168.1.*"`. Allowlist entries can also be placed in the secrets file as `kind: allow` entries. |
@@ -1200,7 +1208,7 @@ Compatibility formats: JSON and TOML remain fully supported for existing workflo
 
 Use `kind: allow` to suppress specific values from sanitization. A value matching an allow entry passes through the output unchanged and is **not** recorded in the mapping store — so it will not be propagated as a discovered literal in Phase 2.
 
-`pattern` supports exact strings and `*` glob wildcards (same as `--allow`). `category` and `label` are ignored.
+`pattern` supports three forms (same as `--allow`): exact strings, `*` glob wildcards, and `regex:<pattern>` for full regex matching. `category` and `label` are ignored.
 
 ```yaml
 # Exact match — the literal string "localhost" is never replaced:
@@ -1217,6 +1225,14 @@ Use `kind: allow` to suppress specific values from sanitization. A value matchin
 
 # Prefix+suffix glob — internal test accounts are not redacted:
 - pattern: "user-*@corp.com"
+  kind: allow
+
+# Regex — allow any RFC-1918 10.x.x.x address (anchored, digit-strict):
+- pattern: "regex:^10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$"
+  kind: allow
+
+# Regex — allow token-format strings like TOKEN-ABC-1234 (case-insensitive via (?i)):
+- pattern: "regex:(?i)^token-[a-z]{3}-[0-9]{4}$"
   kind: allow
 ```
 

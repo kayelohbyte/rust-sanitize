@@ -56,6 +56,15 @@ pub(crate) const STRUCTURED_ENTRY_SIZE: u64 = 256 * 1024 * 1024;
 /// entire archive in memory at once.
 pub(crate) const PARALLEL_ZIP_DATA_SIZE: u64 = 256 * 1024 * 1024;
 
+/// Maximum total buffered data size (bytes) across all tar entries before
+/// parallel processing is disabled.
+///
+/// Unlike zip, tar has no central directory so entry sizes cannot be known
+/// before reading. Entries are buffered speculatively; if the running total
+/// exceeds this cap the parallel path is abandoned and remaining entries are
+/// processed sequentially from the stream.
+pub(crate) const PARALLEL_TAR_DATA_SIZE: u64 = 256 * 1024 * 1024;
+
 /// Default maximum nesting depth for recursive archive processing.
 ///
 /// Depth 0 is the top-level archive. Nested archives at depths 1 through

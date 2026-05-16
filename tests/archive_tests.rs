@@ -1182,3 +1182,108 @@ fn tar_filter_default_passes_all() {
     assert_eq!(stats.entries_filtered, 0);
     assert_eq!(stats.files_processed, 3);
 }
+
+// ===========================================================================
+// Parallel tar processing
+// ===========================================================================
+
+/// Force the parallel path by lowering the threshold to 1.
+fn make_parallel_processor() -> ArchiveProcessor {
+    make_processor().with_parallel_threshold(1)
+}
+
+#[test]
+fn tar_parallel_replaces_secrets_in_all_entries() {
+    // Four entries — all contain a pattern match. Parallel path must sanitize
+    // every one of them, not just the first batch.
+    let proc = make_parallel_processor();
+    let input = make_tar(&[
+        ("a.txt", b"alice@corp.com"),
+        ("b.txt", b"bob@corp.com"),
+        ("c.txt", b"carol@corp.com"),
+        ("d.txt", b"alice@corp.com"),
+    ]);
+
+    let mut output = Vec::new();
+    let stats = proc.process_tar(&input[..], &mut output).unwrap();
+
+    let files = read_tar(&output);
+    assert_eq!(files.len(), 4, "all entries must appear in output");
+    for (name, content) in &files {
+        assert!(
+            !content.contains("alice@corp.com")
+                && !content.contains("bob@corp.com")
+                && !content.contains("carol@corp.com"),
+            "entry '{name}' still contains raw email: {content}"
+        );
+    }
+    assert_eq!(stats.files_processed, 4);
+}
+
+#[test]
+fn tar_parallel_entry_order_preserved() {
+    // Parallel processing must not reorder entries in the output archive.
+    let proc = make_parallel_processor();
+    let input = make_tar(&[
+        ("first.txt", b"alice@corp.com"),
+        ("second.txt", b"hello world"),
+        ("third.txt", b"bob@corp.com"),
+        ("fourth.txt", b"no secrets here"),
+    ]);
+
+    let mut output = Vec::new();
+    proc.process_tar(&input[..], &mut output).unwrap();
+
+    let files = read_tar(&output);
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["first.txt", "second.txt", "third.txt", "fourth.txt"]);
+}
+
+#[test]
+fn tar_parallel_dedup_same_secret_same_replacement() {
+    // Same value appearing in two entries must map to the same replacement,
+    // even when both entries are sanitized concurrently.
+    let proc = make_parallel_processor();
+    let input = make_tar(&[
+        ("a.txt", b"alice@corp.com"),
+        ("b.txt", b"alice@corp.com"),
+        ("c.txt", b"alice@corp.com"),
+        ("d.txt", b"alice@corp.com"),
+    ]);
+
+    let mut output = Vec::new();
+    proc.process_tar(&input[..], &mut output).unwrap();
+
+    let files = read_tar(&output);
+    let replacements: std::collections::HashSet<&str> =
+        files.iter().map(|(_, c)| c.as_str()).collect();
+    assert_eq!(
+        replacements.len(),
+        1,
+        "same secret should produce one unique replacement across all entries; got: {replacements:?}"
+    );
+    assert!(!files[0].1.contains("alice@corp.com"));
+}
+
+#[test]
+fn tar_parallel_preserves_passthrough_content() {
+    // Entries without matches must appear in output unchanged.
+    let proc = make_parallel_processor();
+    let input = make_tar(&[
+        ("clean1.txt", b"nothing sensitive"),
+        ("clean2.txt", b"also fine"),
+        ("secret.txt", b"alice@corp.com"),
+        ("clean3.txt", b"still clean"),
+    ]);
+
+    let mut output = Vec::new();
+    proc.process_tar(&input[..], &mut output).unwrap();
+
+    let files = read_tar(&output);
+    let by_name: std::collections::HashMap<&str, &str> =
+        files.iter().map(|(n, c)| (n.as_str(), c.as_str())).collect();
+    assert_eq!(by_name["clean1.txt"], "nothing sensitive");
+    assert_eq!(by_name["clean2.txt"], "also fine");
+    assert_eq!(by_name["clean3.txt"], "still clean");
+    assert!(!by_name["secret.txt"].contains("alice@corp.com"));
+}

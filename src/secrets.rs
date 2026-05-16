@@ -97,6 +97,10 @@ const PBKDF2_ITERATIONS: u32 = 600_000;
 /// Minimum ciphertext size: salt + nonce + at least 16-byte AES-GCM tag.
 const MIN_ENCRYPTED_LEN: usize = SALT_LEN + NONCE_LEN + 16;
 
+/// Maximum size of a plaintext secrets file accepted by [`parse_secrets`].
+/// Prevents OOM from accidentally passing a large binary or log file as secrets.
+const MAX_SECRETS_PLAINTEXT_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
 // ---------------------------------------------------------------------------
 // Secrets file schema
 // ---------------------------------------------------------------------------
@@ -117,7 +121,13 @@ pub struct SecretEntry {
     #[serde(default)]
     pub pattern: String,
 
-    /// `"regex"`, `"literal"`, or `"allow"`.
+    /// `"regex"`, `"literal"`, `"allow"`, `"entropy"`, or `"field-name"`.
+    ///
+    /// `"field-name"` entries are not compiled into scanner patterns — they
+    /// are extracted separately and injected into structured-processor profiles
+    /// as field-name signals.  The `pattern` field is a case-insensitive
+    /// regex matched against bare field/key names; `threshold` controls the
+    /// entropy gate (defaults to `3.5` bits/char when omitted).
     #[serde(default = "default_kind")]
     pub kind: String,
 
@@ -146,6 +156,26 @@ pub struct SecretEntry {
     /// ```
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
+
+    // ── Entropy-detection fields (only used when kind = "entropy") ──────────
+
+    /// Minimum token length to consider (default: 20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<usize>,
+
+    /// Maximum token length to consider (default: 200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<usize>,
+
+    /// Shannon entropy threshold in bits per character (default: 4.5).
+    /// Tokens whose entropy is at or above this value are flagged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f64>,
+
+    /// Character set the token must consist of exclusively.
+    /// `"alphanumeric"` (default), `"base64"`, `"hex"`, or `"any"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charset: Option<String>,
 }
 
 impl Drop for SecretEntry {
@@ -158,6 +188,9 @@ impl Drop for SecretEntry {
         }
         for v in &mut self.values {
             v.zeroize();
+        }
+        if let Some(ref mut s) = self.charset {
+            s.zeroize();
         }
     }
 }
@@ -202,8 +235,9 @@ impl SecretsFormat {
         let s = String::from_utf8_lossy(content);
         let trimmed = s.trim_start();
         if trimmed.starts_with('[') || trimmed.starts_with('{') {
-            // Could be JSON array/object or TOML table header — try JSON
-            // first since TOML arrays look different.
+            // `[` is ambiguous: JSON arrays and TOML table headers both start
+            // with it. We pick JSON here because our secrets files are never
+            // bare TOML tables, and a wrong guess produces a clear parse error.
             Self::Json
         } else if trimmed.starts_with('-') || trimmed.starts_with("---") {
             Self::Yaml
@@ -270,7 +304,7 @@ pub fn encrypt_secrets(plaintext: &[u8], password: &str) -> Result<Vec<u8>> {
         return Err(SanitizeError::SecretsEmptyPassword);
     }
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     // Generate random salt and nonce.
     let mut salt = [0u8; SALT_LEN];
@@ -350,14 +384,8 @@ pub fn decrypt_secrets(encrypted: &[u8], password: &str) -> Result<Zeroizing<Vec
 /// # Errors
 ///
 /// Returns [`SanitizeError::SecretsError`] if the plaintext is not
-/// valid UTF-8 or cannot be parsed in the specified format.
-/// Maximum size of a plaintext secrets file accepted by [`parse_secrets`].
-/// Prevents OOM from accidentally passing a large binary or log file as secrets.
-const MAX_SECRETS_PLAINTEXT_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
-
-/// # Errors
-/// Returns an error if the plaintext exceeds 10 MiB, the format cannot be
-/// detected, or the content fails to deserialise as the expected format.
+/// valid UTF-8 or cannot be parsed in the specified format, or if the
+/// file exceeds the [`MAX_SECRETS_PLAINTEXT_BYTES`] limit.
 pub fn parse_secrets(plaintext: &[u8], format: Option<SecretsFormat>) -> Result<Vec<SecretEntry>> {
     if plaintext.len() > MAX_SECRETS_PLAINTEXT_BYTES {
         return Err(SanitizeError::SecretsFormatError {
@@ -474,14 +502,6 @@ pub fn parse_category(s: &str) -> Category {
 
 /// Zeroize all sensitive string fields in a `Vec<SecretEntry>` and drop it.
 ///
-/// Called after pattern compilation so that secret values do not linger in
-/// heap memory beyond their point of use.
-fn zeroize_and_drop_entries(entries: Vec<SecretEntry>) {
-    // SecretEntry implements Drop with explicit zeroize() calls on every field,
-    // so dropping the Vec is sufficient — no manual loop needed.
-    drop(entries);
-}
-
 /// Extract allowlist patterns from a set of entries.
 ///
 /// Entries with `kind: allow` are returned as raw pattern strings to be
@@ -526,7 +546,11 @@ pub fn entries_to_patterns(entries: &[SecretEntry]) -> PatternCompileResult {
     let mut errors = Vec::new();
 
     for (i, entry) in entries.iter().enumerate() {
-        if entry.kind == "allow" || entry.pattern.is_empty() {
+        if entry.kind == "allow"
+            || entry.kind == "entropy"
+            || entry.kind == "field-name"
+            || entry.pattern.is_empty()
+        {
             continue;
         }
         let category = parse_category(&entry.category);
@@ -537,7 +561,17 @@ pub fn entries_to_patterns(entries: &[SecretEntry]) -> PatternCompileResult {
 
         let result = match entry.kind.as_str() {
             "regex" => ScanPattern::from_regex(&entry.pattern, category, label),
-            _ => ScanPattern::from_literal(&entry.pattern, category, label),
+            "literal" => ScanPattern::from_literal(&entry.pattern, category, label),
+            other => {
+                errors.push((
+                    i,
+                    SanitizeError::InvalidConfig(format!(
+                        "unknown kind {:?} — expected \"literal\", \"regex\", \"allow\", \"entropy\", or \"field-name\"",
+                        other
+                    )),
+                ));
+                continue;
+            }
         };
 
         match result {
@@ -603,7 +637,9 @@ pub fn load_encrypted_secrets(
     let entries = parse_secrets(&plaintext, format)?;
     let allow = extract_allow_patterns(&entries);
     let result = entries_to_patterns(&entries);
-    zeroize_and_drop_entries(entries);
+    // SecretEntry implements Drop with explicit zeroize() calls, so dropping
+    // the Vec is sufficient to scrub sensitive pattern data from heap memory.
+    drop(entries);
     Ok((result, allow))
 }
 
@@ -635,7 +671,9 @@ pub fn load_plaintext_secrets(
     let entries = parse_secrets(plaintext, format)?;
     let allow = extract_allow_patterns(&entries);
     let result = entries_to_patterns(&entries);
-    zeroize_and_drop_entries(entries);
+    // SecretEntry implements Drop with explicit zeroize() calls, so dropping
+    // the Vec is sufficient to scrub sensitive pattern data from heap memory.
+    drop(entries);
     Ok((result, allow))
 }
 
@@ -647,11 +685,19 @@ pub fn load_plaintext_secrets(
 ///
 /// Heuristic:
 /// 1. Files shorter than the minimum encrypted length cannot be valid
-///    ciphertext.
-/// 2. If the content is valid UTF-8, starts with a JSON/YAML/TOML
-///    marker, and successfully parses as `Vec<SecretEntry>`, it is
-///    considered plaintext.
-/// 3. Otherwise it is assumed to be encrypted.
+///    ciphertext — return `false`.
+/// 2. The **entire** content is checked for UTF-8 validity (not just the
+///    first few bytes). Only if the whole file is valid UTF-8 and begins
+///    with a recognisable plaintext marker (`[`, `{`, `-`, `#`) is it
+///    treated as plaintext — return `false`.
+/// 3. Binary content (not valid UTF-8) or UTF-8 without a plaintext
+///    marker is assumed to be encrypted — return `true`.
+///
+/// Note: a pathological plaintext file that is valid UTF-8 but lacks a
+/// leading plaintext marker (e.g. a TOML file whose first non-whitespace
+/// character is a letter) will be misclassified as encrypted and produce
+/// a `SecretsDecryptFailed` error. Use `force_plaintext: true` in
+/// [`load_secrets_auto`] to bypass the heuristic in that case.
 pub fn looks_encrypted(data: &[u8]) -> bool {
     if data.len() < MIN_ENCRYPTED_LEN {
         // Too short for a valid encrypted blob — might be a tiny
@@ -1196,5 +1242,42 @@ label = "openai_key"
         let entries = parse_secrets(json.as_bytes(), Some(SecretsFormat::Json)).unwrap();
         let patterns = extract_allow_patterns(&entries);
         assert_eq!(patterns, vec!["localhost"]);
+    }
+
+    // ── kind: field-name ─────────────────────────────────────────────────────
+
+    #[test]
+    fn field_name_entries_skipped_by_entries_to_patterns() {
+        // kind:field-name entries must not produce ScanPatterns — they are
+        // handled separately as FieldNameSignals injected into profiles.
+        let json = r#"[
+            {"pattern":"secret","kind":"literal"},
+            {"pattern":"^password$","kind":"field-name","threshold":3.0}
+        ]"#;
+        let entries = parse_secrets(json.as_bytes(), Some(SecretsFormat::Json)).unwrap();
+        let (patterns, errors) = entries_to_patterns(&entries);
+        assert_eq!(patterns.len(), 1, "only the literal entry should produce a pattern");
+        assert!(errors.is_empty());
+        assert_eq!(patterns[0].label(), "secret");
+    }
+
+    #[test]
+    fn field_name_entry_parses_correctly() {
+        let yaml = "- kind: field-name\n  pattern: \"^(password|secret)$\"\n  threshold: 3.0\n  label: my-signal\n";
+        let entries = parse_secrets(yaml.as_bytes(), Some(SecretsFormat::Yaml)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "field-name");
+        assert_eq!(entries[0].pattern, "^(password|secret)$");
+        assert_eq!(entries[0].threshold, Some(3.0));
+        assert_eq!(entries[0].label, Some("my-signal".into()));
+    }
+
+    #[test]
+    fn field_name_entry_not_extracted_as_allow_pattern() {
+        // kind:field-name entries must not bleed into the allowlist.
+        let json = r#"[{"pattern":"^password$","kind":"field-name"}]"#;
+        let entries = parse_secrets(json.as_bytes(), Some(SecretsFormat::Json)).unwrap();
+        let allow = extract_allow_patterns(&entries);
+        assert!(allow.is_empty());
     }
 }

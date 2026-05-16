@@ -87,16 +87,16 @@ use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
 
 use crate::processor::limits::{
-    DEFAULT_ARCHIVE_DEPTH, MAX_ARCHIVE_DEPTH, PARALLEL_ENTRY_THRESHOLD, PARALLEL_ZIP_DATA_SIZE,
-    STRUCTURED_ENTRY_SIZE,
+    DEFAULT_ARCHIVE_DEPTH, MAX_ARCHIVE_DEPTH, PARALLEL_ENTRY_THRESHOLD, PARALLEL_TAR_DATA_SIZE,
+    PARALLEL_ZIP_DATA_SIZE, STRUCTURED_ENTRY_SIZE,
 };
 
 // ---------------------------------------------------------------------------
 // Archive format enum
 // ---------------------------------------------------------------------------
 
-/// Per-entry result from parallel zip processing: `(meta_index, sanitized_bytes_and_stats)`.
-type ZipEntryResult = (usize, Result<(Vec<u8>, ArchiveStats)>);
+/// Per-entry result from parallel archive processing: `(source_index, sanitized_bytes_and_stats)`.
+type ParEntryResult = (usize, Result<(Vec<u8>, ArchiveStats)>);
 
 // ---------------------------------------------------------------------------
 // ArchiveFilter
@@ -797,94 +797,273 @@ impl ArchiveProcessor {
 
     /// Internal: process a tar archive at a given nesting depth.
     ///
-    /// Processes entries one at a time in a single streaming pass so only
-    /// one entry's bytes are in memory at a time (bounded by
-    /// `STRUCTURED_ENTRY_SIZE`). File-level parallelism (multiple
-    /// archive files processed concurrently by the outer loop) replaces
-    /// intra-archive parallelism, which required buffering the whole archive.
+    /// Uses a speculative-buffer strategy to decide between parallel and
+    /// sequential processing:
+    ///
+    /// - **Parallel** (total buffered data ≤ `PARALLEL_TAR_DATA_SIZE` AND
+    ///   file count ≥ threshold AND not inside a rayon worker): buffer all
+    ///   entries, sanitize concurrently with rayon, write in source order.
+    /// - **Sequential — buffered** (threshold not met but data fits): process
+    ///   entries from the in-memory buffer one at a time.
+    /// - **Sequential — streaming** (data exceeds cap mid-stream): process
+    ///   already-buffered entries from memory, then continue streaming the
+    ///   remainder of the archive without additional buffering.
+    ///
+    /// Unlike zip, tar has no central directory so sizes cannot be known before
+    /// reading. The buffer cap (`PARALLEL_TAR_DATA_SIZE`) bounds peak memory to
+    /// cap + one entry overhead regardless of archive size.
     fn process_tar_at_depth<R: Read, W: Write>(
         &self,
         reader: R,
         writer: W,
         depth: u32,
     ) -> Result<ArchiveStats> {
-        let mut stats = ArchiveStats::default();
+        struct TarEntry {
+            header: tar::Header,
+            path: String,
+            is_file: bool,
+            passes_filter: bool,
+            data: Vec<u8>,
+        }
+
         let mut archive = tar::Archive::new(reader);
         let mut builder = tar::Builder::new(writer);
+        let mut stats = ArchiveStats::default();
 
-        let entries_iter = archive
+        // --- Phase 1: speculative buffering ----------------------------------
+        // Stream entries into memory, tracking total file-data size.
+        // Stop buffering (but keep the last entry) if the cap is exceeded.
+        let mut entries_iter = archive
             .entries()
-            .map_err(|e| SanitizeError::ArchiveError(format!("read tar entries: {}", e)))?;
+            .map_err(|e| SanitizeError::ArchiveError(format!("read tar entries: {e}")))?;
 
-        for entry_result in entries_iter {
+        let mut buffered: Vec<TarEntry> = Vec::new();
+        let mut file_count: usize = 0;
+        let mut total_data: u64 = 0;
+        let mut overflowed = false;
+
+        for entry_result in entries_iter.by_ref() {
             let mut entry = entry_result
-                .map_err(|e| SanitizeError::ArchiveError(format!("read tar entry: {}", e)))?;
+                .map_err(|e| SanitizeError::ArchiveError(format!("read tar entry: {e}")))?;
 
             let header = entry.header().clone();
             let path = entry
                 .path()
-                .map_err(|e| SanitizeError::ArchiveError(format!("entry path: {}", e)))?
+                .map_err(|e| SanitizeError::ArchiveError(format!("entry path: {e}")))?
                 .to_string_lossy()
-                .to_string();
+                .into_owned();
             let is_file = header.entry_type().is_file();
+            let passes_filter = !is_file || self.filter.passes(&path);
 
-            if !is_file {
-                // Non-file entries (dirs, symlinks): pass through unchanged.
-                let mut data = Vec::new();
-                entry.read_to_end(&mut data).map_err(|e| {
-                    SanitizeError::ArchiveError(format!("read tar entry '{}': {}", path, e))
-                })?;
-                drop(entry);
-                builder.append(&header, &*data).map_err(|e| {
-                    SanitizeError::ArchiveError(format!("append non-file entry '{}': {}", path, e))
-                })?;
-                stats.entries_skipped += 1;
-                self.emit_progress(&stats, None, &path);
-                continue;
-            }
-
-            // File entry: pipe the entry reader directly into the sanitizer,
-            // eliminating the intermediate input buffer. Structured processors
-            // and nested-archive paths buffer internally as required; the
-            // scanner path works chunk-by-chunk so peak memory is the output
-            // buffer only (half the footprint of the previous approach).
-
-            // Filter: drop entries that do not match the --only/--exclude rules.
-            if !self.filter.passes(&path) {
-                stats.entries_filtered += 1;
-                continue;
-            }
-
-            let size_hint = header.size().ok();
-            let mut sanitized_buf: Vec<u8> = Vec::new();
-            let mut entry_stats = ArchiveStats::default();
-            self.sanitize_entry(
-                &path,
-                &mut entry,
-                &mut sanitized_buf,
-                &mut entry_stats,
-                size_hint,
-                depth,
-            )?;
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .map_err(|e| SanitizeError::ArchiveError(format!("read entry '{path}': {e}")))?;
             drop(entry);
 
-            let mut new_header = header.clone();
-            new_header.set_size(sanitized_buf.len() as u64);
-            new_header.set_cksum();
+            if is_file && passes_filter {
+                file_count += 1;
+                total_data = total_data.saturating_add(data.len() as u64);
+            }
 
-            builder.append(&new_header, &*sanitized_buf).map_err(|e| {
-                SanitizeError::ArchiveError(format!("append entry '{}': {}", path, e))
-            })?;
-            drop(sanitized_buf);
+            buffered.push(TarEntry {
+                header,
+                path,
+                is_file,
+                passes_filter,
+                data,
+            });
 
-            stats.merge(&entry_stats);
-            stats.files_processed += 1;
-            self.emit_progress(&stats, None, &path);
+            if total_data > PARALLEL_TAR_DATA_SIZE {
+                overflowed = true;
+                break;
+            }
+        }
+
+        // --- Phase 2: choose strategy ----------------------------------------
+        let use_parallel = !overflowed
+            && file_count >= self.parallel_threshold
+            && rayon::current_thread_index().is_none();
+
+        if use_parallel {
+            // --- Parallel path -----------------------------------------------
+            // Sanitize all file entries concurrently; write in source order.
+            let file_indices: Vec<usize> = buffered
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.is_file && e.passes_filter)
+                .map(|(i, _)| i)
+                .collect();
+
+            let results: Vec<ParEntryResult> = file_indices
+                .into_par_iter()
+                .map(|i| {
+                    let e = &buffered[i];
+                    let size_hint = e.header.size().ok();
+                    (
+                        i,
+                        self.sanitize_entry_bytes(&e.path, &e.data, size_hint, depth),
+                    )
+                })
+                .collect();
+
+            let mut sanitized: Vec<Option<(Vec<u8>, ArchiveStats)>> =
+                vec![None; buffered.len()];
+            for (i, r) in results {
+                sanitized[i] = Some(r?);
+            }
+
+            for (i, entry) in buffered.iter().enumerate() {
+                if !entry.is_file {
+                    builder
+                        .append(&entry.header, entry.data.as_slice())
+                        .map_err(|e| {
+                            SanitizeError::ArchiveError(format!(
+                                "append '{}': {e}",
+                                entry.path
+                            ))
+                        })?;
+                    stats.entries_skipped += 1;
+                    self.emit_progress(&stats, None, &entry.path);
+                    continue;
+                }
+                if !entry.passes_filter {
+                    stats.entries_filtered += 1;
+                    self.emit_progress(&stats, None, &entry.path);
+                    continue;
+                }
+
+                let (sanitized_buf, entry_stats) =
+                    sanitized[i].take().expect("parallel result missing");
+                stats.merge(&entry_stats);
+
+                let mut new_header = entry.header.clone();
+                new_header.set_size(sanitized_buf.len() as u64);
+                new_header.set_cksum();
+                builder
+                    .append(&new_header, sanitized_buf.as_slice())
+                    .map_err(|e| {
+                        SanitizeError::ArchiveError(format!("append '{}': {e}", entry.path))
+                    })?;
+                stats.files_processed += 1;
+                self.emit_progress(&stats, None, &entry.path);
+            }
+        } else {
+            // --- Sequential path ---------------------------------------------
+            // Process buffered entries first, then stream the remainder.
+
+            // Helper: write one buffered entry to the builder.
+            let write_buffered =
+                |entry: &TarEntry,
+                 builder: &mut tar::Builder<W>,
+                 stats: &mut ArchiveStats,
+                 processor: &ArchiveProcessor| -> Result<()> {
+                    if !entry.is_file {
+                        builder
+                            .append(&entry.header, entry.data.as_slice())
+                            .map_err(|e| {
+                                SanitizeError::ArchiveError(format!(
+                                    "append '{}': {e}",
+                                    entry.path
+                                ))
+                            })?;
+                        stats.entries_skipped += 1;
+                        processor.emit_progress(stats, None, &entry.path);
+                        return Ok(());
+                    }
+                    if !entry.passes_filter {
+                        stats.entries_filtered += 1;
+                        processor.emit_progress(stats, None, &entry.path);
+                        return Ok(());
+                    }
+                    let size_hint = entry.header.size().ok();
+                    let (sanitized_buf, entry_stats) =
+                        processor.sanitize_entry_bytes(&entry.path, &entry.data, size_hint, depth)?;
+                    stats.merge(&entry_stats);
+                    let mut new_header = entry.header.clone();
+                    new_header.set_size(sanitized_buf.len() as u64);
+                    new_header.set_cksum();
+                    builder
+                        .append(&new_header, sanitized_buf.as_slice())
+                        .map_err(|e| {
+                            SanitizeError::ArchiveError(format!("append '{}': {e}", entry.path))
+                        })?;
+                    stats.files_processed += 1;
+                    processor.emit_progress(stats, None, &entry.path);
+                    Ok(())
+                };
+
+            for entry in &buffered {
+                write_buffered(entry, &mut builder, &mut stats, self)?;
+            }
+            drop(buffered);
+
+            // Stream remaining entries when the buffer cap was exceeded.
+            if overflowed {
+                for entry_result in entries_iter {
+                    let mut entry = entry_result.map_err(|e| {
+                        SanitizeError::ArchiveError(format!("read tar entry: {e}"))
+                    })?;
+
+                    let header = entry.header().clone();
+                    let path = entry
+                        .path()
+                        .map_err(|e| SanitizeError::ArchiveError(format!("entry path: {e}")))?
+                        .to_string_lossy()
+                        .into_owned();
+                    let is_file = header.entry_type().is_file();
+
+                    if !is_file {
+                        let mut data = Vec::new();
+                        entry.read_to_end(&mut data).map_err(|e| {
+                            SanitizeError::ArchiveError(format!("read '{path}': {e}"))
+                        })?;
+                        drop(entry);
+                        builder.append(&header, data.as_slice()).map_err(|e| {
+                            SanitizeError::ArchiveError(format!("append '{path}': {e}"))
+                        })?;
+                        stats.entries_skipped += 1;
+                        self.emit_progress(&stats, None, &path);
+                        continue;
+                    }
+
+                    if !self.filter.passes(&path) {
+                        stats.entries_filtered += 1;
+                        continue;
+                    }
+
+                    let size_hint = header.size().ok();
+                    let mut sanitized_buf = Vec::new();
+                    let mut entry_stats = ArchiveStats::default();
+                    self.sanitize_entry(
+                        &path,
+                        &mut entry,
+                        &mut sanitized_buf,
+                        &mut entry_stats,
+                        size_hint,
+                        depth,
+                    )?;
+                    drop(entry);
+
+                    let mut new_header = header.clone();
+                    new_header.set_size(sanitized_buf.len() as u64);
+                    new_header.set_cksum();
+                    builder
+                        .append(&new_header, sanitized_buf.as_slice())
+                        .map_err(|e| {
+                            SanitizeError::ArchiveError(format!("append '{path}': {e}"))
+                        })?;
+
+                    stats.merge(&entry_stats);
+                    stats.files_processed += 1;
+                    self.emit_progress(&stats, None, &path);
+                }
+            }
         }
 
         builder
             .finish()
-            .map_err(|e| SanitizeError::ArchiveError(format!("finalize tar: {}", e)))?;
+            .map_err(|e| SanitizeError::ArchiveError(format!("finalize tar: {e}")))?;
 
         Ok(stats)
     }
@@ -1052,7 +1231,7 @@ impl ArchiveProcessor {
                 file_entries.push(ZipEntry { meta_idx: i, data });
             }
 
-            let results: Vec<ZipEntryResult> = file_entries
+            let results: Vec<ParEntryResult> = file_entries
                 .into_par_iter()
                 .map(|e| {
                     let meta = &metas[e.meta_idx];

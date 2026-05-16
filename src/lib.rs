@@ -160,7 +160,10 @@ pub use processor::archive::{
     ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress, ArchiveStats,
 };
 pub use processor::limits::DEFAULT_ARCHIVE_DEPTH;
-pub use processor::{FieldRule, FileTypeProfile, Processor, ProcessorRegistry};
+pub use processor::{
+    FieldNameSignal, FieldRule, FileTypeProfile, Processor, ProcessorRegistry,
+    DEFAULT_FIELD_SIGNAL_THRESHOLD,
+};
 pub use report::{FileReport, ReportBuilder, ReportMetadata, SanitizeReport};
 pub use scanner::{ScanConfig, ScanPattern, ScanProgress, ScanStats, StreamScanner};
 pub use secrets::{

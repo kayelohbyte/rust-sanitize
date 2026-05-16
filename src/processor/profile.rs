@@ -5,7 +5,140 @@
 
 use crate::category::Category;
 use glob::Pattern;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// FieldNameSignal
+// ---------------------------------------------------------------------------
+
+/// Default Shannon entropy threshold (bits per character) for built-in field-name signals.
+///
+/// Values whose entropy is **below** this threshold are left unchanged even
+/// when their key name matches a sensitive keyword, preventing false positives
+/// on enum-like values such as `token_type: Bearer` or `auth: basic`.
+///
+/// Override per signal in the secrets file with `threshold: <f64>`, or disable
+/// the heuristic entirely with `--no-field-signal`:
+///
+/// ```yaml
+/// # Lower threshold: catch more, including weaker secrets
+/// - kind: field-name
+///   pattern: "^(password|secret)$"
+///   threshold: 3.0
+///
+/// # Higher threshold: only flag high-entropy tokens
+/// - kind: field-name
+///   pattern: "^(token|key)$"
+///   threshold: 4.0
+/// ```
+pub const DEFAULT_FIELD_SIGNAL_THRESHOLD: f64 = 3.5;
+
+/// A field-name–based heuristic signal used during structured processing.
+///
+/// When no explicit [`FieldRule`] covers a key, the processor checks the bare
+/// key name against all active signals.  If a signal matches **and** the
+/// value's Shannon entropy meets or exceeds `threshold`, the value is replaced
+/// using `category` — as if an explicit rule had been defined.
+///
+/// # Entropy threshold guidance
+///
+/// | Threshold | Behaviour |
+/// |-----------|-----------|
+/// | **3.0** | Catches most secrets including moderately weak ones; recommended for high-confidence keywords (`password`, `secret`) |
+/// | **3.5** | Balanced default — skips plain enum values like `Bearer`, `basic`, `true` |
+/// | **4.0** | Conservative — only high-entropy tokens; use when false-positive rate matters |
+///
+/// # Configuring via secrets file
+///
+/// Add `kind: field-name` entries to your secrets file.  The `pattern` field
+/// is a case-insensitive regex matched against the **bare key name** (not the
+/// full dot-path).  `threshold` defaults to [`DEFAULT_FIELD_SIGNAL_THRESHOLD`]
+/// when omitted.
+///
+/// ```yaml
+/// # Strong signal: flag any `password`/`secret`/`private_key` with entropy ≥ 3.0
+/// - kind: field-name
+///   pattern: "^(password|passwd|secret|private_key|client_secret)$"
+///   category: custom:credential
+///   label: my-strong-signals
+///   threshold: 3.0
+///
+/// # Medium signal: flag `token`/`api_key` only when value looks like a real token
+/// - kind: field-name
+///   pattern: "^(token|api_key|access_key)$"
+///   category: custom:credential
+///   threshold: 3.5
+/// ```
+///
+/// Suppress false positives on specific values with `kind: allow`:
+///
+/// ```yaml
+/// - kind: allow
+///   values: ["Bearer", "basic", "oauth2", "true", "false"]
+/// ```
+///
+/// # Built-in defaults
+///
+/// When `--use-default` or `--app` is active, two built-in signals are
+/// injected automatically (unless `--no-field-signal` is passed):
+///
+/// - **Strong** (`threshold: 3.0`): `password`, `passwd`, `secret`,
+///   `private_key`, `api_secret`, `client_secret`
+/// - **Medium** (`threshold: 3.5`): `api_key`, `access_key`, `auth_token`,
+///   `token`, `signing_key`, `encryption_key`, `credential`, `cert`
+#[derive(Debug, Clone)]
+pub struct FieldNameSignal {
+    /// Original pattern string — shown in error messages and log output.
+    pub key_pattern: String,
+    /// Case-insensitive regex compiled from `key_pattern`.
+    pub(crate) key_regex: Regex,
+    /// Replacement category applied to values that pass the entropy gate.
+    pub category: Category,
+    /// Label used in findings and reports.
+    /// Defaults to `"field-signal:<key_pattern>"`.
+    pub label: String,
+    /// Shannon entropy threshold in bits per character.
+    ///
+    /// Values **below** this threshold are left unchanged.
+    /// See the table above and [`DEFAULT_FIELD_SIGNAL_THRESHOLD`].
+    pub threshold: f64,
+}
+
+impl FieldNameSignal {
+    /// Construct a new signal, compiling `key_pattern` as a case-insensitive regex.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable error string if `key_pattern` is not a valid regex.
+    pub fn new(
+        key_pattern: impl Into<String>,
+        category: Category,
+        label: Option<String>,
+        threshold: f64,
+    ) -> Result<Self, String> {
+        let key_pattern = key_pattern.into();
+        let key_regex = regex::RegexBuilder::new(&key_pattern)
+            .case_insensitive(true)
+            .build()
+            .map_err(|e| format!("field-name signal pattern {:?}: {e}", key_pattern))?;
+        let label = label.unwrap_or_else(|| format!("field-signal:{}", key_pattern));
+        Ok(Self {
+            key_pattern,
+            key_regex,
+            category,
+            label,
+            threshold,
+        })
+    }
+
+    /// Returns `true` if `key` (bare field name, not a dot-path) matches this signal.
+    #[inline]
+    #[must_use]
+    pub fn matches_key(&self, key: &str) -> bool {
+        self.key_regex.is_match(key)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FieldRule
@@ -180,6 +313,13 @@ pub struct FileTypeProfile {
     /// Free-form options passed to the processor (e.g. delimiter, comment chars).
     #[serde(default)]
     pub options: std::collections::HashMap<String, String>,
+
+    /// Field-name signals injected at runtime from `kind: field-name` secrets
+    /// entries and from built-in defaults when `--use-default` or `--app` is
+    /// active.  Never serialized to or deserialized from the profile file on
+    /// disk — configure signals in your secrets file instead.
+    #[serde(skip)]
+    pub field_name_signals: Vec<FieldNameSignal>,
 }
 
 impl FileTypeProfile {
@@ -193,6 +333,7 @@ impl FileTypeProfile {
             exclude: Vec::new(),
             fields,
             options: std::collections::HashMap::new(),
+            field_name_signals: Vec::new(),
         }
     }
 

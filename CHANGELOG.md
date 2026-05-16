@@ -95,9 +95,9 @@ contract and MSRV policy.
 
 ### Changed
 
-- **`--update-secrets` replaced by `--no-update-secrets`** — saving discovered
+- **`--update-secrets` replaced by `--no-structured-handoff`** — saving discovered
   field values to the secrets file is now the default when a profile is active
-  (`--profile` or `--app` with a profile). Pass `--no-update-secrets` to
+  (`--profile` or `--app` with a profile). Pass `--no-structured-handoff` to
   suppress the write. The old `--update-secrets` flag is removed.
 
 - **Common allow patterns apply to `--profile` runs** — `--profile` now loads

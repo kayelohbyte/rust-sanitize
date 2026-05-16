@@ -2,6 +2,8 @@
 
 Replacements are **length-preserving** — every replacement has the exact same byte count as the original match. Formatting characters (dots, dashes, colons, `@`) are preserved in place while variable portions are filled with deterministic hex digits or table-indexed names. This ensures replacements can be dropped into size-sensitive contexts (fixed-width columns, binary offsets, structured logs) without breaking alignment.
 
+**UTF-8 caveat.** Length preservation is guaranteed for ASCII input, which covers all real-world secrets (API keys, tokens, emails, IP addresses, UUIDs, etc.). If a matched value contains multi-byte UTF-8 characters, the replacement emits one ASCII byte per byte of the original, so byte length is preserved, but character count will differ. This edge case is not reachable through any built-in pattern because the scanner matches byte sequences that conform to ASCII-range formats; it can only arise if you write a custom pattern that explicitly targets non-ASCII content.
+
 | Category | Replacement Strategy | Example (original → replacement) |
 |----------|---------------------|-----------------------------------|
 | `email` | Preserve domain; fill username with hex to match length | `alice@corp.com` → `a1b2c@corp.com` |

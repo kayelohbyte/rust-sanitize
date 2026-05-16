@@ -109,7 +109,7 @@ jobs:
 
       - uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
+          deno-version: v2.3.3
 
       - name: Compile
         run: >

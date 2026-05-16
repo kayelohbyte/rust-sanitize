@@ -7,19 +7,35 @@
 //!
 //! # Pattern syntax
 //!
-//! Each entry is either an exact string or a simple glob:
+//! Three pattern forms are supported:
 //!
-//! | Pattern          | Matches                                      |
-//! |------------------|----------------------------------------------|
-//! | `localhost`      | Exactly `localhost`                          |
-//! | `*.internal`     | Any value ending with `.internal`            |
-//! | `192.168.1.*`    | Any value starting with `192.168.1.`         |
-//! | `user-*@corp.com`| Prefix `user-`, suffix `@corp.com`           |
+//! | Pattern                          | Matches                                        |
+//! |----------------------------------|------------------------------------------------|
+//! | `localhost`                      | Exactly `localhost`                            |
+//! | `*.internal`                     | Any value ending with `.internal` (glob)       |
+//! | `192.168.1.*`                    | Any value starting with `192.168.1.` (glob)    |
+//! | `user-*@corp.com`                | Prefix + suffix glob                           |
+//! | `regex:^192\.168\.[0-9]+\.[0-9]+$` | Full regex match                             |
 //!
-//! Only `*` is treated as a wildcard. Patterns are case-sensitive.
-//! If a pattern contains regex metacharacters (`^`, `$`, `+`, `(`, `)`)
-//! a warning is emitted — those characters are matched literally.
+//! **Glob patterns** use `*` as the only wildcard (matches any sequence of
+//! characters). Multiple `*` wildcards are supported. Globs are
+//! case-insensitive by default (see [`AllowlistMatcher::new_case_sensitive`]).
+//!
+//! **Regex patterns** are prefixed with `regex:`. The remainder is compiled as
+//! a [`regex::Regex`] and matched against the full value. Regex patterns are
+//! always case-sensitive; use the `(?i)` flag inside the pattern for
+//! case-insensitive matching. The `regex:` prefix is stripped before
+//! compiling, so `regex:^foo$` compiles to `^foo$`.
+//!
+//! If a regex fails to compile, a warning is returned and the pattern is
+//! skipped (the matcher continues without it rather than panicking).
+//!
+//! If a plain pattern (no `*`, no `regex:` prefix) contains regex
+//! metacharacters (`^`, `$`, `+`, `(`, `)`), a warning is emitted suggesting
+//! the `regex:` prefix — those characters are still matched literally in the
+//! plain form.
 
+use regex::Regex;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -27,20 +43,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// Exact patterns are stored in a [`HashSet`] for O(1) lookup. Glob patterns
 /// (those containing `*`) are stored in a [`Vec`] and scanned linearly after
-/// the hash check misses. This means allowlists with many exact entries —
-/// the common case for common-word lists — pay no linear scan cost.
+/// the hash check misses. Regex patterns (`regex:` prefix) are stored in a
+/// separate [`Vec`] and tried last. This means allowlists with many exact
+/// entries — the common case — pay no linear scan cost.
 ///
 /// # Case sensitivity
 ///
 /// By default the matcher is **case-insensitive**: patterns and query values
-/// are both lowercased before comparison. Use [`AllowlistMatcher::new_case_sensitive`]
-/// when exact-case matching is required (e.g. allowlisting a known token value
-/// that must not match a differently-cased substring).
+/// are both lowercased before comparison (applies to exact and glob patterns
+/// only). Use [`AllowlistMatcher::new_case_sensitive`] when exact-case
+/// matching is required. Regex patterns (`regex:` prefix) are always
+/// case-sensitive; use the `(?i)` flag inside the pattern for
+/// case-insensitive regex matching.
 pub struct AllowlistMatcher {
     exact: HashSet<String>,
     globs: Vec<String>,
+    /// `(original_pattern_string, compiled_regex)` pairs from `regex:` entries.
+    regexes: Vec<(String, Regex)>,
     /// When `false` (the default), patterns and query values are lowercased
-    /// before comparison.
+    /// before comparison (exact and glob only; regex patterns are unaffected).
     case_sensitive: bool,
     /// Number of values passed through as allowed across all `is_allowed` calls.
     seen: AtomicU64,
@@ -74,15 +95,25 @@ impl AllowlistMatcher {
     fn build(patterns: Vec<String>, case_sensitive: bool) -> (Self, Vec<String>) {
         let mut exact = HashSet::new();
         let mut globs = Vec::new();
+        let mut regexes = Vec::new();
         let mut warnings = Vec::new();
 
         for pat in patterns {
+            if let Some(re_src) = pat.strip_prefix("regex:") {
+                match Regex::new(re_src) {
+                    Ok(compiled) => regexes.push((pat, compiled)),
+                    Err(e) => warnings.push(format!(
+                        "allowlist pattern '{pat}' failed to compile: {e} — pattern skipped"
+                    )),
+                }
+                continue;
+            }
+
             for ch in ['^', '$', '+', '(', ')'] {
                 if pat.contains(ch) {
                     warnings.push(format!(
-                        "allowlist pattern '{}' contains regex character '{}'; \
-                         it is matched literally — use * for wildcards",
-                        pat, ch
+                        "allowlist pattern '{pat}' contains regex character '{ch}'; \
+                         it is matched literally — use the 'regex:' prefix for regex syntax"
                     ));
                     break;
                 }
@@ -105,6 +136,7 @@ impl AllowlistMatcher {
             Self {
                 exact,
                 globs,
+                regexes,
                 case_sensitive,
                 seen: AtomicU64::new(0),
             },
@@ -121,30 +153,38 @@ impl AllowlistMatcher {
 
     /// Returns the pattern that matches `value`, or `None`.
     ///
-    /// Exact entries are checked first via hash lookup. Glob entries are
-    /// scanned linearly only on a hash miss. Increments the seen counter
-    /// when a match is found.
+    /// Lookup order: exact hash → glob scan → regex scan. Increments the seen
+    /// counter when a match is found.
     ///
-    /// When the matcher was built with [`new`](Self::new) (case-insensitive),
-    /// `value` is lowercased before comparison so the check is case-insensitive.
+    /// Exact and glob patterns are case-insensitive by default (the matcher
+    /// built by [`new`](Self::new) lowercases both patterns and query values
+    /// before comparison). Regex patterns (`regex:` prefix) are always matched
+    /// against the original, un-lowercased value regardless of the
+    /// case-sensitivity setting; use `(?i)` inside the pattern for
+    /// case-insensitive regex matching.
     pub fn match_pattern<'a>(&'a self, value: &str) -> Option<&'a str> {
-        if self.case_sensitive {
-            self.match_pattern_inner(value)
+        // Exact + glob: apply case normalization.
+        let normalized: std::borrow::Cow<str> = if self.case_sensitive {
+            std::borrow::Cow::Borrowed(value)
         } else {
-            let lower = value.to_lowercase();
-            self.match_pattern_inner(&lower)
-        }
-    }
-
-    fn match_pattern_inner<'a>(&'a self, value: &str) -> Option<&'a str> {
-        if let Some(s) = self.exact.get(value) {
+            std::borrow::Cow::Owned(value.to_lowercase())
+        };
+        if let Some(s) = self.exact.get(normalized.as_ref()) {
             self.seen.fetch_add(1, Ordering::Relaxed);
             return Some(s.as_str());
         }
         for pat in &self.globs {
-            if glob_matches(pat, value) {
+            if glob_matches(pat, &normalized) {
                 self.seen.fetch_add(1, Ordering::Relaxed);
                 return Some(pat.as_str());
+            }
+        }
+        // Regex: always match against the original value (regex has (?i) for
+        // case-insensitive matching; we must not pre-lowercase the input).
+        for (pat_str, re) in &self.regexes {
+            if re.is_match(value) {
+                self.seen.fetch_add(1, Ordering::Relaxed);
+                return Some(pat_str.as_str());
             }
         }
         None
@@ -155,14 +195,14 @@ impl AllowlistMatcher {
         self.seen.load(Ordering::Relaxed)
     }
 
-    /// Number of patterns registered (exact + glob).
+    /// Number of patterns registered (exact + glob + regex).
     pub fn pattern_count(&self) -> usize {
-        self.exact.len() + self.globs.len()
+        self.exact.len() + self.globs.len() + self.regexes.len()
     }
 
     /// `true` if no patterns are registered (allowlist is effectively disabled).
     pub fn is_empty(&self) -> bool {
-        self.exact.is_empty() && self.globs.is_empty()
+        self.exact.is_empty() && self.globs.is_empty() && self.regexes.is_empty()
     }
 }
 
@@ -395,5 +435,116 @@ mod tests {
         assert!(m.is_allowed("127.0.0.1"));
         assert!(m.is_allowed("db.internal"));
         assert!(!m.is_allowed("github.com"));
+    }
+
+    // ── regex: prefix ──────────────────────────────────────────────────────
+
+    #[test]
+    fn regex_basic_match() {
+        let m = matcher(&["regex:^192\\.168\\.[0-9]+\\.[0-9]+$"]);
+        assert!(m.is_allowed("192.168.1.1"));
+        assert!(m.is_allowed("192.168.100.255"));
+        assert!(!m.is_allowed("192.168.1."));   // trailing dot
+        assert!(!m.is_allowed("10.0.0.1"));
+    }
+
+    #[test]
+    fn regex_substring_match_without_anchors() {
+        // Without ^ and $, the regex matches as a substring.
+        let m = matcher(&["regex:internal"]);
+        assert!(m.is_allowed("db.internal.corp"));
+        assert!(m.is_allowed("internal"));
+        assert!(!m.is_allowed("external"));
+    }
+
+    #[test]
+    fn regex_anchored_full_match() {
+        let m = matcher(&["regex:^token-[A-Z]{3}-[0-9]{4}$"]);
+        assert!(m.is_allowed("token-ABC-1234"));
+        assert!(!m.is_allowed("token-AB-1234")); // too short
+        assert!(!m.is_allowed("xtoken-ABC-1234")); // extra prefix
+    }
+
+    #[test]
+    fn regex_case_sensitive_by_default() {
+        // regex: patterns are always case-sensitive; (?i) opts in.
+        let m = matcher(&["regex:^localhost$"]);
+        assert!(m.is_allowed("localhost"));
+        assert!(!m.is_allowed("LOCALHOST"));
+        assert!(!m.is_allowed("Localhost"));
+    }
+
+    #[test]
+    fn regex_case_insensitive_via_flag() {
+        let m = matcher(&["regex:(?i)^localhost$"]);
+        assert!(m.is_allowed("localhost"));
+        assert!(m.is_allowed("LOCALHOST"));
+        assert!(m.is_allowed("LocalHost"));
+    }
+
+    #[test]
+    fn regex_invalid_pattern_produces_warning_and_is_skipped() {
+        let (m, warnings) = AllowlistMatcher::new(vec!["regex:[invalid".into()]);
+        assert!(!warnings.is_empty(), "invalid regex must produce a warning");
+        assert!(warnings[0].contains("failed to compile"));
+        // Pattern is skipped — nothing is allowed.
+        assert!(!m.is_allowed("anything"));
+        assert_eq!(m.pattern_count(), 0);
+    }
+
+    #[test]
+    fn regex_match_pattern_returns_full_prefixed_string() {
+        let m = matcher(&["regex:^10\\.0\\."]);
+        assert_eq!(
+            m.match_pattern("10.0.1.5"),
+            Some("regex:^10\\.0\\."),
+        );
+        assert_eq!(m.match_pattern("192.168.1.1"), None);
+    }
+
+    #[test]
+    fn regex_seen_counter_increments() {
+        let m = matcher(&["regex:^test"]);
+        assert_eq!(m.seen_count(), 0);
+        m.is_allowed("test-value");
+        m.is_allowed("test-value");
+        m.is_allowed("other");
+        assert_eq!(m.seen_count(), 2);
+    }
+
+    #[test]
+    fn regex_coexists_with_exact_and_glob() {
+        let m = matcher(&[
+            "localhost",
+            "*.internal",
+            "regex:^10\\.[0-9]+\\.[0-9]+\\.[0-9]+$",
+        ]);
+        assert!(m.is_allowed("localhost"));
+        assert!(m.is_allowed("db.internal"));
+        assert!(m.is_allowed("10.0.0.1"));
+        assert!(m.is_allowed("10.255.255.255"));
+        assert!(!m.is_allowed("192.168.1.1"));
+        assert!(!m.is_allowed("github.com"));
+        assert_eq!(m.pattern_count(), 3);
+    }
+
+    #[test]
+    fn regex_not_subject_to_case_insensitive_lowercasing() {
+        // The case-insensitive matcher lowercases exact/glob query values,
+        // but regex must receive the original value to honour (?i) correctly.
+        let m = matcher(&["regex:^[A-Z]{3}$"]); // matches exactly 3 uppercase letters
+        assert!(m.is_allowed("ABC"));
+        assert!(!m.is_allowed("abc")); // no (?i) — must not match lowercased
+    }
+
+    #[test]
+    fn metacharacter_warning_updated_to_suggest_regex_prefix() {
+        let (_, warnings) = AllowlistMatcher::new(vec!["^bad$".into()]);
+        assert!(!warnings.is_empty());
+        assert!(
+            warnings[0].contains("regex:"),
+            "warning should suggest regex: prefix, got: {}",
+            warnings[0],
+        );
     }
 }
