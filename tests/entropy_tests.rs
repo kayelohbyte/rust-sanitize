@@ -239,9 +239,7 @@ fn entropy_report_counts_entropy_matches() {
         .unwrap_or_else(|e| panic!("report is not valid JSON: {e}\ncontent:\n{report_content}"));
 
     // The report must record at least one match for the high-entropy token.
-    let total_matches = report["summary"]["total_matches"]
-        .as_u64()
-        .unwrap_or(0);
+    let total_matches = report["summary"]["total_matches"].as_u64().unwrap_or(0);
     assert!(
         total_matches >= 1,
         "expected at least 1 match in report summary, got {total_matches};\nreport:\n{report_content}"

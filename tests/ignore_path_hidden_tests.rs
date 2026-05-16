@@ -143,10 +143,7 @@ fn ignore_path_glob_excludes_subtree() {
 
     // logs/app.log should have been sanitized.
     let app_out = out_dir.join("logs").join("app.log");
-    assert!(
-        app_out.exists(),
-        "logs/app.log should be present in outdir"
-    );
+    assert!(app_out.exists(), "logs/app.log should be present in outdir");
     let app_content = fs::read_to_string(&app_out).unwrap();
     assert!(
         !app_content.contains("secret-token-abc123"),

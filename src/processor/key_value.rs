@@ -330,9 +330,7 @@ fn process_line(
                     }
                     output.push('\n');
                     return Ok(());
-                } else if let Some(sig) =
-                    find_field_signal(key, &cfg.profile.field_name_signals)
-                {
+                } else if let Some(sig) = find_field_signal(key, &cfg.profile.field_name_signals) {
                     let raw_value = after_delim.trim();
                     let (quote_char, inner) = detect_quotes(raw_value);
                     let (sanitize_inner, suffix) = match cfg.value_strip_suffix {
@@ -430,6 +428,7 @@ fn process_line(
 /// lines. Returns `Some(sanitized_body)` — without a trailing newline — when a
 /// field rule matched and the value was replaced; `None` when nothing matched
 /// and the line should be preserved verbatim.
+#[allow(clippy::too_many_lines)]
 fn try_sanitize_kv_body(body: &str, cfg: &KvConfig<'_>) -> Result<Option<String>> {
     let body_trimmed = body.trim_start();
     let indent_len = body.len() - body_trimmed.len();
@@ -449,10 +448,23 @@ fn try_sanitize_kv_body(body: &str, cfg: &KvConfig<'_>) -> Result<Option<String>
             let replaced = replace_value(sanitize_inner, rule, cfg.store)?;
             let mut out = String::new();
             if suffix.is_empty() {
-                emit_replaced(raw_key, cfg.delimiter, after_delim, quote_char, &replaced, &mut out);
+                emit_replaced(
+                    raw_key,
+                    cfg.delimiter,
+                    after_delim,
+                    quote_char,
+                    &replaced,
+                    &mut out,
+                );
             } else {
                 emit_replaced_with_suffix(
-                    raw_key, cfg.delimiter, after_delim, quote_char, &replaced, suffix, &mut out,
+                    raw_key,
+                    cfg.delimiter,
+                    after_delim,
+                    quote_char,
+                    &replaced,
+                    suffix,
+                    &mut out,
                 );
             }
             return Ok(Some(out));
@@ -467,11 +479,21 @@ fn try_sanitize_kv_body(body: &str, cfg: &KvConfig<'_>) -> Result<Option<String>
                 let mut out = String::new();
                 if suffix.is_empty() {
                     emit_replaced(
-                        raw_key, cfg.delimiter, after_delim, quote_char, &replaced, &mut out,
+                        raw_key,
+                        cfg.delimiter,
+                        after_delim,
+                        quote_char,
+                        &replaced,
+                        &mut out,
                     );
                 } else {
                     emit_replaced_with_suffix(
-                        raw_key, cfg.delimiter, after_delim, quote_char, &replaced, suffix,
+                        raw_key,
+                        cfg.delimiter,
+                        after_delim,
+                        quote_char,
+                        &replaced,
+                        suffix,
                         &mut out,
                     );
                 }
@@ -492,7 +514,13 @@ fn try_sanitize_kv_body(body: &str, cfg: &KvConfig<'_>) -> Result<Option<String>
                 let replaced = replace_value(inner, rule, cfg.store)?;
                 let mut out = String::new();
                 emit_replaced_with_suffix(
-                    raw_key, sec_delim, after_delim, quote_char, &replaced, suffix, &mut out,
+                    raw_key,
+                    sec_delim,
+                    after_delim,
+                    quote_char,
+                    &replaced,
+                    suffix,
+                    &mut out,
                 );
                 return Ok(Some(out));
             } else if let Some(sig) =
@@ -502,7 +530,13 @@ fn try_sanitize_kv_body(body: &str, cfg: &KvConfig<'_>) -> Result<Option<String>
                 if let Some(replaced) = replace_by_signal(inner, sig, cfg.store)? {
                     let mut out = String::new();
                     emit_replaced_with_suffix(
-                        raw_key, sec_delim, after_delim, quote_char, &replaced, suffix, &mut out,
+                        raw_key,
+                        sec_delim,
+                        after_delim,
+                        quote_char,
+                        &replaced,
+                        suffix,
+                        &mut out,
                     );
                     return Ok(Some(out));
                 }
@@ -849,7 +883,10 @@ mod tests {
         ]);
         let input = "# smtp_password = \"hunter2\"\n";
         let out = process(input, &profile, &store);
-        assert!(out.starts_with("# smtp_password = "), "comment prefix preserved: {out}");
+        assert!(
+            out.starts_with("# smtp_password = "),
+            "comment prefix preserved: {out}"
+        );
         assert!(!out.contains("hunter2"), "secret should be replaced: {out}");
     }
 
@@ -859,11 +896,16 @@ mod tests {
         let mut profile = make_profile(vec![
             FieldRule::new("*secret*").with_category(Category::Custom("auth_token".into()))
         ]);
-        profile.options.insert("secondary_delimiter".into(), "=>,:".into());
+        profile
+            .options
+            .insert("secondary_delimiter".into(), "=>,:".into());
         let input = "#   'client_secret' => 'THIS-IS-SECRET',\n";
         let out = process(input, &profile, &store);
-        assert!(out.starts_with("#"), "comment prefix preserved: {out}");
-        assert!(!out.contains("THIS-IS-SECRET"), "secret should be replaced: {out}");
+        assert!(out.starts_with('#'), "comment prefix preserved: {out}");
+        assert!(
+            !out.contains("THIS-IS-SECRET"),
+            "secret should be replaced: {out}"
+        );
     }
 
     #[test]
@@ -872,11 +914,16 @@ mod tests {
         let mut profile = make_profile(vec![
             FieldRule::new("*secret*").with_category(Category::Custom("auth_token".into()))
         ]);
-        profile.options.insert("secondary_delimiter".into(), "=>,:".into());
+        profile
+            .options
+            .insert("secondary_delimiter".into(), "=>,:".into());
         let input = "#   'client_secret': 'THIS-IS-SECRET',\n";
         let out = process(input, &profile, &store);
-        assert!(out.starts_with("#"), "comment prefix preserved: {out}");
-        assert!(!out.contains("THIS-IS-SECRET"), "secret should be replaced: {out}");
+        assert!(out.starts_with('#'), "comment prefix preserved: {out}");
+        assert!(
+            !out.contains("THIS-IS-SECRET"),
+            "secret should be replaced: {out}"
+        );
     }
 
     #[test]
@@ -885,10 +932,15 @@ mod tests {
         let mut profile = make_profile(vec![
             FieldRule::new("*password*").with_category(Category::Custom("password".into()))
         ]);
-        profile.options.insert("ignore_comments".into(), "true".into());
+        profile
+            .options
+            .insert("ignore_comments".into(), "true".into());
         let input = "# smtp_password = \"hunter2\"\n";
         let out = process(input, &profile, &store);
-        assert_eq!(out, input, "with ignore_comments:true the line should be verbatim");
+        assert_eq!(
+            out, input,
+            "with ignore_comments:true the line should be verbatim"
+        );
     }
 
     #[test]
@@ -1011,9 +1063,8 @@ config = <<-'EOS'
         // re-adds it afterward so the output file preserves the original
         // whitespace structure.
         let store = make_store();
-        let sub_fields = vec![
-            FieldRule::new("*.password").with_category(Category::Custom("password".into())),
-        ];
+        let sub_fields =
+            vec![FieldRule::new("*.password").with_category(Category::Custom("password".into()))];
         let profile = make_profile(vec![FieldRule::new("*['ldap_servers']")
             .with_sub_processor("yaml")
             .with_sub_fields(sub_fields)]);
@@ -1029,11 +1080,16 @@ other_key = 'untouched'
         let out = process(input, &profile, &store);
 
         // Secret is replaced.
-        assert!(!out.contains("real-ldap-password"), "secret must be replaced: {out}");
+        assert!(
+            !out.contains("real-ldap-password"),
+            "secret must be replaced: {out}"
+        );
 
         // The 2-space indentation on the YAML lines must be preserved in output.
         // Check that the `main:` line still starts with exactly two spaces.
-        let main_line = out.lines().find(|l| l.trim_start().starts_with("main:"))
+        let main_line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("main:"))
             .expect("main: line must exist in output");
         assert!(
             main_line.starts_with("  "),
@@ -1041,8 +1097,14 @@ other_key = 'untouched'
         );
 
         // Opener and end marker preserved verbatim.
-        assert!(out.contains("<<~'EOS'"), "heredoc opener must be preserved: {out}");
-        assert!(out.contains("\nEOS\n"), "end marker must be preserved: {out}");
+        assert!(
+            out.contains("<<~'EOS'"),
+            "heredoc opener must be preserved: {out}"
+        );
+        assert!(
+            out.contains("\nEOS\n"),
+            "end marker must be preserved: {out}"
+        );
 
         // Unrelated key untouched.
         assert!(out.contains("other_key = 'untouched'"));
@@ -1053,7 +1115,7 @@ other_key = 'untouched'
         // Blank lines between YAML blocks must not force min_indent to 0.
         let lines = vec![
             "  key1: val1".to_owned(),
-            "".to_owned(),           // blank — ignored when computing min
+            String::new(), // blank — ignored when computing min
             "  key2: val2".to_owned(),
         ];
         let (content, indent) = strip_min_indent(&lines);
@@ -1063,15 +1125,15 @@ other_key = 'untouched'
 
     #[test]
     fn reindent_content_roundtrips_strip() {
-        let original_lines = vec![
-            "  main:".to_owned(),
-            "    password: replaced".to_owned(),
-        ];
+        let original_lines = vec!["  main:".to_owned(), "    password: replaced".to_owned()];
         let (stripped, indent) = strip_min_indent(&original_lines);
         let restored = reindent_content(&stripped, indent);
         // Each line should start with the original indentation again.
         assert!(restored.starts_with("  main:"), "first line: {restored}");
-        assert!(restored.contains("\n    password:"), "second line: {restored}");
+        assert!(
+            restored.contains("\n    password:"),
+            "second line: {restored}"
+        );
     }
 
     // ---- sub-processor: non-heredoc inline value ----

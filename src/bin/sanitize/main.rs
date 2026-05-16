@@ -176,21 +176,16 @@ struct ArchiveDeps<'a> {
 // ---------------------------------------------------------------------------
 
 /// Output format for `--report`.
-#[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
+#[derive(Debug, Clone, PartialEq, Default, clap::ValueEnum)]
 enum ReportFormat {
     /// Structured JSON (default). Machine-readable.
+    #[default]
     Json,
     /// SARIF 2.1.0. Consumed natively by GitHub Advanced Security,
     /// VS Code Problems panel, and most SIEM tooling.
     Sarif,
     /// Self-contained HTML. Human-readable summary with a per-file table.
     Html,
-}
-
-impl Default for ReportFormat {
-    fn default() -> Self {
-        Self::Json
-    }
 }
 
 // ---------------------------------------------------------------------------

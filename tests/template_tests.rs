@@ -41,11 +41,7 @@ fn template_default_creates_generic_yaml() {
 
     let out = run_template(&["-o", out_path.to_str().unwrap()]);
 
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        stderr(&out)
-    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(
         out_path.exists(),
         "template output file should exist at {}",
@@ -164,11 +160,7 @@ fn template_overwrite_flag_replaces_existing_file() {
     // Write dummy content at the target path.
     fs::write(&out_path, b"dummy content that should be replaced\n").unwrap();
 
-    let out = run_template(&[
-        "-o",
-        out_path.to_str().unwrap(),
-        "--overwrite",
-    ]);
+    let out = run_template(&["-o", out_path.to_str().unwrap(), "--overwrite"]);
 
     assert!(out.status.success(), "stderr: {}", stderr(&out));
 
@@ -222,11 +214,7 @@ fn template_generated_file_is_valid_for_sanitize() {
         .map(|l| {
             // Remove one level of leading indentation (two spaces) that
             // nests the entries under `secrets:`.
-            if l.starts_with("  ") {
-                &l[2..]
-            } else {
-                l
-            }
+            l.strip_prefix("  ").unwrap_or(l)
         })
         .fold(String::new(), |mut acc, l| {
             acc.push_str(l);

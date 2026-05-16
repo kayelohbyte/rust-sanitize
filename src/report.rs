@@ -116,6 +116,7 @@ impl SanitizeReport {
     /// # Errors
     ///
     /// Returns [`serde_json::Error`] if serialization fails.
+    #[allow(clippy::too_many_lines)]
     pub fn to_sarif(&self) -> serde_json::Result<String> {
         use serde_json::json;
 
@@ -251,6 +252,7 @@ impl SanitizeReport {
     /// Includes a summary dashboard, per-pattern totals, and a per-file table.
     /// Dark mode is supported via `prefers-color-scheme`.
     #[must_use]
+    #[allow(clippy::too_many_lines, clippy::format_collect)]
     pub fn to_html(&self) -> String {
         let s = &self.summary;
         let m = &self.metadata;
@@ -409,7 +411,7 @@ fn sarif_level(pattern: &str) -> &'static str {
 /// e.g. "auth_token" → "AuthToken", "custom:password" → "CustomPassword"
 fn sarif_rule_name(pattern: &str) -> String {
     pattern
-        .split(|c: char| c == '_' || c == ':' || c == '-')
+        .split(['_', ':', '-'])
         .map(|word| {
             let mut chars = word.chars();
             match chars.next() {
@@ -434,6 +436,7 @@ fn sarif_badge_class(pattern: &str) -> &'static str {
 }
 
 /// Format a byte count as a human-readable string.
+#[allow(clippy::cast_precision_loss)]
 fn fmt_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
@@ -1076,9 +1079,7 @@ mod tests {
     fn html_no_external_resources() {
         let html = rich_report().to_html();
         // No CDN links, no external stylesheets, no external scripts.
-        assert!(
-            !html.contains("http://") || html.contains("https://json.schemastore.org") == false
-        );
+        assert!(!html.contains("http://") || !html.contains("https://json.schemastore.org"));
         assert!(!html.contains("cdn."));
         assert!(!html.contains("src=\"http"));
         assert!(!html.contains("href=\"http"));

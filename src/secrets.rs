@@ -158,7 +158,6 @@ pub struct SecretEntry {
     pub values: Vec<String>,
 
     // ── Entropy-detection fields (only used when kind = "entropy") ──────────
-
     /// Minimum token length to consider (default: 20).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_length: Option<usize>,
@@ -1256,7 +1255,11 @@ label = "openai_key"
         ]"#;
         let entries = parse_secrets(json.as_bytes(), Some(SecretsFormat::Json)).unwrap();
         let (patterns, errors) = entries_to_patterns(&entries);
-        assert_eq!(patterns.len(), 1, "only the literal entry should produce a pattern");
+        assert_eq!(
+            patterns.len(),
+            1,
+            "only the literal entry should produce a pattern"
+        );
         assert!(errors.is_empty());
         assert_eq!(patterns[0].label(), "secret");
     }

@@ -1236,7 +1236,10 @@ fn tar_parallel_entry_order_preserved() {
 
     let files = read_tar(&output);
     let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["first.txt", "second.txt", "third.txt", "fourth.txt"]);
+    assert_eq!(
+        names,
+        ["first.txt", "second.txt", "third.txt", "fourth.txt"]
+    );
 }
 
 #[test]
@@ -1280,8 +1283,10 @@ fn tar_parallel_preserves_passthrough_content() {
     proc.process_tar(&input[..], &mut output).unwrap();
 
     let files = read_tar(&output);
-    let by_name: std::collections::HashMap<&str, &str> =
-        files.iter().map(|(n, c)| (n.as_str(), c.as_str())).collect();
+    let by_name: std::collections::HashMap<&str, &str> = files
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.as_str()))
+        .collect();
     assert_eq!(by_name["clean1.txt"], "nothing sensitive");
     assert_eq!(by_name["clean2.txt"], "also fine");
     assert_eq!(by_name["clean3.txt"], "still clean");

@@ -77,11 +77,7 @@ fn low_entropy_password_field_is_not_replaced() {
     let profile = write_json_profile(&dir, "profile.json");
 
     // "disabled" has entropy ~2.5 bits/char — below both thresholds.
-    let input = write_file(
-        dir.path(),
-        "config.json",
-        r#"{"password":"disabled"}"#,
-    );
+    let input = write_file(dir.path(), "config.json", r#"{"password":"disabled"}"#);
     let output = dir.path().join("config-sanitized.json");
 
     let status = sanitize_cmd()
@@ -115,11 +111,7 @@ fn enum_token_type_is_not_replaced() {
     let profile = write_json_profile(&dir, "profile.json");
 
     // "Bearer" entropy ≈ 2.4 — below the medium threshold (3.5).
-    let input = write_file(
-        dir.path(),
-        "config.json",
-        r#"{"token_type":"Bearer"}"#,
-    );
+    let input = write_file(dir.path(), "config.json", r#"{"token_type":"Bearer"}"#);
     let output = dir.path().join("config-sanitized.json");
 
     let status = sanitize_cmd()

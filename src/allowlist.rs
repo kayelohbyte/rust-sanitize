@@ -444,7 +444,7 @@ mod tests {
         let m = matcher(&["regex:^192\\.168\\.[0-9]+\\.[0-9]+$"]);
         assert!(m.is_allowed("192.168.1.1"));
         assert!(m.is_allowed("192.168.100.255"));
-        assert!(!m.is_allowed("192.168.1."));   // trailing dot
+        assert!(!m.is_allowed("192.168.1.")); // trailing dot
         assert!(!m.is_allowed("10.0.0.1"));
     }
 
@@ -495,10 +495,7 @@ mod tests {
     #[test]
     fn regex_match_pattern_returns_full_prefixed_string() {
         let m = matcher(&["regex:^10\\.0\\."]);
-        assert_eq!(
-            m.match_pattern("10.0.1.5"),
-            Some("regex:^10\\.0\\."),
-        );
+        assert_eq!(m.match_pattern("10.0.1.5"), Some("regex:^10\\.0\\."),);
         assert_eq!(m.match_pattern("192.168.1.1"), None);
     }
 

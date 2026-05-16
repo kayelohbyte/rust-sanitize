@@ -19,11 +19,7 @@ fn write_literal_secrets(dir: &std::path::Path, filename: &str, value: &str) -> 
 }
 
 /// Write a secrets JSON file with a single regex pattern entry.
-fn write_regex_secrets(
-    dir: &std::path::Path,
-    filename: &str,
-    pattern: &str,
-) -> std::path::PathBuf {
+fn write_regex_secrets(dir: &std::path::Path, filename: &str, pattern: &str) -> std::path::PathBuf {
     let path = dir.join(filename);
     let content = format!(
         r#"[{{"pattern":"{pattern}","kind":"regex","category":"custom:test","label":"tok"}}]"#
@@ -113,10 +109,7 @@ fn test_pattern_json_output_contains_matched() {
     );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !stdout.is_empty(),
-        "stdout should be non-empty JSON output"
-    );
+    assert!(!stdout.is_empty(), "stdout should be non-empty JSON output");
     assert!(
         stdout.contains("\"matched\""),
         "JSON output should contain the \"matched\" field; got: {stdout}"
@@ -178,7 +171,10 @@ fn test_pattern_json_output_contains_unmatched() {
         .iter()
         .find(|r| r["value"] == "completely_different_value")
         .expect("value should appear in results");
-    assert_eq!(hit["matched"], false, "unmatched value should have matched=false");
+    assert_eq!(
+        hit["matched"], false,
+        "unmatched value should have matched=false"
+    );
 }
 
 /// 5. Mixed values (one match, one miss) exit 1.
@@ -249,12 +245,7 @@ fn test_pattern_regex_kind_matches() {
     let secrets = write_regex_secrets(dir.path(), "secrets.json", "tok-[0-9]+");
 
     let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-        .args([
-            "test-pattern",
-            "-s",
-            secrets.to_str().unwrap(),
-            "tok-12345",
-        ])
+        .args(["test-pattern", "-s", secrets.to_str().unwrap(), "tok-12345"])
         .env("SANITIZE_LOG", "error")
         .output()
         .unwrap();
@@ -319,7 +310,8 @@ fn test_pattern_no_secrets_no_match() {
     // patterns). Both are acceptable as long as exit 0 is not returned.
     let code = out.status.code().unwrap_or(1);
     assert_ne!(
-        code, 0,
+        code,
+        0,
         "expected non-zero exit when no secrets are defined; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );

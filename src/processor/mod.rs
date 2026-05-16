@@ -250,6 +250,7 @@ use crate::allowlist::glob_matches;
 /// Returns `0.0` for empty input. Uses a fixed 256-element frequency table
 /// so the cost is O(n) time and O(1) space regardless of alphabet size.
 #[inline]
+#[allow(clippy::cast_precision_loss)]
 pub(crate) fn shannon_entropy(data: &[u8]) -> f64 {
     if data.is_empty() {
         return 0.0;
@@ -263,7 +264,7 @@ pub(crate) fn shannon_entropy(data: &[u8]) -> f64 {
         .iter()
         .filter(|&&c| c > 0)
         .map(|&c| {
-            let p = c as f64 / len;
+            let p = f64::from(c) / len;
             -p * p.log2()
         })
         .sum()
@@ -410,11 +411,13 @@ mod tests {
     // ── shannon_entropy ──────────────────────────────────────────────────────
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn entropy_empty_is_zero() {
         assert_eq!(shannon_entropy(b""), 0.0);
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn entropy_single_byte_is_zero() {
         // All characters the same → zero entropy.
         assert_eq!(shannon_entropy(b"aaaa"), 0.0);
@@ -459,13 +462,9 @@ mod tests {
 
     #[test]
     fn signal_alternation_pattern() {
-        let sig = FieldNameSignal::new(
-            r"^(password|secret|token)$",
-            Category::AuthToken,
-            None,
-            3.5,
-        )
-        .unwrap();
+        let sig =
+            FieldNameSignal::new(r"^(password|secret|token)$", Category::AuthToken, None, 3.5)
+                .unwrap();
         assert!(sig.matches_key("password"));
         assert!(sig.matches_key("secret"));
         assert!(sig.matches_key("token"));
@@ -517,8 +516,7 @@ mod tests {
 
     #[test]
     fn find_returns_none_when_no_match() {
-        let sig =
-            FieldNameSignal::new("^password$", Category::AuthToken, None, 3.5).unwrap();
+        let sig = FieldNameSignal::new("^password$", Category::AuthToken, None, 3.5).unwrap();
         assert!(find_field_signal("hostname", &[sig]).is_none());
     }
 }

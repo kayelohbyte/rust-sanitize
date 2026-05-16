@@ -812,6 +812,7 @@ impl ArchiveProcessor {
     /// Unlike zip, tar has no central directory so sizes cannot be known before
     /// reading. The buffer cap (`PARALLEL_TAR_DATA_SIZE`) bounds peak memory to
     /// cap + one entry overhead regardless of archive size.
+    #[allow(clippy::too_many_lines)]
     fn process_tar_at_depth<R: Read, W: Write>(
         &self,
         reader: R,
@@ -907,8 +908,7 @@ impl ArchiveProcessor {
                 })
                 .collect();
 
-            let mut sanitized: Vec<Option<(Vec<u8>, ArchiveStats)>> =
-                vec![None; buffered.len()];
+            let mut sanitized: Vec<Option<(Vec<u8>, ArchiveStats)>> = vec![None; buffered.len()];
             for (i, r) in results {
                 sanitized[i] = Some(r?);
             }
@@ -918,10 +918,7 @@ impl ArchiveProcessor {
                     builder
                         .append(&entry.header, entry.data.as_slice())
                         .map_err(|e| {
-                            SanitizeError::ArchiveError(format!(
-                                "append '{}': {e}",
-                                entry.path
-                            ))
+                            SanitizeError::ArchiveError(format!("append '{}': {e}", entry.path))
                         })?;
                     stats.entries_skipped += 1;
                     self.emit_progress(&stats, None, &entry.path);
@@ -953,45 +950,42 @@ impl ArchiveProcessor {
             // Process buffered entries first, then stream the remainder.
 
             // Helper: write one buffered entry to the builder.
-            let write_buffered =
-                |entry: &TarEntry,
-                 builder: &mut tar::Builder<W>,
-                 stats: &mut ArchiveStats,
-                 processor: &ArchiveProcessor| -> Result<()> {
-                    if !entry.is_file {
-                        builder
-                            .append(&entry.header, entry.data.as_slice())
-                            .map_err(|e| {
-                                SanitizeError::ArchiveError(format!(
-                                    "append '{}': {e}",
-                                    entry.path
-                                ))
-                            })?;
-                        stats.entries_skipped += 1;
-                        processor.emit_progress(stats, None, &entry.path);
-                        return Ok(());
-                    }
-                    if !entry.passes_filter {
-                        stats.entries_filtered += 1;
-                        processor.emit_progress(stats, None, &entry.path);
-                        return Ok(());
-                    }
-                    let size_hint = entry.header.size().ok();
-                    let (sanitized_buf, entry_stats) =
-                        processor.sanitize_entry_bytes(&entry.path, &entry.data, size_hint, depth)?;
-                    stats.merge(&entry_stats);
-                    let mut new_header = entry.header.clone();
-                    new_header.set_size(sanitized_buf.len() as u64);
-                    new_header.set_cksum();
+            let write_buffered = |entry: &TarEntry,
+                                  builder: &mut tar::Builder<W>,
+                                  stats: &mut ArchiveStats,
+                                  processor: &ArchiveProcessor|
+             -> Result<()> {
+                if !entry.is_file {
                     builder
-                        .append(&new_header, sanitized_buf.as_slice())
+                        .append(&entry.header, entry.data.as_slice())
                         .map_err(|e| {
                             SanitizeError::ArchiveError(format!("append '{}': {e}", entry.path))
                         })?;
-                    stats.files_processed += 1;
+                    stats.entries_skipped += 1;
                     processor.emit_progress(stats, None, &entry.path);
-                    Ok(())
-                };
+                    return Ok(());
+                }
+                if !entry.passes_filter {
+                    stats.entries_filtered += 1;
+                    processor.emit_progress(stats, None, &entry.path);
+                    return Ok(());
+                }
+                let size_hint = entry.header.size().ok();
+                let (sanitized_buf, entry_stats) =
+                    processor.sanitize_entry_bytes(&entry.path, &entry.data, size_hint, depth)?;
+                stats.merge(&entry_stats);
+                let mut new_header = entry.header.clone();
+                new_header.set_size(sanitized_buf.len() as u64);
+                new_header.set_cksum();
+                builder
+                    .append(&new_header, sanitized_buf.as_slice())
+                    .map_err(|e| {
+                        SanitizeError::ArchiveError(format!("append '{}': {e}", entry.path))
+                    })?;
+                stats.files_processed += 1;
+                processor.emit_progress(stats, None, &entry.path);
+                Ok(())
+            };
 
             for entry in &buffered {
                 write_buffered(entry, &mut builder, &mut stats, self)?;
@@ -1001,9 +995,8 @@ impl ArchiveProcessor {
             // Stream remaining entries when the buffer cap was exceeded.
             if overflowed {
                 for entry_result in entries_iter {
-                    let mut entry = entry_result.map_err(|e| {
-                        SanitizeError::ArchiveError(format!("read tar entry: {e}"))
-                    })?;
+                    let mut entry = entry_result
+                        .map_err(|e| SanitizeError::ArchiveError(format!("read tar entry: {e}")))?;
 
                     let header = entry.header().clone();
                     let path = entry
