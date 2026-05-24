@@ -44,19 +44,16 @@ jobs:
               - 'fuzz/**'
 
   check:
-    name: Check
+    name: Check (MSRV 1.74)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: changes
     if: github.event_name != 'schedule' && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true')
-    strategy:
-      matrix:
-        rust: [stable, "1.74"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: ${{ matrix.rust }}
+          toolchain: "1.74"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
 
@@ -92,6 +89,7 @@ jobs:
           toolchain: "1.74"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
+      - run: cargo test --doc
 
   clippy:
     name: Clippy
@@ -107,6 +105,22 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: changes
+    if: github.event_name != 'schedule' && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   fmt:
     name: Format
@@ -130,7 +144,7 @@ jobs:
         run: |
           cargo fmt --all
           cargo fmt --manifest-path fuzz/Cargo.toml --all
-          git --no-pager diff -- src fuzz .github/workflows/ci.yml || true
+          git --no-pager diff -- src fuzz || true
           exit 1
 
   deny:
@@ -138,7 +152,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: changes
-    if: github.event_name != 'schedule' && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true')
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -154,12 +168,23 @@ jobs:
         with:
           toolchain: nightly
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-fuzz
+      - name: Cache cargo-fuzz
+        uses: actions/cache@v4
+        id: fuzz-cache
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.toml') }}
+          restore-keys: cargo-fuzz-${{ runner.os }}-
+      - name: Install cargo-fuzz
+        if: steps.fuzz-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --locked
       - run: cargo +nightly fuzz build
-      - run: cargo +nightly fuzz run fuzz_regex -- -max_total_time=30
-      - run: cargo +nightly fuzz run fuzz_json -- -max_total_time=30
-      - run: cargo +nightly fuzz run fuzz_yaml -- -max_total_time=30
-      - run: cargo +nightly fuzz run fuzz_archive -- -max_total_time=30
+      - name: Run fuzz targets
+        run: |
+          cargo +nightly fuzz list | while IFS= read -r target; do
+            echo "Fuzzing $target …"
+            cargo +nightly fuzz run "$target" -- -max_total_time=30
+          done
 
   fuzz-smoke:
     name: Fuzz smoke (PR)
@@ -175,9 +200,20 @@ jobs:
         with:
           toolchain: nightly
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-fuzz
+      - name: Cache cargo-fuzz
+        uses: actions/cache@v4
+        id: fuzz-cache
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.toml') }}
+          restore-keys: cargo-fuzz-${{ runner.os }}-
+      - name: Install cargo-fuzz
+        if: steps.fuzz-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --locked
       - run: cargo +nightly fuzz build
-      - run: cargo +nightly fuzz run fuzz_regex -- -max_total_time=10
-      - run: cargo +nightly fuzz run fuzz_json -- -max_total_time=10
-      - run: cargo +nightly fuzz run fuzz_yaml -- -max_total_time=10
-      - run: cargo +nightly fuzz run fuzz_archive -- -max_total_time=10
+      - name: Run fuzz targets (smoke)
+        run: |
+          cargo +nightly fuzz list | while IFS= read -r target; do
+            echo "Fuzzing $target …"
+            cargo +nightly fuzz run "$target" -- -max_total_time=10
+          done

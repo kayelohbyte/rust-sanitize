@@ -5,10 +5,15 @@ on:
     branches: [main]
     tags: ["v*"]
 
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
 jobs:
   mirror:
     name: Push mirror
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:

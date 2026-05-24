@@ -114,6 +114,7 @@ fn strip_values_from_file() {
             out.to_str().unwrap(),
             input_file.to_str().unwrap(),
         ])
+        .stdin(std::process::Stdio::null())
         .env("SANITIZE_LOG", "error")
         .status()
         .unwrap();

@@ -22,24 +22,31 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+            native: true
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz
+            native: true
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
+            # macos-latest runners are arm64; x86_64 binary requires Rosetta
+            native: false
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
+            native: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
+            native: true
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Install musl tools
@@ -48,6 +55,15 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Smoke test (Unix)
+        if: matrix.native && runner.os != 'Windows'
+        run: ./target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} --version
+
+      - name: Smoke test (Windows)
+        if: matrix.native && runner.os == 'Windows'
+        shell: pwsh
+        run: .\target\${{ matrix.target }}\release\${{ env.BINARY_NAME }}.exe --version
 
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
@@ -192,15 +208,22 @@ jobs:
             "$PROJECT_PATH")
           API="https://gitlab.com/api/v4/projects/${ENCODED}"
 
-          # Upload each file to the GitLab generic packages registry.
+          # Upload all artifacts in parallel (up to 4 concurrent).
+          pids=()
           for f in artifacts/*; do
             filename=$(basename "$f")
             echo "Uploading $filename …"
             curl --fail --silent --show-error \
               --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
               --upload-file "$f" \
-              "${API}/packages/generic/sanitize-engine/${TAG}/${filename}"
+              "${API}/packages/generic/sanitize-engine/${TAG}/${filename}" &
+            pids+=($!)
           done
+          failed=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || failed=1
+          done
+          [ "$failed" -eq 0 ]
 
           # Build the asset-links JSON array for the release.
           LINKS="["
