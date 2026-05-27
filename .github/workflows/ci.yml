@@ -177,7 +177,10 @@ jobs:
           restore-keys: cargo-fuzz-${{ runner.os }}-
       - name: Install cargo-fuzz
         if: steps.fuzz-cache.outputs.cache-hit != 'true'
-        run: cargo install cargo-fuzz --locked
+        # cargo-fuzz 0.13.1 depends on rustix 0.36.x which uses rustc-internal
+        # attributes that newer nightly compilers reject.  Install with stable
+        # (which still accepts them) — only the fuzz runs themselves need nightly.
+        run: cargo +stable install cargo-fuzz --locked
       - run: cargo +nightly fuzz build
       - name: Run fuzz targets
         run: |
@@ -209,7 +212,7 @@ jobs:
           restore-keys: cargo-fuzz-${{ runner.os }}-
       - name: Install cargo-fuzz
         if: steps.fuzz-cache.outputs.cache-hit != 'true'
-        run: cargo install cargo-fuzz --locked
+        run: cargo +stable install cargo-fuzz --locked
       - run: cargo +nightly fuzz build
       - name: Run fuzz targets (smoke)
         run: |
