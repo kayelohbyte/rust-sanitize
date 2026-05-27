@@ -1,0 +1,195 @@
+# Bruno — .bru classic format and OpenCollection YAML (Bruno 3.0+)
+#
+# Two distinct file formats are covered:
+#
+#   1. .bru files — Bruno's custom block DSL. The key_value processor with
+#      delimiter ":" handles indented key-value pairs inside blocks cleanly.
+#      Block headers like `auth:bearer {` parse as key="auth"/value="bearer {"
+#      and pass through untouched because no field rule matches "auth".
+#
+#   2. OpenCollection .yml files — standard YAML introduced in Bruno 3.0.
+#      The yaml processor covers named auth fields directly. Header and
+#      parameter arrays use the {name, value} pattern, handled by the
+#      `kind: field-name` signal in secrets.yaml (threshold: 4.0).
+#
+#   Body content (body:json / http.body.data) is caught by the streaming
+#   regex pass in secrets.yaml, not the structured profile.
+
+# ---------------------------------------------------------------------------
+# .bru classic format
+# ---------------------------------------------------------------------------
+
+- processor: key-value
+  extensions: [".bru"]
+  options:
+    delimiter: ":"
+    comment_prefix: "#"
+  fields:
+    # --- Auth block credentials (auth:bearer, auth:basic, auth:apikey, etc.) ---
+
+    # Bearer token — `auth:bearer { token: actual-token }`
+    - pattern: "token"
+      category: auth_token
+      label: bruno_token
+      min_length: 8
+
+    # Basic / digest / NTLM / WSSE password
+    - pattern: "password"
+      category: custom:password
+      label: bruno_password
+      min_length: 1
+
+    # Basic auth username
+    - pattern: "username"
+      category: name
+      label: bruno_username
+      min_length: 1
+
+    # Generic secret
+    - pattern: "secret"
+      category: auth_token
+      label: bruno_secret
+      min_length: 8
+
+    # API key value — `auth:apikey { value: actual-key }` (key field is the header name, not a secret)
+    - pattern: "apiKey"
+      category: auth_token
+      label: bruno_api_key
+      min_length: 8
+
+    - pattern: "secretKey"
+      category: auth_token
+      label: bruno_secret_key
+      min_length: 8
+
+    # AWS SigV4
+    - pattern: "accessKeyId"
+      category: auth_token
+      label: bruno_aws_access_key_id
+
+    - pattern: "secretAccessKey"
+      category: auth_token
+      label: bruno_aws_secret_access_key
+
+    - pattern: "sessionToken"
+      category: auth_token
+      label: bruno_aws_session_token
+
+    # --- Headers block literal values ---
+    # `headers { Authorization: Bearer actual-token }` — the key is the header name.
+    # Only catch header names that are unambiguously credential-bearing.
+
+    - pattern: "Authorization"
+      category: auth_token
+      label: bruno_authorization_header
+      min_length: 8
+
+    - pattern: "Proxy-Authorization"
+      category: auth_token
+      label: bruno_proxy_auth_header
+      min_length: 8
+
+    # --- Request URL ---
+    - pattern: "url"
+      category: url
+      label: bruno_request_url
+
+    # --- Environment variable values ---
+    # vars:secret blocks contain real credentials; vars blocks may contain URLs
+    # or other non-sensitive values. The field-name signal in secrets.yaml
+    # handles high-entropy values; explicit min_length here avoids over-redaction
+    # for the common `key: value` pattern in vars blocks.
+    # (The bare key name — e.g. `api_key`, `token` — is caught by the rules above.)
+
+# ---------------------------------------------------------------------------
+# OpenCollection YAML format (Bruno 3.0+)
+# ---------------------------------------------------------------------------
+#
+# Individual request files are standard YAML. When sharing a Bruno collection
+# all .yml files are Bruno files, so no include filter is applied — the user's
+# explicit --app bruno flag is the scope signal.
+
+- processor: yaml
+  extensions: [".yml", ".yaml"]
+  include:
+    - "opencollection.yml"
+    - "opencollection.yaml"
+    - "bruno.yml"
+    - "bruno.yaml"
+    - "collection.yml"
+    - "collection.yaml"
+  fields:
+    # Collection-level auth and metadata (root collection file)
+    - pattern: "auth.token"
+      category: auth_token
+      label: bruno_yaml_collection_token
+      min_length: 8
+    - pattern: "auth.password"
+      category: custom:password
+      label: bruno_yaml_collection_password
+    - pattern: "auth.username"
+      category: name
+      label: bruno_yaml_collection_username
+    - pattern: "auth.value"
+      category: auth_token
+      label: bruno_yaml_collection_apikey_value
+      min_length: 8
+
+- processor: yaml
+  extensions: [".yml", ".yaml"]
+  exclude:
+    - "opencollection.yml"
+    - "opencollection.yaml"
+    - "bruno.yml"
+    - "bruno.yaml"
+    - "collection.yml"
+    - "collection.yaml"
+    - "docker-compose.yml"
+    - "docker-compose.yaml"
+    - "*.github/**"
+    - ".github/**"
+  fields:
+    # Request URL
+    - pattern: "http.url"
+      category: url
+      label: bruno_yaml_request_url
+
+    # Request body — may contain credentials in JSON/XML/form payloads
+    - pattern: "http.body.data"
+      category: custom:body
+      label: bruno_yaml_request_body
+      min_length: 4
+
+    # Auth — named fields (not {name,value} arrays), so explicit rules work cleanly
+    - pattern: "http.auth.token"
+      category: auth_token
+      label: bruno_yaml_bearer_token
+      min_length: 8
+
+    - pattern: "http.auth.password"
+      category: custom:password
+      label: bruno_yaml_auth_password
+
+    - pattern: "http.auth.username"
+      category: name
+      label: bruno_yaml_auth_username
+
+    # API key — `auth: { type: apikey, key: X-API-Key, value: actual-key }`
+    # `key` is the header name (not a secret); `value` is the credential.
+    - pattern: "http.auth.value"
+      category: auth_token
+      label: bruno_yaml_apikey_value
+      min_length: 8
+
+    # AWS SigV4
+    - pattern: "http.auth.accessKeyId"
+      category: auth_token
+      label: bruno_yaml_aws_access_key
+
+    - pattern: "http.auth.secretAccessKey"
+      category: auth_token
+      label: bruno_yaml_aws_secret_key
+
+    - pattern: "http.auth.sessionToken"
+      category: auth_token
+      label: bruno_yaml_aws_session_token

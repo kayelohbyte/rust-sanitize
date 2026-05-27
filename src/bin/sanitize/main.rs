@@ -768,7 +768,8 @@ EXAMPLES:\n  \
     /// The installed script is plain POSIX sh and can be inspected or edited
     /// directly. Remove it with --remove or by deleting the hook file.
     ///
-    /// Run `sanitize init` first to create the global default secrets file.
+    /// Run `sanitize init-hook` first to create the global settings file and
+    /// install a hook in the current repository.
     #[command(
         name = "install-hook",
         after_help = "\
@@ -792,26 +793,23 @@ EXAMPLES:\n  \
     #[command(name = "show-config")]
     ShowConfig,
 
-    /// One-time machine setup: create the global default secrets file and
-    /// optionally install a git hook for the current repository.
+    /// One-time repo setup: create the global settings file and install a git
+    /// hook for the current repository.
     ///
-    /// The secrets file is written to ~/.config/sanitize/secrets.yaml
-    /// (or $XDG_CONFIG_HOME/sanitize/secrets.yaml) and contains the balanced
-    /// built-in patterns. It is auto-loaded by every subsequent `sanitize`
-    /// invocation that does not specify --secrets-file explicitly.
-    ///
-    /// Run this once when setting up a new machine. For each repository you
-    /// want a hook in, run `sanitize install-hook` (or use --with-hook here).
+    /// The settings file is written to ~/.config/sanitize/settings.yaml
+    /// (or $XDG_CONFIG_HOME/sanitize/settings.yaml) and lets you set persistent
+    /// flag defaults. The global secrets file is created automatically on the
+    /// first plain `sanitize` run — no explicit setup needed.
     #[command(
-        name = "init",
+        name = "init-hook",
         after_help = "\
 EXAMPLES:\n  \
-  sanitize init                        # create default secrets file only\n  \
-  sanitize init --with-hook            # create secrets file + pre-commit hook\n  \
-  sanitize init --with-hook --mode sanitize  # hook sanitizes files in place\n  \
-  sanitize init --with-hook --hook pre-push  # hook runs on push instead"
+  sanitize init-hook                        # create settings file + pre-commit hook\n  \
+  sanitize init-hook --mode sanitize        # hook sanitizes files in place\n  \
+  sanitize init-hook --hook pre-push        # hook runs on push instead\n  \
+  sanitize init-hook --global               # apply hook to all repos on this machine"
     )]
-    Init(InitArgs),
+    InitHook(InitArgs),
 
     /// Scan files for secrets without modifying them. Exits 2 if any are found.
     ///
@@ -1244,38 +1242,20 @@ pub(crate) struct InstallHookArgs {
 
 #[derive(Parser, Debug)]
 pub(crate) struct InitArgs {
-    /// Also install a git hook in the current repository after creating the
-    /// secrets file. Equivalent to running `sanitize install-hook` immediately
-    /// after `sanitize init`.
-    #[arg(long)]
-    pub(crate) with_hook: bool,
-
-    /// Hook type to install when --with-hook is set.
-    #[arg(
-        long,
-        value_enum,
-        default_value = "pre-commit",
-        value_name = "HOOK",
-        requires = "with_hook"
-    )]
+    /// Hook type to install.
+    #[arg(long, value_enum, default_value = "pre-commit", value_name = "HOOK")]
     pub(crate) hook: HookType,
 
-    /// Hook behaviour when --with-hook is set: scan blocks the commit without
-    /// modifying files; sanitize rewrites staged files in place.
-    #[arg(
-        long,
-        value_enum,
-        default_value = "scan",
-        value_name = "MODE",
-        requires = "with_hook"
-    )]
+    /// Hook behaviour: scan blocks the commit without modifying files;
+    /// sanitize rewrites staged files in place.
+    #[arg(long, value_enum, default_value = "scan", value_name = "MODE")]
     pub(crate) mode: HookMode,
 
-    /// When --with-hook is set, install the hook globally (all repositories).
-    #[arg(long, requires = "with_hook")]
+    /// Install the hook globally (all repositories on this machine).
+    #[arg(long)]
     pub(crate) global: bool,
 
-    /// Overwrite an existing default secrets file even if it already exists.
+    /// Overwrite an existing settings file even if it already exists.
     #[arg(long, short = 'f')]
     pub(crate) force: bool,
 
@@ -2269,8 +2249,19 @@ pub(crate) fn common_allow_patterns() -> Vec<String> {
         "https://example.com*".into(),
         "https://example.org*".into(),
         "https://example.net*".into(),
-        // Null UUID — commonly used as a placeholder or uninitialized resource ID.
+        // Null UUID and common placeholder UUIDs.
         "00000000-0000-0000-0000-000000000000".into(),
+        "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".into(),
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
+        "12345678-1234-1234-1234-123456789abc".into(),
+        // Common placeholder words that appear in docs, default configs, and templates.
+        "changeme".into(),
+        "example".into(),
+        "sample".into(),
+        "placeholder".into(),
+        // Template variable syntax — these are never real secret values.
+        "${*}".into(),
+        "{{*}}".into(),
     ]
 }
 
@@ -5405,7 +5396,7 @@ fn run() -> Result<(), (String, i32)> {
         Some(SubCommand::Template(args)) => return run_template(args),
         Some(SubCommand::AllowTest(args)) => return run_allow_test(args),
         Some(SubCommand::InstallHook(args)) => return run_install_hook(args),
-        Some(SubCommand::Init(args)) => return run_init(args),
+        Some(SubCommand::InitHook(args)) => return run_init(args),
         Some(SubCommand::ShowConfig) => return run_show_config(),
         Some(SubCommand::Scan(args)) => return run_scan(args),
         Some(SubCommand::TestPattern(args)) => return run_test_pattern(args),
@@ -5554,12 +5545,35 @@ fn run_sanitize(
         .num_threads(thread_count)
         .build_global();
 
-    // --- auto-load global default secrets (before header so path is visible) ----
-    // If the user has not provided --secrets-file but the global default exists
-    // (written by `sanitize install-hook`), use it silently. An explicit
-    // --secrets-file on the CLI always takes precedence.
-    if cli.secrets_file.is_none() {
+    // --- auto-load (and auto-create) global default secrets -------------------
+    // Skipped when --app is active: each app bundle is self-contained and
+    // provides its own write-back target.
+    if cli.secrets_file.is_none() && cli.app.is_empty() {
         let default_path = global_default_secrets_path();
+        if !default_path.exists() {
+            // First run: create a minimal secrets file so the user has a
+            // visible, editable file to customise. Detection patterns are
+            // applied from hardcoded defaults; the file starts with just the
+            // allowlist so it stays small and readable.
+            if let Some(parent) = default_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let allow_entry = SecretEntry {
+                kind: "allow".into(),
+                pattern: String::new(),
+                category: String::new(),
+                label: None,
+                values: common_allow_patterns(),
+                min_length: None,
+                max_length: None,
+                threshold: None,
+                charset: None,
+            };
+            if let Ok(yaml) = serde_yaml_ng::to_string(&[allow_entry]) {
+                let header = "# Global sanitize allowlist — add patterns or kind:regex entries here.\n# Auto-loaded on every plain run. Edit freely; deleted values take effect immediately.\n\n";
+                let _ = fs::write(&default_path, format!("{header}{yaml}"));
+            }
+        }
         if default_path.exists() {
             cli.secrets_file = Some(default_path);
         }
@@ -5855,7 +5869,7 @@ fn run_sanitize(
     }
 
     if base_patterns.is_empty() && app_profiles.is_empty() {
-        warn!("no secrets file or --app provided; run 'sanitize init' to create a default secrets file, or pass --secrets-file, --app, or --profile explicitly");
+        warn!("no secrets file or --app provided; pass --secrets-file, --app, or --profile explicitly, or run without flags to auto-create the default secrets file");
     }
 
     let scanner = StreamScanner::new(

@@ -1,0 +1,78 @@
+# Postman — collection credentials, environment variables, auth configs
+
+# Collection files use the Postman Collection Format v2.0 / v2.1 JSON schema.
+# Items (requests and folders) can nest arbitrarily deep, so auth and request
+# paths use `*.` prefix globs to match at any depth.
+#
+# The {key, value} array pattern for auth, headers, query, and form fields
+# means the processor cannot filter by key name to decide whether to redact
+# value. The `kind: field-name` signal in secrets.yaml (threshold: 4.0)
+# handles high-entropy values in those arrays. Explicit rules below cover
+# paths that are always credentials regardless of entropy.
+
+- processor: json
+  extensions: [".json"]
+  include:
+    - "*.postman_collection.json"
+    - "postman_collection.json"
+  fields:
+    # --- Auth credentials (collection-level and per-request, any nesting depth) ---
+
+    # Bearer, OAuth2 access/refresh tokens, and any other auth type whose
+    # credential sits in a {key, value} array under a named auth block.
+    - pattern: "*.auth.*.value"
+      category: auth_token
+      label: postman_auth_value
+      min_length: 4
+
+    # AWS SigV4 — accessKey / secretKey / sessionToken are in the same array
+    # but named differently; "value" still holds the credential.
+    # (Covered by *.auth.*.value above — listed explicitly for clarity.)
+
+    # --- Request bodies ---
+
+    # Raw body text — may contain JSON/XML payloads with embedded credentials
+    - pattern: "*.request.body.raw"
+      category: custom:body
+      label: postman_request_body_raw
+      min_length: 4
+
+    # URL-encoded form field values (login forms, OAuth token requests, etc.)
+    - pattern: "*.request.body.urlencoded.value"
+      category: auth_token
+      label: postman_form_urlencoded_value
+      min_length: 4
+
+    # Multipart form-data field values
+    - pattern: "*.request.body.formdata.value"
+      category: auth_token
+      label: postman_formdata_value
+      min_length: 4
+
+    # --- URLs ---
+
+    # Raw request URL — may embed API keys or tokens in the query string
+    - pattern: "*.request.url.raw"
+      category: url
+      label: postman_request_url
+
+    # --- Pre/post scripts ---
+    # pm.environment.set("api_key", "actual-secret") calls — caught by
+    # the streaming secrets.yaml patterns, not the structured profile.
+
+- processor: json
+  extensions: [".json"]
+  include:
+    - "*.postman_environment.json"
+    - "postman_environment.json"
+    - "*.postman_globals.json"
+    - "postman_globals.json"
+  fields:
+    # Environment and globals variable values.
+    # The {key, value} structure means we can't filter by variable name;
+    # the field-name signal in secrets.yaml catches high-entropy ones,
+    # while min_length here avoids redacting short placeholder values.
+    - pattern: "values.value"
+      category: auth_token
+      label: postman_env_variable_value
+      min_length: 16

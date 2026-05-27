@@ -9,7 +9,7 @@ sanitize [OPTIONS] [INPUT]...
 command | sanitize [OPTIONS]
 sanitize scan [OPTIONS] [INPUT]...
 sanitize test-pattern [OPTIONS] [VALUE]...
-sanitize init [OPTIONS]
+sanitize init-hook [OPTIONS]
 sanitize show-config
 sanitize install-hook [OPTIONS]
 sanitize guided
@@ -381,45 +381,44 @@ You can also drop bundle directories manually without using `sanitize apps add`:
 
 The directory name is the app name. `SANITIZE_APPS_DIR` overrides the default location. User-defined bundles take precedence over built-in bundles with the same name.
 
-### `sanitize init`
+### `sanitize init-hook`
 
-One-time machine setup. Creates the default patterns file and persistent settings file. Run this once on a new machine; use `sanitize install-hook` to add a git hook to each repository separately.
+One-time repo setup. Creates the persistent settings file and installs a git hook in the current repository. The global secrets file (`~/.config/sanitize/secrets.yaml`) is created automatically on the first plain `sanitize` run — no explicit setup needed for that.
 
 Config directory locations:
 - **Unix/macOS**: `$XDG_CONFIG_HOME/sanitize/` → `~/.config/sanitize/`
 - **Windows**: `%APPDATA%\sanitize\` → `%USERPROFILE%\.config\sanitize\`
 
 ```
-sanitize init [OPTIONS]
+sanitize init-hook [OPTIONS]
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--with-hook` | Also install a git hook in the current repository after creating the config files. |
-| `--hook <pre-commit\|pre-push>` | Hook type when `--with-hook` is set (default: `pre-commit`). |
-| `--mode <scan\|sanitize>` | Hook mode when `--with-hook` is set (default: `scan`). |
-| `--global` | When `--with-hook` is set, install the hook globally for all repositories. |
-| `-f, --force` | Overwrite existing config files. |
+| `--hook <pre-commit\|pre-push>` | Git hook to install (default: `pre-commit`). |
+| `--mode <scan\|sanitize>` | `scan` (default) blocks the commit if secrets are found. `sanitize` rewrites staged files in place. |
+| `--global` | Install the hook globally for all repositories on this machine. |
+| `-f, --force` | Overwrite existing settings file and hook without prompting. |
 | `--dry-run` | Print what would be created without writing any files. |
 
-If the files already exist `init` prints a notice and does nothing unless `--force` is given.
-
 ```bash
-# First-time machine setup:
-sanitize init
+# Create settings file + install pre-commit hook:
+sanitize init-hook
 
-# Setup + hook in one step:
-sanitize init --with-hook
+# Hook that sanitizes staged files in place instead of blocking:
+sanitize init-hook --mode sanitize
 
-# Hook that sanitizes in place instead of blocking:
-sanitize init --with-hook --mode sanitize
+# Install a pre-push hook instead:
+sanitize init-hook --hook pre-push
+
+# Install globally for every repository on this machine:
+sanitize init-hook --global
 
 # Preview without writing:
-sanitize init --dry-run
-sanitize init --with-hook --dry-run
+sanitize init-hook --dry-run
 
 # Recreate files (e.g. after a tool upgrade):
-sanitize init --force
+sanitize init-hook --force
 ```
 
 ---
@@ -551,7 +550,7 @@ Example:
 
 ### `sanitize install-hook`
 
-Install a git hook that scans staged files for secrets before each commit (or push). Run `sanitize init` first to create the default secrets file that the hook relies on. The installed script is plain POSIX sh — no external dependencies beyond `sanitize` itself. If `sanitize` is not in PATH the hook silently passes so teammates who haven't installed the tool are unaffected.
+Install a git hook that scans staged files for secrets before each commit (or push). The default secrets file is created automatically on the first plain `sanitize` run — no prior setup required. The installed script is plain POSIX sh — no external dependencies beyond `sanitize` itself. If `sanitize` is not in PATH the hook silently passes so teammates who haven't installed the tool are unaffected.
 
 **Windows note:** The hook script uses POSIX sh syntax and requires [Git for Windows](https://git-scm.com/download/win) (which bundles Git Bash). It will not execute under cmd.exe or PowerShell directly. Git for Windows is the standard git installation on Windows and executes hooks via its bundled shell automatically.
 
@@ -571,7 +570,7 @@ sanitize install-hook [OPTIONS]
 | `--dry-run` | Print the script that would be written without touching any files. |
 
 ```bash
-# Most common setup — relies on the default secrets file from `sanitize init`:
+# Most common setup — default secrets file is auto-created on first run:
 sanitize install-hook
 
 # Add app bundles on top of the default patterns:
@@ -600,10 +599,24 @@ sanitize install-hook --global --remove          # remove a global hook
 
 #### Settings file
 
-Created by `sanitize init`. Provides persistent defaults for CLI flags — values here apply when the corresponding flag is not passed on the command line. An explicit CLI flag always wins.
+Created by `sanitize init-hook`. Provides persistent defaults for CLI flags — values here apply when the corresponding flag is not passed on the command line. An explicit CLI flag always wins.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `app` | list of strings | `[]` | App bundles to load on every run. Equivalent to passing `--app` each time. |
+| `allow` | list of strings | `[]` | Values to pass through unchanged. Supports exact strings, `*` glob wildcards, and `regex:<pattern>`. Merged with `--allow` on the CLI. |
+| `fail_on_match` | bool | `false` | Exit with code 2 when any match is found. Equivalent to `--fail-on-match`. |
+| `strict` | bool | `false` | Abort on the first error instead of skipping and continuing. Equivalent to `--strict`. |
+| `no_structured_handoff` | bool | `false` | Suppress the Phase 1 → Phase 2 value handoff (discovered field values are not seeded into the scanner). Equivalent to `--no-structured-handoff`. |
+| `no_field_signal` | bool | `false` | Disable the field-name entropy heuristic. When active, key names matching sensitive keywords (`password`, `secret`, `token`, …) are flagged by their value's Shannon entropy even without an explicit `FieldRule`. Default thresholds: 3.0 bits/char for strong keywords, 3.5 for ambiguous ones. Equivalent to `--no-field-signal`. |
+| `threads` | integer | auto | Worker thread count. Omit or set to `null` for auto-detect. Equivalent to `--threads`. |
+| `log_format` | string | `"human"` | Log output format: `"human"` or `"json"` for SIEM ingestion. Equivalent to `--log-format`. |
+| `log_level` | string | `"warn"` | Log verbosity: `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, or `"trace"`. Overridden by the `SANITIZE_LOG` env var. Equivalent to `--log-level`. |
+| `no_progress` | bool | `false` | Disable progress output. Equivalent to `--no-progress`. |
 
 ```yaml
 # ~/.config/sanitize/settings.yaml
+# All fields are optional — uncomment and edit to activate.
 
 # Load these app bundles on every run (--app).
 # app:
@@ -626,11 +639,18 @@ Created by `sanitize init`. Provides persistent defaults for CLI flags — value
 # Suppress the structured-to-scanner value handoff (--no-structured-handoff).
 # no_structured_handoff: false
 
+# Disable the field-name entropy heuristic (--no-field-signal).
+# no_field_signal: false
+
 # Worker thread count — omit for auto-detect (--threads).
 # threads: 4
 
-# Log format: "human" or "json" for SIEM ingestion (--log-format).
+# Log format: "human" (default) or "json" for SIEM ingestion (--log-format).
 # log_format: human
+
+# Log level: off, error, warn (default), info, debug, trace (--log-level).
+# Override with SANITIZE_LOG env var.
+# log_level: warn
 
 # Disable progress output (--no-progress).
 # no_progress: false

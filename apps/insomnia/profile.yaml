@@ -1,0 +1,96 @@
+# Insomnia — workspace exports, request credentials, environment variables
+
+# Insomnia v4 export is a JSON file with a flat `resources` array. Each
+# resource has a `_type` field identifying it as a request, environment,
+# workspace, cookie_jar, etc.
+#
+# Authentication credentials in Insomnia are named fields (not {key,value}
+# arrays like Postman), so explicit path rules work cleanly for auth blocks.
+# Header and parameter arrays still use the {name, value} pattern; those are
+# handled by the `kind: field-name` signal in secrets.yaml.
+
+- processor: json
+  extensions: [".json", ".yaml", ".yml"]
+  include:
+    - "Insomnia_*.json"
+    - "insomnia_*.json"
+    - "insomnia.json"
+    - "*.insomnia.json"
+    - "Insomnia_*.yaml"
+    - "insomnia_*.yaml"
+    - "insomnia.yaml"
+  fields:
+    # --- Request URLs ---
+    - pattern: "resources.url"
+      category: url
+      label: insomnia_request_url
+
+    # --- Request bodies ---
+    - pattern: "resources.body.text"
+      category: custom:body
+      label: insomnia_request_body
+      min_length: 4
+
+    # --- Authentication block (named fields — always credentials) ---
+
+    # Bearer / OAuth2 / API key token
+    - pattern: "resources.authentication.token"
+      category: auth_token
+      label: insomnia_auth_token
+
+    # Basic auth password
+    - pattern: "resources.authentication.password"
+      category: auth_token
+      label: insomnia_auth_password
+
+    # Basic auth username
+    - pattern: "resources.authentication.username"
+      category: name
+      label: insomnia_auth_username
+
+    # API key value
+    - pattern: "resources.authentication.key"
+      category: auth_token
+      label: insomnia_auth_key
+
+    # OAuth2 client secret
+    - pattern: "resources.authentication.clientSecret"
+      category: auth_token
+      label: insomnia_oauth2_client_secret
+
+    # OAuth2 access / refresh tokens stored in the workspace
+    - pattern: "resources.authentication.accessTokenUrl"
+      category: url
+      label: insomnia_oauth2_token_url
+
+    # AWS SigV4
+    - pattern: "resources.authentication.accessKeyId"
+      category: auth_token
+      label: insomnia_aws_access_key
+
+    - pattern: "resources.authentication.secretAccessKey"
+      category: auth_token
+      label: insomnia_aws_secret_key
+
+    - pattern: "resources.authentication.sessionToken"
+      category: auth_token
+      label: insomnia_aws_session_token
+
+    # --- Environment variables ---
+    # `data` is a free-form object; we can't filter by key name.
+    # Explicit rule with min_length catches longer values (likely credentials);
+    # the field-name signal in secrets.yaml handles high-entropy shorter ones.
+    - pattern: "resources.data.*"
+      category: auth_token
+      label: insomnia_env_variable
+      min_length: 16
+
+    # --- Cookie jar ---
+    - pattern: "resources.cookies.value"
+      category: auth_token
+      label: insomnia_cookie_value
+      min_length: 4
+
+    - pattern: "resources.cookies.domain"
+      category: hostname
+      label: insomnia_cookie_domain

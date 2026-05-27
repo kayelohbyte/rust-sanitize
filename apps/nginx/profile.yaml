@@ -35,11 +35,11 @@
       category: ipv4
       label: nginx_trusted_proxy_ip
     - pattern: "ssl_certificate_key"
-      category: hostname
+      category: file_path
       label: nginx_ssl_key_path
     - pattern: "ssl_certificate"
-      category: hostname
+      category: file_path
       label: nginx_ssl_cert_path
     - pattern: "auth_basic_user_file"
-      category: hostname
+      category: file_path
       label: nginx_htpasswd_path

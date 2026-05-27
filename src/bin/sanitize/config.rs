@@ -1,7 +1,7 @@
 use crate::hooks::{
     global_default_secrets_path, global_settings_path, run_install_hook, sanitize_config_dir,
 };
-use crate::{build_guided_entries, GuidedOptions, GuidedPreset, InitArgs, InstallHookArgs};
+use crate::{InitArgs, InstallHookArgs};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -175,7 +175,7 @@ pub(crate) fn load_project_config(path: &Path) -> (ProjectConfig, PathBuf) {
     (cfg, config_dir)
 }
 
-/// Template written to `settings.yaml` by `sanitize init`.
+/// Template written to `settings.yaml` by `sanitize init-hook`.
 const SETTINGS_TEMPLATE: &str = "\
 # sanitize settings
 # Values here apply when the corresponding flag is not passed on the command
@@ -235,7 +235,7 @@ pub(crate) fn run_show_config() -> Result<(), (String, i32)> {
     if secrets_path.exists() {
         println!(" (found — auto-loaded when --secrets-file is not given)");
     } else {
-        println!(" (not found — run 'sanitize init' to create it)");
+        println!(" (not found — will be created automatically on the next plain run)");
     }
 
     // ── settings file ─────────────────────────────────────────────────────────
@@ -244,7 +244,7 @@ pub(crate) fn run_show_config() -> Result<(), (String, i32)> {
     if no_settings {
         println!(" (skipped — SANITIZE_NO_SETTINGS=1)");
     } else if !settings_path.exists() {
-        println!(" (not found — run 'sanitize init' to create it)");
+        println!(" (not found — run 'sanitize init-hook' to create it)");
     } else {
         println!();
 
@@ -373,19 +373,21 @@ pub(crate) fn run_show_config() -> Result<(), (String, i32)> {
 }
 
 pub(crate) fn run_init(args: &InitArgs) -> Result<(), (String, i32)> {
-    let secrets_path = global_default_secrets_path();
     let settings_path = global_settings_path();
+
+    let hook_args = InstallHookArgs {
+        hook: args.hook,
+        mode: args.mode,
+        global: args.global,
+        force: args.force,
+        remove: false,
+        app: None,
+        secrets_file: None,
+        dry_run: args.dry_run,
+    };
 
     if args.dry_run {
         println!("Would create (dry-run):");
-        if secrets_path.exists() && !args.force {
-            println!(
-                "  {} (already exists — use --force to overwrite)",
-                secrets_path.display()
-            );
-        } else {
-            println!("  {} — balanced built-in patterns", secrets_path.display());
-        }
         if settings_path.exists() && !args.force {
             println!(
                 "  {} (already exists — use --force to overwrite)",
@@ -394,56 +396,15 @@ pub(crate) fn run_init(args: &InitArgs) -> Result<(), (String, i32)> {
         } else {
             println!("  {} — persistent flag defaults", settings_path.display());
         }
-        if args.with_hook {
-            println!();
-            let hook_args = InstallHookArgs {
-                hook: args.hook,
-                mode: args.mode,
-                global: args.global,
-                force: args.force,
-                remove: false,
-                app: None,
-                secrets_file: None,
-                dry_run: true,
-            };
-            run_install_hook(&hook_args)?;
-        }
+        println!();
+        run_install_hook(&hook_args)?;
         return Ok(());
-    }
-
-    // ── secrets.yaml ──────────────────────────────────────────────────────────
-    if secrets_path.exists() && !args.force {
-        println!("Secrets file already exists: {}", secrets_path.display());
-        println!("  Use --force to overwrite, or edit it directly.");
-    } else {
-        let opts = GuidedOptions {
-            preset: GuidedPreset::Balanced,
-            domains: vec![],
-            providers: vec![],
-            exclude_noise_ids: false,
-            formats: vec![],
-        };
-        let entries = build_guided_entries(&opts);
-        let yaml = serde_yaml_ng::to_string(&entries)
-            .map_err(|e| (format!("failed to serialize default patterns: {e}"), 1))?;
-        if let Some(parent) = secrets_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| (format!("failed to create {}: {e}", parent.display()), 1))?;
-        }
-        fs::write(&secrets_path, &yaml).map_err(|e| {
-            (
-                format!("failed to write {}: {e}", secrets_path.display()),
-                1,
-            )
-        })?;
-        println!("Created: {}", secrets_path.display());
-        println!("  Contains the balanced built-in patterns.");
-        println!("  Edit it to add or tune patterns for your environment.");
     }
 
     // ── settings.yaml ─────────────────────────────────────────────────────────
     if settings_path.exists() && !args.force {
         println!("Settings file already exists: {}", settings_path.display());
+        println!("  Use --force to overwrite, or edit it directly.");
     } else {
         if let Some(parent) = settings_path.parent() {
             fs::create_dir_all(parent)
@@ -459,20 +420,6 @@ pub(crate) fn run_init(args: &InitArgs) -> Result<(), (String, i32)> {
         println!("  Uncomment fields to set persistent flag defaults.");
     }
 
-    if args.with_hook {
-        println!();
-        let hook_args = InstallHookArgs {
-            hook: args.hook,
-            mode: args.mode,
-            global: args.global,
-            force: args.force,
-            remove: false,
-            app: None,
-            secrets_file: None,
-            dry_run: false,
-        };
-        run_install_hook(&hook_args)?;
-    }
-
-    Ok(())
+    println!();
+    run_install_hook(&hook_args)
 }

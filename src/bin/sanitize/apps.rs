@@ -96,6 +96,24 @@ pub(crate) const BUILTIN_APPS: &[BuiltinApp] = &[
         profile_yaml: Some(include_str!("../../../apps/grafana/profile.yaml")),
     },
     BuiltinApp {
+        name: "bruno",
+        description: "Bruno — .bru collections and OpenCollection YAML (Bruno 3.0+) credentials",
+        secrets_yaml: Some(include_str!("../../../apps/bruno/secrets.yaml")),
+        profile_yaml: Some(include_str!("../../../apps/bruno/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "har",
+        description: "HAR (HTTP Archive) — browser-captured request/response traffic, auth headers, cookies",
+        secrets_yaml: Some(include_str!("../../../apps/har/secrets.yaml")),
+        profile_yaml: Some(include_str!("../../../apps/har/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "insomnia",
+        description: "Insomnia — workspace exports, request auth, environment variables",
+        secrets_yaml: Some(include_str!("../../../apps/insomnia/secrets.yaml")),
+        profile_yaml: Some(include_str!("../../../apps/insomnia/profile.yaml")),
+    },
+    BuiltinApp {
         name: "heroku",
         description: "Heroku — app.json env values, add-on credentials (Postgres, Redis, SendGrid, Mailgun, Cloudinary…)",
         secrets_yaml: Some(include_str!("../../../apps/heroku/secrets.yaml")),
@@ -124,6 +142,12 @@ pub(crate) const BUILTIN_APPS: &[BuiltinApp] = &[
         description: "MySQL / MariaDB — my.cnf credentials, .env DATABASE_URL",
         secrets_yaml: Some(include_str!("../../../apps/mysql/secrets.yaml")),
         profile_yaml: Some(include_str!("../../../apps/mysql/profile.yaml")),
+    },
+    BuiltinApp {
+        name: "postman",
+        description: "Postman — collection credentials, environment variables, auth configs",
+        secrets_yaml: Some(include_str!("../../../apps/postman/secrets.yaml")),
+        profile_yaml: Some(include_str!("../../../apps/postman/profile.yaml")),
     },
     BuiltinApp {
         name: "nginx",
@@ -217,6 +241,67 @@ fn read_app_description(app_dir: &Path) -> String {
         }
     }
     String::new()
+}
+
+/// Ensure a local user copy of a built-in app bundle exists.
+///
+/// Called automatically when `--app <name>` is used. If the user app directory
+/// for `name` does not yet exist, both `profile.yaml` and `secrets.yaml` are
+/// copied from the built-in bundle so that:
+///
+/// - The profile and secrets files are editable without running `sanitize apps edit`.
+/// - Discovered literal values from the profile pass can be persisted back into
+///   `secrets.yaml` by subsequent runs.
+///
+/// Returns the path to the user `secrets.yaml` on success, or `None` when the
+/// app is not a built-in or the directory could not be created.
+///
+/// If the directory already exists this is a no-op; existing customisations are
+/// never overwritten.
+pub(crate) fn ensure_user_app_copy(name: &str) -> Option<PathBuf> {
+    let apps_dir = user_apps_dir()?;
+    let app_dir = apps_dir.join(name);
+
+    // Already provisioned — return the secrets file path (may or may not exist yet).
+    if app_dir.is_dir() {
+        return Some(app_dir.join("secrets.yaml"));
+    }
+
+    // Only provision built-in apps; custom apps have no source to copy from.
+    let entry = BUILTIN_APPS.iter().find(|a| a.name == name)?;
+
+    if let Err(e) = fs::create_dir_all(&app_dir) {
+        eprintln!(
+            "warning: could not create app directory {}: {e}",
+            app_dir.display()
+        );
+        return None;
+    }
+
+    let mut ok = true;
+
+    if let Some(yaml) = entry.profile_yaml {
+        let dst = app_dir.join("profile.yaml");
+        if let Err(e) = fs::write(&dst, yaml) {
+            eprintln!("warning: could not write {}: {e}", dst.display());
+            ok = false;
+        }
+    }
+
+    if let Some(yaml) = entry.secrets_yaml {
+        let dst = app_dir.join("secrets.yaml");
+        if let Err(e) = fs::write(&dst, yaml) {
+            eprintln!("warning: could not write {}: {e}", dst.display());
+            ok = false;
+        }
+    }
+
+    if !ok {
+        let _ = fs::remove_dir_all(&app_dir);
+        return None;
+    }
+
+    Some(app_dir.join("secrets.yaml"))
 }
 
 /// Load an app bundle by name.

@@ -22,13 +22,18 @@
       category: file_path
       label: pg_krb_keyfile
 
-- processor: key-value
+- processor: csv
   extensions: [".pgpass"]
   include: [".pgpass", "pgpass"]
   options:
     delimiter: ":"
-    comment_prefix: "#"
+    has_header: "false"
   fields:
-    - pattern: "*"
+    - pattern: "3"
+      category: name
+      label: pgpass_username
+      min_length: 2
+    - pattern: "4"
       category: custom:password
-      label: pgpass_entry
+      label: pgpass_password
+      min_length: 2

@@ -1,4 +1,5 @@
-# Kubernetes — kubeconfig credentials, Secret manifests, Helm values
+# Kubernetes — kubeconfig, Secret manifests, Helm values, workload specs, kubectl output
+
 - processor: yaml
   extensions: [".yaml", ".yml"]
   include: ["kubeconfig", "*.kubeconfig", "config", "kube-config.yaml", "kube-config.yml"]
@@ -76,3 +77,130 @@
       category: auth_token
       label: jwt_key_camel
       min_length: 8
+
+# Workload manifests — Deployments, StatefulSets, DaemonSets, Jobs, CronJobs.
+# Covers both standalone files and manifests bundled in support archives.
+# High-entropy env var values are also caught by the `kind: field-name` signal
+# in secrets.yaml, which handles keys the include filter misses.
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  include:
+    - "deployment.yaml"
+    - "deployment.yml"
+    - "statefulset.yaml"
+    - "statefulset.yml"
+    - "daemonset.yaml"
+    - "daemonset.yml"
+    - "job.yaml"
+    - "job.yml"
+    - "cronjob.yaml"
+    - "cronjob.yml"
+    - "*-deployment.yaml"
+    - "*-deployment.yml"
+    - "*-statefulset.yaml"
+    - "*-statefulset.yml"
+    - "*-daemonset.yaml"
+    - "*-daemonset.yml"
+    - "*deploy*.yaml"
+    - "*deploy*.yml"
+  fields:
+    # Container env var values — DATABASE_URL, API_KEY, etc.
+    - pattern: "spec.template.spec.containers.env.value"
+      category: auth_token
+      label: k8s_container_env_value
+      min_length: 8
+    # Init container env vars
+    - pattern: "spec.template.spec.initContainers.env.value"
+      category: auth_token
+      label: k8s_init_container_env_value
+      min_length: 8
+    # Container image — reveals internal registry hostname
+    - pattern: "spec.template.spec.containers.image"
+      category: url
+      label: k8s_container_image
+    # Init container image
+    - pattern: "spec.template.spec.initContainers.image"
+      category: url
+      label: k8s_init_container_image
+
+# Service and Ingress manifests — network topology and hostname exposure
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  include:
+    - "service.yaml"
+    - "service.yml"
+    - "ingress.yaml"
+    - "ingress.yml"
+    - "*-service.yaml"
+    - "*-service.yml"
+    - "*-ingress.yaml"
+    - "*-ingress.yml"
+    - "*-svc.yaml"
+    - "*-svc.yml"
+  fields:
+    # ClusterIP / ExternalIP / LoadBalancer IP
+    - pattern: "spec.clusterIP"
+      category: ipv4
+      label: k8s_cluster_ip
+    - pattern: "spec.loadBalancerIP"
+      category: ipv4
+      label: k8s_lb_ip
+    - pattern: "spec.externalIPs"
+      category: ipv4
+      label: k8s_external_ip
+    # Ingress hostname rules
+    - pattern: "spec.rules.host"
+      category: hostname
+      label: k8s_ingress_host
+    # NFS / iSCSI volume servers in PersistentVolume specs
+    - pattern: "spec.nfs.server"
+      category: hostname
+      label: k8s_nfs_server
+    - pattern: "spec.iscsi.targetPortal"
+      category: hostname
+      label: k8s_iscsi_target
+
+# kubectl get -o json output — single resources and List objects.
+# Covers pod status IPs, node addresses, env vars, and image refs.
+- processor: json
+  extensions: [".json"]
+  include:
+    - "kubectl-*.json"
+    - "k8s-*.json"
+    - "kube-*.json"
+    - "*-kubectl.json"
+  fields:
+    # Pod and host IP from status
+    - pattern: "status.podIP"
+      category: ipv4
+      label: k8s_pod_ip
+    - pattern: "status.hostIP"
+      category: ipv4
+      label: k8s_host_ip
+    - pattern: "status.podIPs.ip"
+      category: ipv4
+      label: k8s_pod_ips
+    # Node addresses (InternalIP, ExternalIP, Hostname)
+    - pattern: "status.addresses.address"
+      category: ipv4
+      label: k8s_node_address
+    # Env vars in workload specs within JSON dumps
+    - pattern: "spec.template.spec.containers.env.value"
+      category: auth_token
+      label: k8s_json_env_value
+      min_length: 8
+    - pattern: "spec.template.spec.initContainers.env.value"
+      category: auth_token
+      label: k8s_json_init_env_value
+      min_length: 8
+    # List output — kubectl get pods/deployments -o json wraps items in a List
+    - pattern: "items.spec.template.spec.containers.env.value"
+      category: auth_token
+      label: k8s_list_env_value
+      min_length: 8
+    - pattern: "items.status.podIP"
+      category: ipv4
+      label: k8s_list_pod_ip
+    - pattern: "items.status.hostIP"
+      category: ipv4
+      label: k8s_list_host_ip

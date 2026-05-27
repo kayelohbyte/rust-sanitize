@@ -1,0 +1,70 @@
+# HAR (HTTP Archive) — browser-captured HTTP request/response traffic
+
+# HAR 1.2 is always JSON. This profile covers DevTools exports, Charles Proxy,
+# Fiddler, Postman, and any other tool that follows the spec.
+#
+# Headers and cookies are arrays of {name, value} objects. The json processor
+# cannot conditionally redact `value` based on its sibling `name`, so:
+#
+#   - Explicit rules cover the highest-risk paths (bodies, cookie values,
+#     server IPs, redirect URLs).
+#   - A `kind: field-name` signal in secrets.yaml (threshold: 4.0) catches
+#     high-entropy `value` fields — Authorization tokens, session IDs, API
+#     keys — without redacting low-entropy values like "gzip" or "text/html".
+#   - The streaming regex pass (secrets.yaml) catches shaped tokens (Bearer,
+#     Basic, JWT, AWS) that appear inside request/response bodies.
+
+- processor: json
+  extensions: [".har"]
+  fields:
+    # Full request URL — query string may embed tokens or credentials
+    - pattern: "log.entries.request.url"
+      category: url
+      label: har_request_url
+
+    # Request body — form posts, JSON payloads, and multipart uploads can
+    # all carry credentials or PII
+    - pattern: "log.entries.request.postData.text"
+      category: custom:body
+      label: har_request_body
+      min_length: 4
+
+    # Request cookie values
+    - pattern: "log.entries.request.cookies.value"
+      category: auth_token
+      label: har_request_cookie_value
+      min_length: 4
+
+    # Request cookie domain — reveals internal hostnames
+    - pattern: "log.entries.request.cookies.domain"
+      category: hostname
+      label: har_request_cookie_domain
+
+    # Response body — may contain tokens, user data, or API secrets in
+    # JSON responses (e.g. access_token, refresh_token, user.email)
+    - pattern: "log.entries.response.content.text"
+      category: custom:body
+      label: har_response_body
+      min_length: 4
+
+    # Response cookie values (Set-Cookie)
+    - pattern: "log.entries.response.cookies.value"
+      category: auth_token
+      label: har_response_cookie_value
+      min_length: 4
+
+    # Response cookie domain
+    - pattern: "log.entries.response.cookies.domain"
+      category: hostname
+      label: har_response_cookie_domain
+
+    # Redirect URL — Location header targets can reveal internal paths
+    - pattern: "log.entries.response.redirectURL"
+      category: url
+      label: har_redirect_url
+      min_length: 8
+
+    # Server IP recorded per entry
+    - pattern: "log.entries.serverIPAddress"
+      category: ipv4
+      label: har_server_ip
