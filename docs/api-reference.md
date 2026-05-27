@@ -49,7 +49,7 @@ All public types are re-exported from the crate root (`rust_sanitize::*`) for co
 | `HmacGenerator` | Deterministic generator using `HMAC-SHA256(key, category_tag \|\| "\x00" \|\| original)`. Key is zeroized on drop. |
 | `HmacGenerator::new(key: [u8; 32])` | Create from a 32-byte key. |
 | `HmacGenerator::from_slice(bytes)` | Create from a byte slice (must be exactly 32 bytes). |
-| `RandomGenerator` | Non-deterministic generator using OS CSPRNG (`thread_rng`). |
+| `RandomGenerator` | Non-deterministic generator using OS CSPRNG (`rand::rng()`). |
 | `RandomGenerator::new()` | Create a new random generator. |
 
 ## Strategy Module (`strategy`)

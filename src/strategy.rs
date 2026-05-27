@@ -191,6 +191,26 @@ impl ReplacementGenerator for StrategyGenerator {
 // Built-in strategies
 // ===========================================================================
 
+/// Seed a 64-bit xorshift PRNG from a 32-byte entropy buffer.
+///
+/// Folds the four 8-byte little-endian chunks via wrapping addition so that
+/// all 256 bits of entropy influence the initial state. Guards against the
+/// degenerate all-zero state that would cause xorshift64 to produce only zeros.
+#[inline]
+fn xorshift64_seed(entropy: &[u8; 32]) -> u64 {
+    let mut state = 0u64;
+    for chunk in entropy.chunks_exact(8) {
+        let arr: [u8; 8] = chunk
+            .try_into()
+            .expect("chunks_exact(8) yields 8-byte slices");
+        state = state.wrapping_add(u64::from_le_bytes(arr));
+    }
+    if state == 0 {
+        state = 0xDEAD_BEEF_CAFE_BABE;
+    }
+    state
+}
+
 // ---------------------------------------------------------------------------
 // 1. RandomString
 // ---------------------------------------------------------------------------
@@ -235,21 +255,8 @@ impl Strategy for RandomString {
         const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz\
                                   ABCDEFGHIJKLMNOPQRSTUVWXYZ\
                                   0123456789";
-        // Expand entropy with a simple deterministic PRNG seeded from the
-        // 32 entropy bytes (xorshift64 on 8-byte chunks).
         let mut chars = String::with_capacity(self.len);
-        // Seed from all 32 entropy bytes via wrapping addition of 4 u64 chunks.
-        let mut state = 0u64;
-        for chunk in entropy.chunks_exact(8) {
-            // chunks_exact(8) on a [u8; 32] always yields exactly 8-byte slices.
-            let arr: [u8; 8] = chunk
-                .try_into()
-                .expect("chunks_exact(8) yields 8-byte slices");
-            state = state.wrapping_add(u64::from_le_bytes(arr));
-        }
-        if state == 0 {
-            state = 0xDEAD_BEEF_CAFE_BABE; // avoid degenerate zero state
-        }
+        let mut state = xorshift64_seed(entropy);
 
         for _ in 0..self.len {
             // xorshift64
@@ -387,19 +394,7 @@ impl Strategy for PreserveLength {
             return String::new();
         }
 
-        // Seed from all 32 entropy bytes via wrapping addition of 4 u64 chunks.
-        let mut state = 0u64;
-        for chunk in entropy.chunks_exact(8) {
-            // chunks_exact(8) on a [u8; 32] always yields exactly 8-byte slices.
-            let arr: [u8; 8] = chunk
-                .try_into()
-                .expect("chunks_exact(8) yields 8-byte slices");
-            state = state.wrapping_add(u64::from_le_bytes(arr));
-        }
-        if state == 0 {
-            state = 0xCAFE_BABE_DEAD_BEEFu64;
-        }
-
+        let mut state = xorshift64_seed(entropy);
         let mut result = String::with_capacity(target_len);
         for _ in 0..target_len {
             state ^= state << 13;

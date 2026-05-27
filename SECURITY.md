@@ -75,7 +75,7 @@ HMAC-SHA256(seed, category_tag || "\x00" || plaintext_value)
 - The **seed** is a 32-byte key provided at CLI invocation. Same seed +
   same value → same replacement across runs.
 - The seed is zeroized on `HmacGenerator` drop.
-- Category `domain_tag()` provides domain separation so e.g. an email
+- Category `domain_tag_hmac()` provides domain separation so e.g. an email
   `"alice"` and a hostname `"alice"` produce different replacements.
 
 ---

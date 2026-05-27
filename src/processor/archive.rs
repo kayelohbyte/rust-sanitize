@@ -56,18 +56,15 @@ use crate::processor::registry::ProcessorRegistry;
 use crate::scanner::{ScanStats, StreamScanner};
 use crate::store::MappingStore;
 
-/// Strip path components from a zip entry name that could cause the output
-/// archive to be extracted outside the intended directory by a naive consumer.
+/// Strip path traversal components from an archive entry path before writing output.
 ///
 /// Removes: leading `/`, `./`, and any `../` sequences. The result is always
 /// a relative path with no upward traversal. An empty result is replaced with
-/// `"_"` to avoid writing an entry with a blank name.
-fn sanitize_zip_entry_name(name: &str) -> String {
-    // Normalise backslashes (Windows zips) to forward slashes.
+/// `"_"` to avoid writing an entry with a blank name. Backslashes are
+/// normalised to forward slashes (handles Windows-style zip entries).
+fn sanitize_archive_entry_name(name: &str) -> String {
     let name = name.replace('\\', "/");
-    // Strip leading slashes and dots.
     let name = name.trim_start_matches('/');
-    // Resolve each segment, dropping `.` and `..`.
     let safe: Vec<&str> = name
         .split('/')
         .filter(|s| !s.is_empty() && *s != "." && *s != "..")
@@ -80,23 +77,14 @@ fn sanitize_zip_entry_name(name: &str) -> String {
     }
 }
 
-/// Strip path traversal components from a tar entry path before writing output.
-///
-/// Mirrors [`sanitize_zip_entry_name`]: removes leading `/`, `./`, and any
-/// `../` sequences so a crafted archive cannot write outside the output tree.
+#[inline]
+fn sanitize_zip_entry_name(name: &str) -> String {
+    sanitize_archive_entry_name(name)
+}
+
+#[inline]
 fn sanitize_tar_entry_name(name: &str) -> String {
-    let name = name.replace('\\', "/");
-    let name = name.trim_start_matches('/');
-    let safe: Vec<&str> = name
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-        .collect();
-    let result = safe.join("/");
-    if result.is_empty() {
-        "_".to_string()
-    } else {
-        result
-    }
+    sanitize_archive_entry_name(name)
 }
 
 use glob::MatchOptions;
