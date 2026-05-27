@@ -80,6 +80,25 @@ fn sanitize_zip_entry_name(name: &str) -> String {
     }
 }
 
+/// Strip path traversal components from a tar entry path before writing output.
+///
+/// Mirrors [`sanitize_zip_entry_name`]: removes leading `/`, `./`, and any
+/// `../` sequences so a crafted archive cannot write outside the output tree.
+fn sanitize_tar_entry_name(name: &str) -> String {
+    let name = name.replace('\\', "/");
+    let name = name.trim_start_matches('/');
+    let safe: Vec<&str> = name
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .collect();
+    let result = safe.join("/");
+    if result.is_empty() {
+        "_".to_string()
+    } else {
+        result
+    }
+}
+
 use glob::MatchOptions;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -935,12 +954,16 @@ impl ArchiveProcessor {
                 stats.merge(&entry_stats);
 
                 let mut new_header = entry.header.clone();
+                let safe_path = sanitize_tar_entry_name(&entry.path);
+                new_header
+                    .set_path(&safe_path)
+                    .map_err(|e| SanitizeError::ArchiveError(format!("set path '{safe_path}': {e}")))?;
                 new_header.set_size(sanitized_buf.len() as u64);
                 new_header.set_cksum();
                 builder
                     .append(&new_header, sanitized_buf.as_slice())
                     .map_err(|e| {
-                        SanitizeError::ArchiveError(format!("append '{}': {e}", entry.path))
+                        SanitizeError::ArchiveError(format!("append '{safe_path}': {e}"))
                     })?;
                 stats.files_processed += 1;
                 self.emit_progress(&stats, None, &entry.path);
@@ -975,12 +998,16 @@ impl ArchiveProcessor {
                     processor.sanitize_entry_bytes(&entry.path, &entry.data, size_hint, depth)?;
                 stats.merge(&entry_stats);
                 let mut new_header = entry.header.clone();
+                let safe_path = sanitize_tar_entry_name(&entry.path);
+                new_header
+                    .set_path(&safe_path)
+                    .map_err(|e| SanitizeError::ArchiveError(format!("set path '{safe_path}': {e}")))?;
                 new_header.set_size(sanitized_buf.len() as u64);
                 new_header.set_cksum();
                 builder
                     .append(&new_header, sanitized_buf.as_slice())
                     .map_err(|e| {
-                        SanitizeError::ArchiveError(format!("append '{}': {e}", entry.path))
+                        SanitizeError::ArchiveError(format!("append '{safe_path}': {e}"))
                     })?;
                 stats.files_processed += 1;
                 processor.emit_progress(stats, None, &entry.path);
@@ -1039,12 +1066,16 @@ impl ArchiveProcessor {
                     drop(entry);
 
                     let mut new_header = header.clone();
+                    let safe_path = sanitize_tar_entry_name(&path);
+                    new_header
+                        .set_path(&safe_path)
+                        .map_err(|e| SanitizeError::ArchiveError(format!("set path '{safe_path}': {e}")))?;
                     new_header.set_size(sanitized_buf.len() as u64);
                     new_header.set_cksum();
                     builder
                         .append(&new_header, sanitized_buf.as_slice())
                         .map_err(|e| {
-                            SanitizeError::ArchiveError(format!("append '{path}': {e}"))
+                            SanitizeError::ArchiveError(format!("append '{safe_path}': {e}"))
                         })?;
 
                     stats.merge(&entry_stats);
@@ -1140,7 +1171,7 @@ impl ArchiveProcessor {
             name: String,
             is_dir: bool,
             compression: zip::CompressionMethod,
-            last_modified: zip::DateTime,
+            last_modified: Option<zip::DateTime>,
             unix_mode: Option<u32>,
             size: u64,
         }
@@ -1185,11 +1216,13 @@ impl ArchiveProcessor {
 
         let mut stats = ArchiveStats::default();
 
-        // Helper: build FileOptions for a metadata entry.
+        // Helper: build SimpleFileOptions for a metadata entry.
         let make_options = |m: &ZipMeta| {
-            let opts = zip::write::FileOptions::default()
-                .compression_method(m.compression)
-                .last_modified_time(m.last_modified);
+            let mut opts = zip::write::SimpleFileOptions::default()
+                .compression_method(m.compression);
+            if let Some(dt) = m.last_modified {
+                opts = opts.last_modified_time(dt);
+            }
             if let Some(mode) = m.unix_mode {
                 opts.unix_permissions(mode)
             } else {
@@ -1656,7 +1689,7 @@ mod tests {
         {
             let mut zip = zip::ZipWriter::new(&mut buf);
             for (name, data) in entries {
-                let options = zip::write::FileOptions::default()
+                let options = zip::write::SimpleFileOptions::default()
                     .compression_method(zip::CompressionMethod::Deflated);
                 zip.start_file(*name, options).unwrap();
                 zip.write_all(data).unwrap();
@@ -1718,10 +1751,10 @@ mod tests {
         {
             let mut zip = zip::ZipWriter::new(&mut buf);
 
-            let dir_options = zip::write::FileOptions::default();
+            let dir_options = zip::write::SimpleFileOptions::default();
             zip.add_directory("subdir/", dir_options).unwrap();
 
-            let file_options = zip::write::FileOptions::default()
+            let file_options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zip.start_file("subdir/data.txt", file_options).unwrap();
             zip.write_all(b"SUPERSECRET value").unwrap();

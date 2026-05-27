@@ -94,7 +94,7 @@ fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     {
         let mut zip = zip::ZipWriter::new(&mut buf);
         for (name, data) in entries {
-            let opts = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             zip.start_file(*name, opts).unwrap();
             zip.write_all(data).unwrap();
@@ -397,10 +397,10 @@ fn zip_directory_passthrough() {
     let mut buf = Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut buf);
-        zip.add_directory("mydir/", zip::write::FileOptions::default())
+        zip.add_directory("mydir/", zip::write::SimpleFileOptions::default())
             .unwrap();
         let opts =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("mydir/data.txt", opts).unwrap();
         zip.write_all(b"alice@corp.com").unwrap();
         zip.finish().unwrap();

@@ -1,17 +1,21 @@
 [package]
-name = "sanitize-engine"
+name = "rust-sanitize"
 version = "0.10.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Deterministic one-way data sanitization engine"
 license = "Apache-2.0"
 repository = "https://github.com/kayelohbyte/rust-sanitize"
-documentation = "https://docs.rs/sanitize-engine"
+documentation = "https://docs.rs/rust-sanitize"
 readme = "README.md"
 categories = ["command-line-utilities", "text-processing"]
 keywords = ["sanitization", "redaction", "privacy", "pii"]
 exclude = ["tests/", "fuzz/", ".github/", "docs/", "target/"]
 autobins = false
+
+[lib]
+name = "sanitize_engine"
+path = "src/lib.rs"
 
 [features]
 default = []
@@ -35,7 +39,7 @@ serde_yaml_ng = "0.10"
 toml = "0.8"
 quick-xml = "0.31"
 csv = "1"
-zip = { version = "0.6", default-features = false, features = ["deflate"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4.45"
 flate2 = "1"
 clap = { version = "4.5.60", features = ["derive"] }

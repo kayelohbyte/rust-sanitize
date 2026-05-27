@@ -35,19 +35,28 @@ import { z } from "zod";
 // ---------------------------------------------------------------------------
 
 const SANITIZE_BIN = Deno.env.get("SANITIZE_BIN") ?? "sanitize";
-const MAX_CONTENT_BYTES = parseInt(
-  Deno.env.get("SANITIZE_MCP_MAX_CONTENT_BYTES") ?? "524288",
-  10,
+
+/** Parse a positive integer from an env var string; returns fallback on NaN, 0, or negative. */
+function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const MAX_CONTENT_BYTES = parsePositiveInt(
+  Deno.env.get("SANITIZE_MCP_MAX_CONTENT_BYTES"), 524288,
 );
 // MCP default is lower than the CLI default (3) to limit zip-bomb exposure.
-const MAX_ARCHIVE_DEPTH = parseInt(
-  Deno.env.get("SANITIZE_MCP_MAX_ARCHIVE_DEPTH") ?? "2",
-  10,
+const MAX_ARCHIVE_DEPTH = parsePositiveInt(
+  Deno.env.get("SANITIZE_MCP_MAX_ARCHIVE_DEPTH"), 2,
 );
 // When set, appended to every processing invocation to cap CPU usage.
+// The value is validated and re-serialised as a decimal integer to prevent flag injection.
 const THREADS_ARGS: string[] = (() => {
   const t = Deno.env.get("SANITIZE_MCP_THREADS");
-  return t ? ["--threads", t] : [];
+  if (!t) return [];
+  const n = parseInt(t, 10);
+  return Number.isFinite(n) && n > 0 ? ["--threads", String(n)] : [];
 })();
 const SANITIZE_SECRETS_DIR = Deno.env.get("SANITIZE_SECRETS_DIR");
 const SANITIZE_SECRETS_DIR_RESOLVED = SANITIZE_SECRETS_DIR
@@ -91,9 +100,8 @@ const decoder = new TextDecoder();
  * The subprocess never receives sensitive content via argv —
  * only via the stdin pipe or a mode-0600 temp file.
  */
-const SUBPROCESS_TIMEOUT_MS = parseInt(
-  Deno.env.get("SANITIZE_MCP_TIMEOUT_MS") ?? "60000",
-  10,
+const SUBPROCESS_TIMEOUT_MS = parsePositiveInt(
+  Deno.env.get("SANITIZE_MCP_TIMEOUT_MS"), 60000,
 );
 
 /**
@@ -247,6 +255,20 @@ function checkContentSize(content: string, label = "content"): void {
     );
   }
 }
+
+/**
+ * Return a sanitized excerpt from subprocess stderr for use in error messages.
+ * Capped at 200 chars to avoid leaking unexpectedly verbose output.
+ */
+function safeStderr(result: RunResult): string {
+  const raw = safeStderr(result);
+  return raw.length > 200 ? raw.slice(0, 200) + "…" : raw;
+}
+
+// Concurrency guard: limit simultaneous subprocess invocations to avoid
+// resource exhaustion when many tool calls arrive at once.
+const MAX_CONCURRENT = 4;
+let activeCalls = 0;
 
 // ---------------------------------------------------------------------------
 // Output name prediction + archive detection
@@ -497,14 +519,29 @@ async function toolSanitize(params: {
   }
   if (hasFiles) {
     for (const f of params.files!) {
+      if (f.startsWith("-")) throw new Error(`files entry '${f}' must not start with '-' (flag injection)`);
       validatePath(f, "files", true);
       validateFilesPath(f);
     }
   } else {
     checkContentSize(params.content!);
   }
+  for (const af of params.archive_filters ?? []) {
+    for (const p of af.only ?? []) {
+      if (p.startsWith("-")) throw new Error(`archive_filters only pattern '${p}' must not start with '-'`);
+    }
+    for (const p of af.exclude ?? []) {
+      if (p.startsWith("-")) throw new Error(`archive_filters exclude pattern '${p}' must not start with '-'`);
+    }
+  }
   if (params.secrets_file) validatePath(params.secrets_file, "secrets_file");
   if (params.profile) validatePath(params.profile, "profile");
+  if (params.llm_template) {
+    const builtins = ["troubleshoot", "review-config", "review-security"];
+    if (!builtins.includes(params.llm_template)) {
+      validatePath(params.llm_template, "llm_template");
+    }
+  }
   if (
     params.use_default &&
     (params.secrets_file || params.namespace || (params.patterns && params.patterns.length > 0))
@@ -514,6 +551,10 @@ async function toolSanitize(params: {
     );
   }
 
+  if (activeCalls >= MAX_CONCURRENT) {
+    throw new Error(`Too many concurrent requests (max ${MAX_CONCURRENT}). Retry after current calls complete.`);
+  }
+  activeCalls++;
   const tmpDir = await Deno.makeTempDir({ prefix: TEMP_PREFIX });
   try {
     const env: Record<string, string> = {};
@@ -606,14 +647,14 @@ async function toolSanitize(params: {
         // --llm writes the formatted prompt to stdout instead of the output file.
         const result = await runSanitize(["-", ...commonArgs], params.content!, env);
         if (result.exitCode !== 0) {
-          throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+          throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
         }
         content = result.stdout;
       } else {
         const outputPath = join(tmpDir, "output.txt");
         const result = await runSanitize(["-", "--output", outputPath, ...commonArgs], params.content!, env);
         if (result.exitCode !== 0) {
-          throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+          throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
         }
         content = await Deno.readTextFile(outputPath);
       }
@@ -648,7 +689,7 @@ async function toolSanitize(params: {
     const result = await runSanitize([...inputArgs, "--output", outputDir, ...commonArgs], null, env);
 
     if (result.exitCode !== 0) {
-      throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+      throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
     }
 
     // When --llm is active, the formatted prompt is on stdout — return it directly.
@@ -685,6 +726,7 @@ async function toolSanitize(params: {
     }
     return { results: fileResults };
   } finally {
+    activeCalls--;
     await Deno.remove(tmpDir, { recursive: true });
   }
 }
@@ -720,9 +762,21 @@ async function toolScan(params: {
     throw new Error("'content' and 'files' are mutually exclusive — provide one or the other");
   }
   if (hasFiles) {
-    for (const f of params.files!) { validatePath(f, "files", true); validateFilesPath(f); }
+    for (const f of params.files!) {
+      if (f.startsWith("-")) throw new Error(`files entry '${f}' must not start with '-' (flag injection)`);
+      validatePath(f, "files", true);
+      validateFilesPath(f);
+    }
   } else {
     checkContentSize(params.content!);
+  }
+  for (const af of params.archive_filters ?? []) {
+    for (const p of af.only ?? []) {
+      if (p.startsWith("-")) throw new Error(`archive_filters only pattern '${p}' must not start with '-'`);
+    }
+    for (const p of af.exclude ?? []) {
+      if (p.startsWith("-")) throw new Error(`archive_filters exclude pattern '${p}' must not start with '-'`);
+    }
   }
   if (params.secrets_file) validatePath(params.secrets_file, "secrets_file");
   if (params.profile) validatePath(params.profile, "profile");
@@ -735,6 +789,10 @@ async function toolScan(params: {
     );
   }
 
+  if (activeCalls >= MAX_CONCURRENT) {
+    throw new Error(`Too many concurrent requests (max ${MAX_CONCURRENT}). Retry after current calls complete.`);
+  }
+  activeCalls++;
   const tmpDir = await Deno.makeTempDir({ prefix: TEMP_PREFIX });
   try {
     const reportPath = join(tmpDir, "report.json");
@@ -810,12 +868,13 @@ async function toolScan(params: {
       return { secrets_detected: true, report: JSON.parse(await Deno.readTextFile(reportPath)) };
     }
     if (result.exitCode !== 0) {
-      throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+      throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
     }
 
     const report = JSON.parse(await Deno.readTextFile(reportPath));
     return params.fail_on_match ? { secrets_detected: false, report } : report;
   } finally {
+    activeCalls--;
     await Deno.remove(tmpDir, { recursive: true });
   }
 }
@@ -841,6 +900,10 @@ async function toolStripConfigValues(params: {
     checkContentSize(params.content!);
   }
 
+  if (activeCalls >= MAX_CONCURRENT) {
+    throw new Error(`Too many concurrent requests (max ${MAX_CONCURRENT}). Retry after current calls complete.`);
+  }
+  activeCalls++;
   const tmpDir = await Deno.makeTempDir({ prefix: TEMP_PREFIX });
   try {
     const stripArgs = [
@@ -855,7 +918,7 @@ async function toolStripConfigValues(params: {
       const outputPath = join(tmpDir, "output.txt");
       const result = await runSanitize(["-", "--output", outputPath, ...stripArgs], params.content!);
       if (result.exitCode !== 0) {
-        throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+        throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
       }
       return await Deno.readTextFile(outputPath);
     }
@@ -864,7 +927,7 @@ async function toolStripConfigValues(params: {
     await Deno.mkdir(outputDir);
     const result = await runSanitize([...params.files!, "--output", outputDir, ...stripArgs], null);
     if (result.exitCode !== 0) {
-      throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+      throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
     }
 
     const usedNames = new Set<string>();
@@ -875,6 +938,7 @@ async function toolStripConfigValues(params: {
     }
     return fileResults;
   } finally {
+    activeCalls--;
     await Deno.remove(tmpDir, { recursive: true });
   }
 }
@@ -900,7 +964,7 @@ async function toolTestAllowlist(params: {
 
   if (result.exitCode !== 0) {
     throw new Error(
-      `sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`,
+      `sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`,
     );
   }
 
@@ -910,7 +974,7 @@ async function toolTestAllowlist(params: {
 async function toolListApps(): Promise<string> {
   const result = await runSanitize(["apps"], null);
   if (result.exitCode !== 0) {
-    throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+    throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
   }
   return result.stdout;
 }
@@ -928,7 +992,7 @@ async function toolBuildSecrets(params: {
   preset?: string;
   overwrite?: boolean;
 }): Promise<string> {
-  validatePath(params.output_path, "output_path", true);
+  validatePath(params.output_path, "output_path");
 
   if (!params.overwrite && await fileExists(params.output_path)) {
     throw new Error(
@@ -936,39 +1000,47 @@ async function toolBuildSecrets(params: {
     );
   }
 
-  let content: string;
-
-  if (params.preset) {
-    const args = ["template", "--preset", params.preset, "--output", params.output_path, "--overwrite"];
-    const result = await runSanitize(args, null);
-    if (result.exitCode !== 0) {
-      throw new Error(`sanitize template failed: ${result.stderr.trim()}`);
-    }
-    content = await Deno.readTextFile(params.output_path);
-  } else {
-    content =
-      "# sanitize secrets file\n" +
-      "# Generated by build_secrets. Edit patterns as needed.\n" +
-      "# Run: sanitize <input> -s " +
-      params.output_path +
-      " -o <output>\n\nsecrets:\n";
+  if (activeCalls >= MAX_CONCURRENT) {
+    throw new Error(`Too many concurrent requests (max ${MAX_CONCURRENT}). Retry after current calls complete.`);
   }
+  activeCalls++;
+  try {
+    let content: string;
 
-  if (params.entries && params.entries.length > 0) {
-    content += "\n  # Custom entries\n";
-    for (const e of params.entries) {
-      const kind = e.kind ?? "literal";
-      const patEscaped = e.pattern.replace(/'/g, "''");
-      content += `  - label: ${e.label}\n`;
-      content += `    kind: ${kind}\n`;
-      content += `    pattern: '${patEscaped}'\n`;
-      if (e.category) content += `    category: ${e.category}\n`;
-      content += "\n";
+    if (params.preset) {
+      const args = ["template", "--preset", params.preset, "--output", params.output_path, "--overwrite"];
+      const result = await runSanitize(args, null);
+      if (result.exitCode !== 0) {
+        throw new Error(`sanitize template failed: ${safeStderr(result)}`);
+      }
+      content = await Deno.readTextFile(params.output_path);
+    } else {
+      content =
+        "# sanitize secrets file\n" +
+        "# Generated by build_secrets. Edit patterns as needed.\n" +
+        "# Run: sanitize <input> -s " +
+        params.output_path +
+        " -o <output>\n\nsecrets:\n";
     }
-  }
 
-  await Deno.writeTextFile(params.output_path, content);
-  return content;
+    if (params.entries && params.entries.length > 0) {
+      content += "\n  # Custom entries\n";
+      for (const e of params.entries) {
+        const kind = e.kind ?? "literal";
+        const patEscaped = e.pattern.replace(/'/g, "''");
+        content += `  - label: ${e.label}\n`;
+        content += `    kind: ${kind}\n`;
+        content += `    pattern: '${patEscaped}'\n`;
+        if (e.category) content += `    category: ${e.category}\n`;
+        content += "\n";
+      }
+    }
+
+    await Deno.writeTextFile(params.output_path, content);
+    return content;
+  } finally {
+    activeCalls--;
+  }
 }
 
 async function toolTestPattern(params: {
@@ -989,6 +1061,10 @@ async function toolTestPattern(params: {
     throw new Error("namespace cannot be combined with secrets_file or patterns");
   }
 
+  if (activeCalls >= MAX_CONCURRENT) {
+    throw new Error(`Too many concurrent requests (max ${MAX_CONCURRENT}). Retry after current calls complete.`);
+  }
+  activeCalls++;
   const tmpDir = await Deno.makeTempDir({ prefix: TEMP_PREFIX });
   try {
     const env: Record<string, string> = {};
@@ -1023,10 +1099,11 @@ async function toolTestPattern(params: {
       result.exitCode === 1 &&
       result.stderr.includes("some values did not match any pattern");
     if (result.exitCode !== 0 && !isPartialMatch) {
-      throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+      throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
     }
     return JSON.parse(result.stdout);
   } finally {
+    activeCalls--;
     await Deno.remove(tmpDir, { recursive: true });
   }
 }
@@ -1335,8 +1412,8 @@ const StripSchema = {
   files: z.array(z.string()).optional().describe(
     "One or more paths to strip values from (absolute or relative). Mutually exclusive with `content`.",
   ),
-  delimiter: z.string().optional().describe('Key-value delimiter (default: "=")'),
-  comment_prefix: z.string().optional().describe('Comment prefix character (default: "#")'),
+  delimiter: z.string().max(10).optional().describe('Key-value delimiter (default: "=")'),
+  comment_prefix: z.string().max(20).optional().describe('Comment prefix character (default: "#")'),
 };
 
 type SanitizeParams = z.infer<z.ZodObject<typeof SanitizeSchema>>;
@@ -1457,7 +1534,7 @@ server.tool(
   {
     output_path: z
       .string()
-      .describe("Absolute or relative path where the secrets YAML file should be written (e.g. 'secrets.yaml' or '/home/user/project/secrets.yaml')."),
+      .describe("Relative path where the secrets YAML file should be written (e.g. 'secrets.yaml' or 'config/secrets.yaml')."),
     preset: z
       .enum(["generic", "web", "k8s", "database", "aws"])
       .optional()
@@ -1473,12 +1550,13 @@ server.tool(
     overwrite?: boolean;
   }) => {
     try {
+      validatePath(params.output_path, "output_path");
       const args = ["template", "--output", params.output_path];
       if (params.preset) args.push("--preset", params.preset);
       if (params.overwrite) args.push("--overwrite");
       const result = await runSanitize(args, null);
       if (result.exitCode !== 0) {
-        throw new Error(`sanitize exited with code ${result.exitCode}: ${result.stderr.trim()}`);
+        throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
       }
       const preset = params.preset ?? "generic";
       let fileContent = "";
@@ -1546,7 +1624,7 @@ server.tool(
   {
     output_path: z
       .string()
-      .describe("Path where the secrets YAML file should be written."),
+      .describe("Relative path where the secrets YAML file should be written (e.g. 'secrets.yaml')."),
     entries: z
       .array(
         z.object({
