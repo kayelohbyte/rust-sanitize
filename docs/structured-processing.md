@@ -486,12 +486,12 @@ sanitize config.yaml app.log --profile profile.yaml -s secrets.yaml
 ## Library API
 
 ```rust
-use sanitize_engine::category::Category;
-use sanitize_engine::generator::HmacGenerator;
-use sanitize_engine::processor::key_value::KeyValueProcessor;
-use sanitize_engine::processor::profile::{FieldRule, FileTypeProfile};
-use sanitize_engine::processor::Processor;
-use sanitize_engine::store::MappingStore;
+use rust_sanitize::category::Category;
+use rust_sanitize::generator::HmacGenerator;
+use rust_sanitize::processor::key_value::KeyValueProcessor;
+use rust_sanitize::processor::profile::{FieldRule, FileTypeProfile};
+use rust_sanitize::processor::Processor;
+use rust_sanitize::store::MappingStore;
 use std::sync::Arc;
 
 let generator = Arc::new(HmacGenerator::new([42u8; 32]));

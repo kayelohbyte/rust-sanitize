@@ -29,9 +29,9 @@ MappingStore
 ## Library API Example
 
 ```rust
-use sanitize_engine::strategy::{PreserveLength, StrategyGenerator, EntropyMode};
-use sanitize_engine::store::MappingStore;
-use sanitize_engine::category::Category;
+use rust_sanitize::strategy::{PreserveLength, StrategyGenerator, EntropyMode};
+use rust_sanitize::store::MappingStore;
+use rust_sanitize::category::Category;
 use std::sync::Arc;
 
 // Create a strategy-based generator with deterministic entropy.
@@ -53,7 +53,7 @@ assert_eq!(replaced.len(), "alice@corp.com".len());
 Implement the `Strategy` trait and wrap it in `StrategyGenerator`:
 
 ```rust
-use sanitize_engine::strategy::Strategy;
+use rust_sanitize::strategy::Strategy;
 
 struct Redact;
 

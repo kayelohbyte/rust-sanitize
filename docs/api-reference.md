@@ -1,6 +1,6 @@
 # Library API Reference
 
-All public types are re-exported from the crate root (`sanitize_engine::*`) for convenience. The table below summarises every module and its key exports.
+All public types are re-exported from the crate root (`rust_sanitize::*`) for convenience. The table below summarises every module and its key exports.
 
 ## Scanner Module (`scanner`)
 
@@ -118,7 +118,7 @@ Scans sanitized output for error/warning keywords and captures the surrounding l
 ### Example — in-memory
 
 ```rust
-use sanitize_engine::log_context::{extract_context, LogContextConfig};
+use rust_sanitize::log_context::{extract_context, LogContextConfig};
 
 let log = "INFO  startup\nERROR disk full\nINFO  retrying\nINFO  done";
 let config = LogContextConfig::new().with_context_lines(1);
@@ -134,7 +134,7 @@ assert_eq!(result.matches[0].after,  vec!["INFO  retrying"]);
 ### Example — streaming (large files)
 
 ```rust
-use sanitize_engine::log_context::{extract_context_reader, LogContextConfig};
+use rust_sanitize::log_context::{extract_context_reader, LogContextConfig};
 use std::io::BufReader;
 use std::fs::File;
 
@@ -233,7 +233,7 @@ The allowlist suppresses specific values from sanitization. Values that match an
 | `*` | Anything |
 
 ```rust
-use sanitize_engine::allowlist::AllowlistMatcher;
+use rust_sanitize::allowlist::AllowlistMatcher;
 
 let (matcher, warnings) = AllowlistMatcher::new(vec![
     "localhost".into(),

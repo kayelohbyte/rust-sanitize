@@ -1,5 +1,7 @@
 # CLI Reference
 
+> For MCP server setup, tool parameters, and JSON call examples, see [mcp.md](mcp.md).
+
 ## `sanitize`
 
 ```
@@ -262,13 +264,13 @@ sanitize apps
 #   terraform          Terraform — *.tfvars variable files, terraform.tfstate sensitive outputs
 
 # Use a single bundle:
-sanitize config.rb --app gitlab -s secrets.yaml
+sanitize config.rb --app gitlab -s patterns.yaml
 
 # Combine multiple bundles in one run:
 sanitize nginx.conf gitlab.rb --app nginx,gitlab
 
-# Combine a bundle with a custom secrets file and profile:
-sanitize config.rb app.log --app gitlab -s extra-secrets.yaml --profile custom.profile.yaml
+# Combine a bundle with a custom patterns file and profile:
+sanitize config.rb server.log --app gitlab -s extra-patterns.yaml --profile custom.profile.yaml
 ```
 
 Each app bundle includes:
@@ -306,7 +308,7 @@ sanitize apps add myapp --secrets myapp.secrets.yaml
 sanitize apps add elastic --profile elastic.profile.yaml --overwrite
 
 # Use it immediately after installing:
-sanitize app.log --app elastic
+sanitize server.log --app elastic
 ```
 
 The bundle is stored under the user apps directory (see `sanitize apps dir`). The first `# comment` line of either YAML file becomes the description shown in `sanitize apps`.
@@ -361,7 +363,7 @@ sanitize apps edit <NAME>
 sanitize apps edit rails
 
 # After editing, use the customised bundle like any other:
-sanitize app.log --app rails
+sanitize server.log --app rails
 ```
 
 The copied files are placed in the user apps directory (see `sanitize apps dir`). To revert to the built-in version, remove the user copy with `sanitize apps remove <name> --yes`.
@@ -445,7 +447,6 @@ sanitize scan [OPTIONS] [INPUT]...
 | `--include-path <GLOB>` | Only scan files matching this glob pattern during directory walks. Repeatable. When both `--include-path` and `--exclude-path` match a file, exclusion wins. No effect on explicitly named file arguments. |
 | `-r, --report [PATH]` | Write a JSON match report to PATH (or stderr if omitted). |
 | `--entropy-threshold <THRESHOLD>` | Enable Shannon entropy detection for high-entropy tokens (bits/char, e.g. `4.5`). Off by default. Prints an entropy calibration histogram to stderr (counts only — no token values). |
-| `--use-default` | Load built-in balanced detection patterns. Additive with `--secrets-file` and `--app`. |
 | `--json` | Write findings as NDJSON to stdout instead of human-readable log. One JSON object per file plus a summary line. Implies `--progress off`. |
 | `--threads <N>` | Worker thread count (default: auto). |
 | `--log-format <FMT>` | `human` (default) or `json`. |
@@ -455,18 +456,18 @@ sanitize scan [OPTIONS] [INPUT]...
 **`--json` flag:** writes per-file findings as NDJSON to stdout instead of human-readable log output. Each line is a self-contained JSON object — one per file, plus a summary line. Implies `--no-progress`. Compatible with `jq`, SIEM ingest, and line-oriented JSON tools.
 
 ```
-{"type":"file","file":"app.log","matches":3,"clean":false,"patterns":{"aws_access_key":2,"github_pat":1},"bytes_processed":4096}
+{"type":"file","file":"server.log","matches":3,"clean":false,"patterns":{"aws_access_key":2,"github_pat":1},"bytes_processed":4096}
 {"type":"file","file":"clean.log","matches":0,"clean":true,"bytes_processed":512}
 {"type":"summary","files":2,"matches":3,"clean":false}
 ```
 
 ```bash
-sanitize scan app.log -s secrets.yaml                           # scan a file
+sanitize scan server.log -s patterns.yaml                       # scan a file
 sanitize scan ./logs/ --app gitlab                              # scan a directory
 sanitize scan . --exclude-path tests/fixtures/                   # skip test fixtures
 sanitize scan ./logs/ --include-path '*.log'                    # only .log files
 sanitize scan ./support-bundle/ --include-path '**/*.conf' --include-path '**/*.log'
-git diff HEAD | sanitize scan -s secrets.yaml                   # scan a patch
+git diff HEAD | sanitize scan -s patterns.yaml                  # scan a patch
 
 # Machine-readable output:
 sanitize scan ./logs/ --app gitlab --json
@@ -502,8 +503,8 @@ All three pattern sources are additive — you can combine `--pattern`, `--secre
 # Test an inline pattern:
 sanitize test-pattern --pattern 'ghp_([A-Za-z0-9_]{36})' 'ghp_abc123...'
 
-# Test all patterns in a secrets file:
-sanitize test-pattern -s secrets.yaml 'my-secret' 'safe-value'
+# Test all patterns in a patterns file:
+sanitize test-pattern -s patterns.yaml 'my-secret' 'safe-value'
 
 # Test an app bundle's patterns:
 sanitize test-pattern --app gitlab 'glpat-abc123xyz'
@@ -512,7 +513,7 @@ sanitize test-pattern --app gitlab 'glpat-abc123xyz'
 echo 'AKIA1234567890ABCDEF' | sanitize test-pattern --app aws
 
 # JSON output for scripting:
-sanitize test-pattern -s secrets.yaml --json 'value1' 'value2'
+sanitize test-pattern -s patterns.yaml --json 'value1' 'value2'
 ```
 
 ---
@@ -576,8 +577,8 @@ sanitize install-hook
 # Add app bundles on top of the default patterns:
 sanitize install-hook --app gitlab,kubernetes
 
-# Use a custom secrets file instead of the default:
-sanitize install-hook -s .sanitize/secrets.yaml
+# Use a custom patterns file instead of the default:
+sanitize install-hook -s .sanitize/patterns.yaml
 
 # Sanitize staged files in place (they'll be modified before committing):
 sanitize install-hook --mode sanitize
@@ -653,7 +654,7 @@ allow = ["localhost", "*.internal"]
 # Secrets file path, relative to this file.
 # Overrides the global default (~/.config/sanitize/secrets.yaml) but is
 # itself overridden by --secrets-file on the CLI.
-secrets_file = "secrets.yaml"
+secrets_file = "patterns.yaml"
 
 # Set to true when the secrets_file above is AES-GCM encrypted.
 # encrypted_secrets = false
@@ -730,7 +731,7 @@ sanitize allow-test \
   db.internal 192.168.1.5 8.8.8.8
 
 # Feed values from a file (one per line):
-cut -f3 app.log | sort -u | sanitize allow-test --allow '*.internal' --allow localhost
+cut -f3 server.log | sort -u | sanitize allow-test --allow '*.internal' --allow localhost
 
 # Machine-readable output for scripting:
 sanitize allow-test --allow '*.internal' db.internal github.com --json
@@ -791,6 +792,8 @@ sanitize template --preset aws --overwrite
 
 ### Default Mode — Sanitize
 
+When neither `-s`/`--secrets-file` nor `--app` is provided, the built-in pattern set is loaded automatically. It covers API keys (AWS, GCP, GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab, SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM headers, password/secret key=value pairs, and credential URLs — with common allow-patterns so loopback IPs, `localhost`, `example.com`, and similar are never replaced.
+
 | Flag / Argument | Short | Description |
 |-----------------|-------|-------------|
 | `[INPUT]...` | | One or more paths to sanitize. Any mix of plain files, structured files, and archives is accepted. Omit to read from stdin; use `-` to include stdin alongside file paths. `-` may appear at most once. |
@@ -810,8 +813,7 @@ sanitize template --preset aws --overwrite
 | `--threads <N>` | | Number of worker threads. When multiple input files are given, files are processed in parallel up to this limit. For a single archive input, entries are sanitized in parallel using the same budget. Defaults to the number of logical CPUs. Capped to available parallelism. |
 | `--max-archive-depth <N>` | | Maximum nesting depth for recursive archive processing (default: `3`, max: `10`). Each nesting level may buffer up to 256 MiB. Advanced flag — hidden from `--help` but works at runtime. |
 | `--profile <FILE>` | | Path to a file-type profile (JSON or YAML). Enables structured field-level sanitization for matched files. **Requires `--secrets-file`** — without one, discovered field values have nowhere to go and Phase 2 runs blind, producing incomplete sanitization. The secrets file may be empty on the first run; discovered literals are appended to it automatically (see `--no-structured-handoff`) so subsequent runs catch those values everywhere. See [Structured Processing](structured-processing.md). |
-| `--use-default` | | Use built-in balanced detection patterns without a secrets file. Covers API keys (AWS, GCP, GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, GitLab, SendGrid, npm), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM headers, password/secret key=value pairs, and credential URLs. Loads common allow patterns so loopback IPs, `localhost`, `example.com`, etc. are never replaced. Additive with `--secrets-file`, `--app`, and `--profile`. These same built-in patterns are also loaded automatically (without this flag) when none of `--secrets-file`, `--app`, `--profile`, or `--use-default` is specified (zero-config), or when `--app` is used without `--secrets-file`. Note: `--profile` alone no longer triggers built-in defaults — use `--use-default` explicitly if you want both. |
-| `--app <APPS>` | | Load built-in secrets patterns and structured field profiles for one or more applications. Comma-separated app names (e.g. `--app gitlab` or `--app gitlab,nginx`). Additive with `--use-default`, `--secrets-file`, and `--profile`. Loads common allow patterns. Run `sanitize apps` to list available app names. |
+| `--app <APPS>` | | Load built-in secrets patterns and structured field profiles for one or more applications. Comma-separated app names (e.g. `--app gitlab` or `--app gitlab,nginx`). Additive with `--secrets-file` and `--profile`. Run `sanitize apps` to list available app names. |
 | `--allow <PATTERN>` | | Allow a specific value through unchanged (repeatable). Matched values are not replaced and not recorded in the mapping store — they will pass through in every file processed in the same run. Supports exact strings and `*` glob patterns. Matching is **case-insensitive** by default (patterns and values are lowercased before comparison). Examples: `--allow localhost`, `--allow "*.internal"`, `--allow "192.168.1.*"`. Allowlist entries can also be placed in the secrets file as `kind: allow` entries. |
 | `--only <PATTERN>` | | Keep only archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--only` flags accumulate. Combined with `--exclude`: `--only` narrows first, then `--exclude` removes. Only affects archive inputs; ignored for plain files. |
 | `--exclude <PATTERN>` | | Remove archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--exclude` flags accumulate. |
@@ -870,35 +872,35 @@ Log level is controlled via the `SANITIZE_LOG` environment variable (e.g. `SANIT
 
 ```bash
 # Keep only entries matching test/test.config (exact full path):
-sanitize archive.zip --only test/test.config -s secrets.yaml
+sanitize archive.zip --only test/test.config -s patterns.yaml
 
 # Keep only JSON files at any depth:
-sanitize archive.zip --only '**/*.json' -s secrets.yaml
+sanitize archive.zip --only '**/*.json' -s patterns.yaml
 
 # Keep only entries under the config/ prefix:
-sanitize archive.zip --only 'config/' -s secrets.yaml
+sanitize archive.zip --only 'config/' -s patterns.yaml
 
 # Drop all .log files:
-sanitize archive.zip --exclude '*.log' -s secrets.yaml
+sanitize archive.zip --exclude '*.log' -s patterns.yaml
 
 # Keep only JSON files, then drop secrets.json:
-sanitize archive.zip --only '**/*.json' --exclude config/secrets.json -s secrets.yaml
+sanitize archive.zip --only '**/*.json' --exclude config/secrets.json -s patterns.yaml
 
 # Keep only JSON files in the root (not subdirectories):
-sanitize archive.zip --only '*.json' -s secrets.yaml
+sanitize archive.zip --only '*.json' -s patterns.yaml
 ```
 
 **Multiple archives — each gets its own filter**
 
 ```bash
 # a.zip keeps only config/, b.tar.gz keeps only *.log files:
-sanitize a.zip --only 'config/' b.tar.gz --only '**/*.log' -s secrets.yaml
+sanitize a.zip --only 'config/' b.tar.gz --only '**/*.log' -s patterns.yaml
 
 # Mix an archive with a plain file — the plain file is not filtered:
-sanitize report.txt backup.zip --only 'logs/' -s secrets.yaml
+sanitize report.txt backup.zip --only 'logs/' -s patterns.yaml
 
 # Mix stdin with an archive filter:
-cat extra.log | sanitize - backup.zip --only 'logs/' -s secrets.yaml
+cat extra.log | sanitize - backup.zip --only 'logs/' -s patterns.yaml
 ```
 
 #### Directory Walk Filtering (`--include-path` / `--exclude-path`)
@@ -923,19 +925,19 @@ cat extra.log | sanitize - backup.zip --only 'logs/' -s secrets.yaml
 
 ```bash
 # Only process .log files in a directory:
-sanitize ./logs/ -s secrets.yaml --include-path '*.log'
+sanitize ./logs/ -s patterns.yaml --include-path '*.log'
 
 # Only .conf and .log files anywhere in the tree:
-sanitize /etc/ -s secrets.yaml --include-path '**/*.conf' --include-path '**/*.log'
+sanitize /etc/ -s patterns.yaml --include-path '**/*.conf' --include-path '**/*.log'
 
 # Include a subtree:
-sanitize ./support-bundle/ -s secrets.yaml --include-path 'app/'
+sanitize ./support-bundle/ -s patterns.yaml --include-path 'app/'
 
 # Include only logs but skip test fixtures (exclusion wins):
-sanitize ./logs/ -s secrets.yaml --include-path '*.log' --exclude-path 'tests/'
+sanitize ./logs/ -s patterns.yaml --include-path '*.log' --exclude-path 'tests/'
 
 # Exclude a vendor subtree (no include filter — all other files are processed):
-sanitize . -s secrets.yaml --exclude-path 'vendor/'
+sanitize . -s patterns.yaml --exclude-path 'vendor/'
 ```
 
 **Directory expansion feedback**
@@ -1017,19 +1019,19 @@ Examples:
 ```bash
 # Default behavior: spinner in interactive terminals, silent in CI/non-TTY.
 # Redaction summary always prints to stderr.
-sanitize large.log -s secrets.enc --encrypted-secrets --password
+sanitize large.log -s patterns.enc --encrypted-secrets --password
 
 # Force progress messages even in non-interactive environments.
-sanitize large.log -s secrets.enc --encrypted-secrets --password --progress on
+sanitize large.log -s patterns.enc --encrypted-secrets --password --progress on
 
 # Suppress all decorative output (summary + progress). Exit code only.
-sanitize large.log -s secrets.enc --encrypted-secrets --password --quiet
+sanitize large.log -s patterns.enc --encrypted-secrets --password --quiet
 
 # Redirect sanitized payload and progress separately.
-sanitize large.log -s secrets.enc --encrypted-secrets --password --progress on > clean.log 2> progress.log
+sanitize large.log -s patterns.enc --encrypted-secrets --password --progress on > clean.log 2> progress.log
 
 # Keep machine-readable JSON logs clean (no spinner frames).
-sanitize large.log -s secrets.enc --encrypted-secrets --password --log-format json --progress on > clean.log 2> events.jsonl
+sanitize large.log -s patterns.enc --encrypted-secrets --password --log-format json --progress on > clean.log 2> events.jsonl
 ```
 
 #### Output Naming
@@ -1057,14 +1059,14 @@ When no input path is given (or one of the paths is `-`), `sanitize` reads from 
 
 ```bash
 # Pipe from grep with a plaintext secrets file:
-grep "error" app.log | sanitize -s secrets.yaml
+grep "error" server.log | sanitize -s patterns.yaml
 
 # Pipe from grep with an encrypted secrets file (use env var since stdin is a pipe):
 export SANITIZE_PASSWORD="my-password"
-grep "error" app.log | sanitize -s secrets.enc --encrypted-secrets
+grep "error" server.log | sanitize -s patterns.enc --encrypted-secrets
 
 # Read from stdin, write to a file (plaintext secrets):
-cat data.csv | sanitize -s secrets.yaml -f csv -o clean.csv
+cat data.csv | sanitize -s patterns.yaml -f csv -o clean.csv
 
 # Use with heredoc:
 sanitize -s secrets.json <<< "my secret api-key-12345"
@@ -1094,10 +1096,10 @@ Deferring stdin until after file discovery is what makes piping work correctly a
 ```bash
 # config.yaml runs first (Phase 1), discovers e.g. password: hunter2
 # error.json (stdin) is processed after — "hunter2" is replaced in it too
-cat error.json | sanitize config.yaml --profile profile.yaml -s secrets.yaml
+cat error.json | sanitize config.yaml --profile fields.yaml -s patterns.yaml
 
 # Without --profile, stdin runs immediately (no deferral — no discovery happens)
-cat error.json | sanitize -s secrets.yaml
+cat error.json | sanitize -s patterns.yaml
 ```
 
 **Does file order matter?**
@@ -1112,80 +1114,80 @@ The mapping store is shared across all phases and all threads. If `hunter2` is d
 
 ```bash
 # file order within Phase 2 does not affect replacements:
-sanitize a.log b.log c.log -s secrets.yaml   # same result as c b a order
+sanitize a.log b.log c.log -s patterns.yaml   # same result as c b a order
 ```
 
 #### Examples
 
 ```bash
 # Sanitize a single log file (output goes to data-sanitized.log):
-sanitize data.log -s secrets.yaml
+sanitize data.log -s patterns.yaml
 
 # Sanitize a directory (output goes to logs-sanitized/, tree structure preserved):
-sanitize logs/ -s secrets.yaml
-# Produces: logs-sanitized/app.log  logs-sanitized/sub/db.log  …
+sanitize logs/ -s patterns.yaml
+# Produces: logs-sanitized/server.log  logs-sanitized/sub/db.log  …
 
 # Sanitize a directory to an explicit output location:
-sanitize logs/ -s secrets.yaml -o /tmp/clean-logs/
+sanitize logs/ -s patterns.yaml -o /tmp/clean-logs/
 
 # Sanitize multiple files in one command:
-sanitize test.txt a.json b.zip -s secrets.yaml
+sanitize test.txt a.json b.zip -s patterns.yaml
 # Produces: test-sanitized.txt  a-sanitized.json  b.sanitized.zip
 
 # Send all sanitized files to a specific output directory:
-sanitize test.txt a.json b.zip -s secrets.yaml -o /tmp/clean/
+sanitize test.txt a.json b.zip -s patterns.yaml -o /tmp/clean/
 
 # Override output path for a single file:
-sanitize data.log -s secrets.yaml -o clean.log
+sanitize data.log -s patterns.yaml -o clean.log
 
 # Pipe from grep (plaintext secrets):
-grep "error" app.log | sanitize -s secrets.yaml
+grep "error" server.log | sanitize -s patterns.yaml
 
 # Mix stdin with file inputs (stdin goes to stdout, files get per-file outputs):
-cat extra.txt | sanitize - data.log -s secrets.yaml
+cat extra.txt | sanitize - data.log -s patterns.yaml
 
 # Mix stdin with an archive (stdin sanitized to stdout; archive gets its own output file):
-cat extra.log | sanitize - backup.zip -s secrets.yaml
+cat extra.log | sanitize - backup.zip -s patterns.yaml
 
 # Archive and plain file together (each gets its own output file):
-sanitize backup.zip config.yaml -s secrets.yaml
+sanitize backup.zip config.yaml -s patterns.yaml
 # Produces: backup.sanitized.zip  config-sanitized.yaml
 
 # Filter archive entries — keep only files under config/:
-sanitize backup.zip --only 'config/' -s secrets.yaml
+sanitize backup.zip --only 'config/' -s patterns.yaml
 
 # Filter by glob — keep only JSON files at any depth:
-sanitize backup.zip --only '**/*.json' -s secrets.yaml
+sanitize backup.zip --only '**/*.json' -s patterns.yaml
 
 # Filter by exact full path (paths are stored as-is inside the archive):
-sanitize test.zip --only test/test.config -s secrets.yaml
+sanitize test.zip --only test/test.config -s patterns.yaml
 
 # Combine --only and --exclude: keep JSON, drop secrets file:
-sanitize backup.zip --only '**/*.json' --exclude config/secrets.json -s secrets.yaml
+sanitize backup.zip --only '**/*.json' --exclude config/secrets.json -s patterns.yaml
 
 # Drop all log files from the output archive:
-sanitize backup.zip --exclude '**/*.log' -s secrets.yaml
+sanitize backup.zip --exclude '**/*.log' -s patterns.yaml
 
 # Per-archive filters — each archive has independent --only / --exclude:
-sanitize a.zip --only 'config/' b.tar.gz --only '**/*.log' -s secrets.yaml
+sanitize a.zip --only 'config/' b.tar.gz --only '**/*.log' -s patterns.yaml
 
 # Plain file alongside a filtered archive:
-sanitize report.txt backup.zip --only 'logs/' -s secrets.yaml
+sanitize report.txt backup.zip --only 'logs/' -s patterns.yaml
 # Produces: report-sanitized.txt  backup.sanitized.zip (with only logs/ entries)
 
 # Force progress to stderr while keeping stdout pipe-safe:
-grep "error" app.log | sanitize -s secrets.yaml --progress on > clean.log 2> progress.log
+grep "error" server.log | sanitize -s patterns.yaml --progress on > clean.log 2> progress.log
 
 # Structured stdin processing:
-cat config.yaml | sanitize -s secrets.yaml -f yaml -o clean.yaml
+cat config.yaml | sanitize -s patterns.yaml -f yaml -o clean.yaml
 
 # Encrypted secrets file — requires --encrypted-secrets:
-sanitize data.log -s secrets.enc --encrypted-secrets --password
-sanitize data.log -s secrets.enc --encrypted-secrets --password -o clean.log
+sanitize data.log -s patterns.enc --encrypted-secrets --password
+sanitize data.log -s patterns.enc --encrypted-secrets --password -o clean.log
 
 # Non-interactive pipeline with encrypted secrets (env var):
 export SANITIZE_PASSWORD="my-password"
-grep "error" app.log | sanitize -s secrets.enc --encrypted-secrets
+grep "error" server.log | sanitize -s patterns.enc --encrypted-secrets
 
 # Deterministic mode (reproducible replacements) with encrypted secrets:
 sanitize data.csv -s s.enc --encrypted-secrets --password -d
@@ -1200,22 +1202,22 @@ sanitize config.yaml -s s.enc --encrypted-secrets -P /run/secrets/pw --fail-on-m
 sanitize data.log -s s.enc --encrypted-secrets -P /run/secrets/pw
 
 # Extract context from sanitized output (capture surrounding lines for each error/warning):
-sanitize app.log -s secrets.yaml --report report.json --extract-context
+sanitize server.log -s patterns.yaml --report report.json --extract-context
 
 # Increase captured context window from default 10 to 20 lines:
-sanitize app.log -s secrets.yaml --report report.json --extract-context --context-lines 20
+sanitize server.log -s patterns.yaml --report report.json --extract-context --context-lines 20
 
 # Increase match cap (default 50) to capture more events before truncation:
-sanitize app.log -s secrets.yaml --report report.json --extract-context --max-context-matches 200
+sanitize server.log -s patterns.yaml --report report.json --extract-context --max-context-matches 200
 
 # Case-sensitive keyword matching (default is case-insensitive):
-sanitize app.log -s secrets.yaml --report report.json --extract-context --context-case-sensitive
+sanitize server.log -s patterns.yaml --report report.json --extract-context --context-case-sensitive
 
 # Custom keywords merged with defaults:
-sanitize app.log -s secrets.yaml --report report.json --extract-context --context-keywords timeout,oomkilled,backoff
+sanitize server.log -s patterns.yaml --report report.json --extract-context --context-keywords timeout,oomkilled,backoff
 
 # Use only custom keywords, suppress built-in defaults:
-sanitize app.log -s secrets.yaml --report report.json --extract-context --context-keywords "timeout,oomkilled" --context-keywords-replace
+sanitize server.log -s patterns.yaml --report report.json --extract-context --context-keywords "timeout,oomkilled" --context-keywords-replace
 
 # Strip values from a key=value config file — no secrets file required:
 sanitize config.ini --strip-values -o config-stripped.ini
@@ -1227,38 +1229,38 @@ sanitize nginx.conf --strip-values --strip-delimiter : -o nginx-stripped.conf
 sanitize app.conf --strip-values --strip-comment-prefix // -o app-stripped.conf
 
 # Generate a sanitized LLM-ready prompt with built-in troubleshoot template:
-sanitize app.log -s secrets.yaml --llm
+sanitize server.log -s patterns.yaml --llm
 
 # Configuration review:
-sanitize app.log -s secrets.yaml --llm review-config
+sanitize server.log -s patterns.yaml --llm review-config
 
 # Security posture review:
 sanitize nginx.conf --app nginx --llm review-security
 sanitize kubeconfig --app kubernetes --llm review-security
 
 # Use a custom template file:
-sanitize app.log -s secrets.yaml --llm /path/to/my-template.txt
+sanitize server.log -s patterns.yaml --llm /path/to/my-template.txt
 
 # Combine LLM output with context extraction for notable events:
-sanitize app.log -s secrets.yaml --report /tmp/report.json --extract-context --llm troubleshoot
+sanitize server.log -s patterns.yaml --report /tmp/report.json --extract-context --llm troubleshoot
 
 # Shannon entropy detection for unrecognized high-entropy tokens:
-sanitize app.log -s secrets.yaml --entropy-threshold 4.5
-sanitize app.log -s secrets.yaml --entropy-threshold 4.0 --report report.json
+sanitize server.log -s patterns.yaml --entropy-threshold 4.5
+sanitize server.log -s patterns.yaml --entropy-threshold 4.0 --report report.json
 
 # Exclude paths from a directory walk:
-sanitize ./logs/ -s secrets.yaml --exclude-path "tests/fixtures/"
-sanitize ./logs/ -s secrets.yaml --exclude-path "vendor/" --exclude-path "**/*.generated.*"
+sanitize ./logs/ -s patterns.yaml --exclude-path "tests/fixtures/"
+sanitize ./logs/ -s patterns.yaml --exclude-path "vendor/" --exclude-path "**/*.generated.*"
 
 # Only process specific file types in a directory:
-sanitize ./support-bundle/ -s secrets.yaml --include-path '*.log'
-sanitize /etc/ -s secrets.yaml --include-path '**/*.conf' --include-path '**/*.yaml'
+sanitize ./support-bundle/ -s patterns.yaml --include-path '*.log'
+sanitize /etc/ -s patterns.yaml --include-path '**/*.conf' --include-path '**/*.yaml'
 
 # Combine include and exclude (exclusion wins when both match):
-sanitize ./logs/ -s secrets.yaml --include-path '*.log' --exclude-path "tests/"
+sanitize ./logs/ -s patterns.yaml --include-path '*.log' --exclude-path "tests/"
 
 # Walk hidden files (dot-files) in a directory:
-sanitize ./config/ -s secrets.yaml --hidden
+sanitize ./config/ -s patterns.yaml --hidden
 sanitize . --app gitlab --hidden --exclude-path ".git/"
 ```
 
@@ -1368,7 +1370,7 @@ Use `kind: allow` to suppress specific values from sanitization. A value matchin
 Equivalent via CLI (for ad-hoc runs without editing the secrets file):
 
 ```bash
-sanitize data.log -s secrets.yaml \
+sanitize data.log -s patterns.yaml \
   --allow localhost \
   --allow "*.internal" \
   --allow "192.168.1.*"
@@ -1422,31 +1424,31 @@ At runtime, literal patterns are matched by an Aho-Corasick automaton (single mu
 **Sanitize a single file (interactive password prompt):**
 
 ```bash
-sanitize data.log -s secrets.enc --encrypted-secrets --password
+sanitize data.log -s patterns.enc --encrypted-secrets --password
 ```
 
 **Structured field-level sanitization with a profile:**
 
 ```bash
 # Sanitize only the password and username fields in config YAML files:
-sanitize config.yaml -s secrets.yaml --profile profile.yaml
+sanitize config.yaml -s patterns.yaml --profile fields.yaml
 
 # Process a config file and log file together:
-# values found in config.yaml are also replaced in app.log
-sanitize config.yaml app.log --profile profile.yaml -s secrets.yaml
+# values found in config.yaml are also replaced in server.log
+sanitize config.yaml server.log --profile fields.yaml -s patterns.yaml
 ```
 
 **Deterministic mode with profile (saves discovered values to secrets file):**
 
 ```bash
-# First run: discovers "hunter2" as a password, appends it to secrets.yaml
+# First run: discovers "hunter2" as a password, appends it to patterns.yaml
 SANITIZE_PASSWORD=secret sanitize config.yaml \
-  --profile profile.yaml --deterministic --secrets-file secrets.yaml
+  --profile fields.yaml --deterministic --secrets-file patterns.yaml
 
-# Second run against a log: "hunter2" is now in secrets.yaml and gets
+# Second run against a log: "hunter2" is now in patterns.yaml and gets
 # the same replacement as in the first run
-SANITIZE_PASSWORD=secret sanitize app.log \
-  --deterministic --secrets-file secrets.yaml
+SANITIZE_PASSWORD=secret sanitize server.log \
+  --deterministic --secrets-file patterns.yaml
 ```
 
 **Deterministic mode (same seed → same replacements every run):**
@@ -1465,29 +1467,29 @@ sanitize backup.tar.gz -s s.enc --encrypted-secrets --password -o backup.sanitiz
 
 ```bash
 # Exact full path (paths are stored as-is inside the archive, e.g. test/test.config):
-sanitize test.zip --only test/test.config -s secrets.yaml
+sanitize test.zip --only test/test.config -s patterns.yaml
 
 # Keep all JSON files at any depth (**/ crosses directory boundaries):
-sanitize backup.zip --only '**/*.json' -s secrets.yaml
+sanitize backup.zip --only '**/*.json' -s patterns.yaml
 
 # Keep an entire directory subtree (trailing / = directory-prefix match):
-sanitize backup.zip --only 'config/' -s secrets.yaml
+sanitize backup.zip --only 'config/' -s patterns.yaml
 
 # Drop all log files:
-sanitize backup.zip --exclude '**/*.log' -s secrets.yaml
+sanitize backup.zip --exclude '**/*.log' -s patterns.yaml
 
 # Combine: keep JSON files, then drop the secrets file:
-sanitize backup.zip --only '**/*.json' --exclude config/secrets.json -s secrets.yaml
+sanitize backup.zip --only '**/*.json' --exclude config/secrets.json -s patterns.yaml
 ```
 
 **Per-archive filters — each archive in a multi-input command is filtered independently:**
 
 ```bash
 # a.zip keeps only config/; b.tar.gz keeps only *.log files:
-sanitize a.zip --only 'config/' b.tar.gz --only '**/*.log' -s secrets.yaml
+sanitize a.zip --only 'config/' b.tar.gz --only '**/*.log' -s patterns.yaml
 
 # Plain file alongside a filtered archive:
-sanitize report.txt backup.zip --only 'logs/' -s secrets.yaml
+sanitize report.txt backup.zip --only 'logs/' -s patterns.yaml
 # Produces: report-sanitized.txt  backup.sanitized.zip (logs/ entries only)
 ```
 
@@ -1495,7 +1497,7 @@ sanitize report.txt backup.zip --only 'logs/' -s secrets.yaml
 
 ```bash
 # stdin goes to stdout; each file/archive gets its own output file:
-cat extra.log | sanitize - backup.zip --only 'logs/' config.yaml -s secrets.yaml
+cat extra.log | sanitize - backup.zip --only 'logs/' config.yaml -s patterns.yaml
 ```
 
 **Dry-run — see what would be replaced without writing output:**
@@ -1514,20 +1516,20 @@ sanitize config.yaml -s s.enc --encrypted-secrets -P /run/secrets/pw --fail-on-m
 
 ```bash
 # Basic: report gets a log_context block per file with default keywords and 10 lines of context.
-sanitize app.log -s secrets.yaml --report report.json --extract-context
+sanitize server.log -s patterns.yaml --report report.json --extract-context
 
 # Multiple files: each file gets its own log_context in the report.
-sanitize app.log worker.log -s secrets.yaml --report report.json --extract-context
+sanitize server.log worker.log -s patterns.yaml --report report.json --extract-context
 
 # Custom context window and extra keywords:
-sanitize app.log -s secrets.yaml --report report.json \
+sanitize server.log -s patterns.yaml --report report.json \
   --extract-context --context-lines 20 --context-keywords timeout,oomkilled,backoff
 
 # Pipe stdin and capture context (output to file required when input > 256 MiB):
-cat app.log | sanitize -s secrets.yaml --report - --extract-context
+cat server.log | sanitize -s patterns.yaml --report - --extract-context
 
 # Only keywords you care about (replaces defaults entirely):
-sanitize app.log -s secrets.yaml --report report.json \
+sanitize server.log -s patterns.yaml --report report.json \
   --extract-context --context-keywords fatal,critical --context-keywords-replace
 ```
 
@@ -1535,7 +1537,7 @@ sanitize app.log -s secrets.yaml --report report.json \
 
 ```json
 {
-  "path": "app.log",
+  "path": "server.log",
   "matches": 3,
   "replacements": 3,
   "bytes_processed": 10240,
@@ -1583,27 +1585,27 @@ sanitize data.log -s s.enc --encrypted-secrets --password --log-format json
 
 ```bash
 # Plaintext YAML/JSON/TOML is the default — just point at the file:
-sanitize data.log -s secrets.yaml
+sanitize data.log -s patterns.yaml
 sanitize data.log -s secrets.json
 
 # Deterministic mode with plaintext secrets:
-sanitize data.csv -s secrets.yaml -d
+sanitize data.csv -s patterns.yaml -d
 
 # Fail CI with plaintext secrets:
-sanitize config.yaml -s secrets.yaml --fail-on-match
+sanitize config.yaml -s patterns.yaml --fail-on-match
 ```
 
 **Use an encrypted secrets file (opt-in with `--encrypted-secrets`):**
 
 ```bash
 # Interactive password prompt:
-sanitize data.log -s secrets.enc --encrypted-secrets --password
+sanitize data.log -s patterns.enc --encrypted-secrets --password
 
 # Password from file (CI-friendly):
-sanitize data.log -s secrets.enc --encrypted-secrets -P /run/secrets/pw
+sanitize data.log -s patterns.enc --encrypted-secrets -P /run/secrets/pw
 
 # Password from environment variable:
-SANITIZE_PASSWORD=hunter2 sanitize data.log -s secrets.enc --encrypted-secrets
+SANITIZE_PASSWORD=hunter2 sanitize data.log -s patterns.enc --encrypted-secrets
 ```
 
 **Encrypted secrets file workflow:**
