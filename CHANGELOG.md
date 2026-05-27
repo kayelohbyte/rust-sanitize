@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Datadog app bundle** (`datadog`) — covers `datadog.yaml` (API key, app key,
+  proxy credentials, SNMP community strings, cluster agent token, Cloud Foundry
+  credentials, per-subsystem intake URLs), legacy `datadog.conf` (INI-style,
+  colon-delimited), and `conf.d/conf.yaml` integration check configs (host,
+  username, password, token, TLS paths, AWS access/secret keys). Streaming
+  patterns cover 32-char hex API keys, 40-char hex app keys, `DD_API_KEY=` env
+  vars, proxy URLs with embedded credentials, and SNMP community strings.
+  `field-name` signals at entropy thresholds 3.0 and 3.5 catch arbitrary
+  credential fields in integration configs.
+
+- **docker-compose list-form env var coverage** — a streaming regex in
+  `apps/docker-compose/secrets.yaml` now covers the list form of `environment:`
+  blocks (`- KEY=value` lines where the key contains `PASSWORD`, `SECRET`,
+  `TOKEN`, `API_KEY`, `PRIVATE_KEY`, `ACCESS_KEY`, or `AUTH`). The structured
+  profile already handled map-form env vars; this closes the remaining gap.
+
+### Fixed
+
+- **GitHub Actions template expressions over-redacted** — `${{ secrets.X }}`
+  expressions (using the `${{…}}` syntax) were being flagged by streaming
+  patterns. Added `"${{*}}"` to the `apps/github-actions/secrets.yaml`
+  allowlist so template references pass through unredacted.
+
+- **CircleCI pipeline expressions over-redacted** — `<< parameters.X >>`
+  expressions were being flagged by streaming patterns. Added `"<<*>>"` to the
+  `apps/circleci/secrets.yaml` allowlist.
+
 - **secrets.yaml for every built-in app** — all 21 apps now ship a secrets
   file. Apps with TruffleHog detectors get regex patterns sourced from those
   detectors (AWS AKIA key IDs, GitHub ghp_/gho_/ghs_ tokens, GitLab glpat-
