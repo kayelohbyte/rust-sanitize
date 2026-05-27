@@ -1,0 +1,293 @@
+# Datadog Agent — datadog.yaml, datadog.conf (legacy), and check configs (conf.d/)
+
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  include:
+    - "datadog.yaml"
+    - "datadog.yml"
+    - "datadog/datadog.yaml"
+    - "datadog/datadog.yml"
+    - "etc/datadog-agent/datadog.yaml"
+  fields:
+    # ---- Top-level credentials ----------------------------------------
+
+    # Primary API key — 32 hex chars, required for all agent submissions
+    - pattern: "api_key"
+      category: auth_token
+      label: dd_api_key
+
+    # Application key — used to access the programmatic API
+    - pattern: "app_key"
+      category: auth_token
+      label: dd_app_key
+
+    # Intake site — reveals which Datadog region is in use
+    - pattern: "site"
+      category: hostname
+      label: dd_site
+
+    # Custom intake URL override
+    - pattern: "dd_url"
+      category: url
+      label: dd_url
+
+    # Agent hostname — may expose internal infrastructure naming
+    - pattern: "hostname"
+      category: hostname
+      label: dd_hostname
+
+    # ---- Proxy configuration ------------------------------------------
+    # Proxy URLs embed credentials: http://user:pass@proxy.internal:3128
+
+    - pattern: "proxy.https"
+      category: url
+      label: dd_proxy_https
+
+    - pattern: "proxy.http"
+      category: url
+      label: dd_proxy_http
+
+    # ---- Per-subsystem intake endpoints (proxied or custom) -----------
+    # All use the same *.dd_url glob since each subsystem nests it differently:
+    # logs_config.logs_dd_url, apm_config.apm_dd_url, etc.
+
+    - pattern: "*.logs_dd_url"
+      category: url
+      label: dd_logs_dd_url
+
+    - pattern: "*.apm_dd_url"
+      category: url
+      label: dd_apm_dd_url
+
+    - pattern: "*.profiling_dd_url"
+      category: url
+      label: dd_profiling_dd_url
+
+    - pattern: "*.process_dd_url"
+      category: url
+      label: dd_process_dd_url
+
+    # ---- Cluster Agent -----------------------------------------------
+
+    - pattern: "cluster_agent.auth_token"
+      category: auth_token
+      label: dd_cluster_agent_auth_token
+
+    - pattern: "cluster_agent.url"
+      category: url
+      label: dd_cluster_agent_url
+
+    # ---- Autodiscovery config providers (etcd, consul, zookeeper) ----
+    # These are arrays of provider objects; arrays are traversed transparently.
+
+    - pattern: "config_providers.username"
+      category: name
+      label: dd_config_provider_username
+
+    - pattern: "config_providers.password"
+      category: custom:password
+      label: dd_config_provider_password
+
+    - pattern: "config_providers.token"
+      category: auth_token
+      label: dd_config_provider_token
+
+    - pattern: "config_providers.template_url"
+      category: url
+      label: dd_config_provider_url
+
+    # ---- Cloud Foundry -----------------------------------------------
+
+    - pattern: "cloud_foundry_cc.client_id"
+      category: name
+      label: dd_cf_client_id
+
+    - pattern: "cloud_foundry_cc.client_secret"
+      category: auth_token
+      label: dd_cf_client_secret
+
+    - pattern: "cloud_foundry_cc.url"
+      category: url
+      label: dd_cf_cc_url
+
+    - pattern: "cloud_foundry_bbs.cert_file"
+      category: file_path
+      label: dd_cf_bbs_cert_file
+
+    - pattern: "cloud_foundry_bbs.key_file"
+      category: file_path
+      label: dd_cf_bbs_key_file
+
+    # ---- SNMP / Network Devices (SNMPv2 community, SNMPv3 auth) ------
+    # Deep nesting under network_devices.snmp.* and traps.users.*
+
+    - pattern: "*.community_string"
+      category: auth_token
+      label: dd_snmp_community_string
+      min_length: 1
+
+    - pattern: "*.authKey"
+      category: auth_token
+      label: dd_snmp_auth_key
+      min_length: 4
+
+    - pattern: "*.privKey"
+      category: auth_token
+      label: dd_snmp_priv_key
+      min_length: 4
+
+# ---------------------------------------------------------------------------
+# Legacy Agent v5/v6 — datadog.conf (INI-style, colon-delimited)
+#
+# Section headers like [Main] and [trace.config] contain no colon so they
+# pass through the key_value processor untouched. Commented-out fields
+# (# proxy_password: secret) are sanitized by default.
+# ---------------------------------------------------------------------------
+
+- processor: key-value
+  extensions: [".conf"]
+  include:
+    - "datadog.conf"
+    - "dd-agent/datadog.conf"
+    - "dd-agent.conf"
+  options:
+    delimiter: ":"
+    comment_prefix: "#"
+  fields:
+    - pattern: "api_key"
+      category: auth_token
+      label: dd_conf_api_key
+
+    - pattern: "dd_url"
+      category: url
+      label: dd_conf_dd_url
+
+    - pattern: "hostname"
+      category: hostname
+      label: dd_conf_hostname
+
+    # Proxy credentials
+    - pattern: "proxy_host"
+      category: hostname
+      label: dd_conf_proxy_host
+
+    - pattern: "proxy_user"
+      category: name
+      label: dd_conf_proxy_user
+
+    - pattern: "proxy_password"
+      category: custom:password
+      label: dd_conf_proxy_password
+
+    # Service discovery backend credentials (etcd/consul/zookeeper)
+    - pattern: "sd_backend_username"
+      category: name
+      label: dd_conf_sd_username
+
+    - pattern: "sd_backend_password"
+      category: custom:password
+      label: dd_conf_sd_password
+
+    - pattern: "consul_token"
+      category: auth_token
+      label: dd_conf_consul_token
+
+# ---------------------------------------------------------------------------
+# Integration check configs — conf.d/**/conf.yaml
+#
+# Every Datadog integration check follows the same schema:
+#   instances:
+#     - host: db.internal
+#       username: datadog
+#       password: secret
+#       url: https://...
+#
+# Arrays are traversed transparently so `instances.password` matches all
+# password fields regardless of how many instances are configured.
+# The glob `*.password` catches passwords nested under named sub-keys
+# (e.g. tls_config.password, auth.password in some integrations).
+# ---------------------------------------------------------------------------
+
+- processor: yaml
+  extensions: [".yaml", ".yml"]
+  include:
+    - "conf.yaml"
+    - "conf.yml"
+  fields:
+    # Common across nearly all integrations
+    - pattern: "instances.host"
+      category: hostname
+      label: dd_check_host
+
+    - pattern: "instances.hosts"
+      category: hostname
+      label: dd_check_hosts
+
+    - pattern: "instances.username"
+      category: name
+      label: dd_check_username
+
+    - pattern: "instances.user"
+      category: name
+      label: dd_check_user
+
+    - pattern: "instances.password"
+      category: custom:password
+      label: dd_check_password
+
+    - pattern: "instances.pass"
+      category: custom:password
+      label: dd_check_pass
+
+    # URL-based integrations (HTTP check, Prometheus, etc.)
+    - pattern: "instances.url"
+      category: url
+      label: dd_check_url
+
+    - pattern: "instances.urls"
+      category: url
+      label: dd_check_urls
+
+    # Token / API key authentication
+    - pattern: "instances.token"
+      category: auth_token
+      label: dd_check_token
+
+    - pattern: "instances.api_key"
+      category: auth_token
+      label: dd_check_api_key
+
+    # AWS integrations
+    - pattern: "instances.access_key_id"
+      category: auth_token
+      label: dd_check_aws_access_key
+
+    - pattern: "instances.secret_access_key"
+      category: auth_token
+      label: dd_check_aws_secret_key
+
+    # TLS / certificate paths and inline certs
+    - pattern: "*.tls_cert"
+      category: file_path
+      label: dd_check_tls_cert
+
+    - pattern: "*.tls_private_key"
+      category: file_path
+      label: dd_check_tls_key
+
+    - pattern: "*.tls_ca_cert"
+      category: file_path
+      label: dd_check_tls_ca
+
+    # Catch-all for password/token fields nested under sub-keys in
+    # integrations that use non-standard auth blocks (e.g. auth.password,
+    # tls_config.password, basic_auth.password)
+    - pattern: "*.password"
+      category: custom:password
+      label: dd_check_nested_password
+      min_length: 1
+
+    - pattern: "*.token"
+      category: auth_token
+      label: dd_check_nested_token
+      min_length: 8

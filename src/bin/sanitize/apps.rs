@@ -54,6 +54,12 @@ pub(crate) const BUILTIN_APPS: &[BuiltinApp] = &[
         profile_yaml: Some(include_str!("../../../apps/circleci/profile.yaml")),
     },
     BuiltinApp {
+        name: "datadog",
+        description: "Datadog Agent — datadog.yaml API keys, proxy credentials, SNMP auth, cluster agent tokens",
+        secrets_yaml: Some(include_str!("../../../apps/datadog/secrets.yaml")),
+        profile_yaml: Some(include_str!("../../../apps/datadog/profile.yaml")),
+    },
+    BuiltinApp {
         name: "django",
         description: "Django — .env files, SECRET_KEY, database credentials, third-party API keys",
         secrets_yaml: Some(include_str!("../../../apps/django/secrets.yaml")),
