@@ -73,7 +73,7 @@ pub(crate) const HISTOGRAM_THRESHOLDS: [f64; 6] = [3.0, 3.5, 4.0, 4.5, 5.0, 5.5]
 /// Token values are never stored — only counts.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct EntropyBuckets {
-    /// Count of candidates with entropy >= HISTOGRAM_THRESHOLDS[i].
+    /// Count of candidates with entropy >= HISTOGRAM_THRESHOLDS\[i\].
     pub(crate) counts: [u64; 6],
     /// Total tokens examined that met the charset/length constraints.
     pub(crate) total_candidates: u64,
