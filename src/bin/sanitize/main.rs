@@ -78,8 +78,7 @@ use hooks::{global_default_secrets_path, run_install_hook};
 mod entropy;
 use entropy::{
     entropy_configs_from_entries, entropy_histogram_bytes, entropy_scan_bytes, scanner_fallback,
-    EntropyBuckets, EntropyConfig, HISTOGRAM_THRESHOLDS,
-    NullSeekWriter,
+    EntropyBuckets, EntropyConfig, NullSeekWriter, HISTOGRAM_THRESHOLDS,
 };
 
 mod progress;
@@ -2471,8 +2470,8 @@ fn init_logging(log_format: &str, log_level: &str) {
     use tracing_subscriber::fmt;
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_env("SANITIZE_LOG")
-        .unwrap_or_else(|_| EnvFilter::new(log_level));
+    let filter =
+        EnvFilter::try_from_env("SANITIZE_LOG").unwrap_or_else(|_| EnvFilter::new(log_level));
 
     match log_format {
         "json" => {
@@ -2882,9 +2881,7 @@ fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
             // Use the input directory as the anchor for --exclude-path /
             // --include-path so that patterns like "skip/" are matched against
             // paths relative to the walked root, not the project config dir.
-            let walk_root = input
-                .canonicalize()
-                .unwrap_or_else(|_| input.to_path_buf());
+            let walk_root = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
             let files: Vec<PathBuf> = files
                 .into_iter()
                 .filter(|f| {
@@ -3625,7 +3622,14 @@ fn scan_with_locations<R, W>(
     total_bytes: Option<u64>,
     progress_cb: impl FnMut(&sanitize_engine::ScanProgress),
     max_locations: usize,
-) -> Result<(ScanStats, Vec<sanitize_engine::scanner::MatchLocation>, bool), String>
+) -> Result<
+    (
+        ScanStats,
+        Vec<sanitize_engine::scanner::MatchLocation>,
+        bool,
+    ),
+    String,
+>
 where
     R: std::io::Read,
     W: std::io::Write,
@@ -3757,7 +3761,6 @@ fn process_stdin(
                             bytes_processed: input_bytes.len() as u64,
                             bytes_output: output_bytes.len() as u64,
                             pattern_counts,
-                            ..Default::default()
                         };
                         rb.record_file(FileReport::from_scan_stats(
                             "<stdin>".to_string(),
@@ -4555,12 +4558,8 @@ fn process_plain_file(
             }
             if let Some(rb) = report_builder {
                 rb.record_file(
-                    FileReport::from_scan_stats(
-                        input.display().to_string(),
-                        &stats,
-                        method,
-                    )
-                    .with_match_locations(locs, locs_truncated),
+                    FileReport::from_scan_stats(input.display().to_string(), &stats, method)
+                        .with_match_locations(locs, locs_truncated),
                 );
             }
             info!(
@@ -4607,12 +4606,8 @@ fn process_plain_file(
                 }
                 if let Some(rb) = report_builder {
                     rb.record_file(
-                        FileReport::from_scan_stats(
-                            input.display().to_string(),
-                            &stats,
-                            method,
-                        )
-                        .with_match_locations(locs, locs_truncated),
+                        FileReport::from_scan_stats(input.display().to_string(), &stats, method)
+                            .with_match_locations(locs, locs_truncated),
                     );
                 }
                 maybe_extract_context(&buf, &input.display().to_string(), cli, report_builder);
@@ -4653,12 +4648,8 @@ fn process_plain_file(
                 }
                 if let Some(rb) = report_builder {
                     rb.record_file(
-                        FileReport::from_scan_stats(
-                            input.display().to_string(),
-                            &stats,
-                            method,
-                        )
-                        .with_match_locations(locs, locs_truncated),
+                        FileReport::from_scan_stats(input.display().to_string(), &stats, method)
+                            .with_match_locations(locs, locs_truncated),
                     );
                 }
                 maybe_extract_context_reader(
@@ -4705,12 +4696,8 @@ fn process_plain_file(
                 }
                 if let Some(rb) = report_builder {
                     rb.record_file(
-                        FileReport::from_scan_stats(
-                            input.display().to_string(),
-                            &stats,
-                            method,
-                        )
-                        .with_match_locations(locs, locs_truncated),
+                        FileReport::from_scan_stats(input.display().to_string(), &stats, method)
+                            .with_match_locations(locs, locs_truncated),
                     );
                 }
                 maybe_extract_context(&buf, &input.display().to_string(), cli, report_builder);
@@ -4753,12 +4740,8 @@ fn process_plain_file(
                 }
                 if let Some(rb) = report_builder {
                     rb.record_file(
-                        FileReport::from_scan_stats(
-                            input.display().to_string(),
-                            &stats,
-                            method,
-                        )
-                        .with_match_locations(locs, locs_truncated),
+                        FileReport::from_scan_stats(input.display().to_string(), &stats, method)
+                            .with_match_locations(locs, locs_truncated),
                     );
                 }
             }
@@ -5780,9 +5763,8 @@ fn run_sanitize(
         && cli.app.is_empty()
         && cli.profile.is_none()
         && !cli.use_default;
-    let load_defaults = cli.use_default
-        || nothing_specified
-        || (!cli.app.is_empty() && cli.secrets_file.is_none());
+    let load_defaults =
+        cli.use_default || nothing_specified || (!cli.app.is_empty() && cli.secrets_file.is_none());
     if load_defaults {
         all_allow_patterns.extend(common_allow_patterns());
     }

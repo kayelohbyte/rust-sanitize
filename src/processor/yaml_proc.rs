@@ -28,7 +28,10 @@ impl Processor for YamlProcessor {
         // Heuristic: starts with `---` or a YAML-ish key: value.
         let text = String::from_utf8_lossy(content);
         let trimmed = text.trim_start();
-        trimmed.starts_with("---") || trimmed.starts_with("- ") || trimmed.contains(": ")
+        trimmed.starts_with("---")
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with('{')
+            || trimmed.contains(": ")
     }
 
     fn process(

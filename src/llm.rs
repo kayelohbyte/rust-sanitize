@@ -233,8 +233,14 @@ mod tests {
     fn troubleshoot_embeds_preamble_and_instructions() {
         let t = resolve_llm_template("troubleshoot").unwrap();
         assert!(t.contains("sanitized"), "preamble should be embedded");
-        assert!(t.contains("Root cause"), "should request root cause analysis");
-        assert!(t.contains("Remediation"), "should request remediation steps");
+        assert!(
+            t.contains("Root cause"),
+            "should request root cause analysis"
+        );
+        assert!(
+            t.contains("Remediation"),
+            "should request remediation steps"
+        );
         assert!(
             t.contains("clarifying question"),
             "should instruct LLM to ask rather than guess"
@@ -263,14 +269,8 @@ mod tests {
     fn review_security_embeds_preamble_and_instructions() {
         let t = resolve_llm_template("review-security").unwrap();
         assert!(t.contains("sanitized"), "preamble should be embedded");
-        assert!(
-            t.contains("Authentication"),
-            "should cover auth review"
-        );
-        assert!(
-            t.contains("Encryption"),
-            "should cover TLS/crypto review"
-        );
+        assert!(t.contains("Authentication"), "should cover auth review");
+        assert!(t.contains("Encryption"), "should cover TLS/crypto review");
         assert!(
             t.contains("Hardcoded"),
             "should flag hardcoded credential placement"

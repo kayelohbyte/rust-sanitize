@@ -113,7 +113,13 @@ fn apps_add_secrets_only() {
 
     let apps_dir = dir.path().join("apps");
     let out = run_with_apps_dir(
-        &["apps", "add", "myapp", "--secrets-file", src.to_str().unwrap()],
+        &[
+            "apps",
+            "add",
+            "myapp",
+            "--secrets-file",
+            src.to_str().unwrap(),
+        ],
         apps_dir.to_str().unwrap(),
     );
     assert!(out.status.success(), "stderr: {}", stderr(&out));

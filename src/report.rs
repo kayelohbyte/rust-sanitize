@@ -613,7 +613,7 @@ impl FileReport {
     }
 
     /// Attach per-match location data collected via
-    /// [`StreamScanner::scan_reader_with_callbacks`].
+    /// [`crate::scanner::StreamScanner::scan_reader_with_callbacks`].
     ///
     /// No-ops when `locations` is empty and `truncated` is false, keeping
     /// the JSON output clean for files with no scanner matches.

@@ -874,6 +874,7 @@ impl StreamScanner {
     /// Scan one window, apply replacements up to the commit point, and flush
     /// the result to `writer`. Returns the commit point so the caller can
     /// slice the carry for the next iteration.
+    #[allow(clippy::too_many_arguments)]
     fn process_committed_window(
         &self,
         window: &[u8],
@@ -1209,6 +1210,7 @@ impl StreamScanner {
     /// `String::from_utf8_lossy` returns `Cow::Borrowed(&str)` for valid
     /// UTF-8 input (the common case for ASCII secrets) — no heap allocation
     /// on the hot path.
+    #[allow(clippy::too_many_arguments)]
     fn apply_replacements(
         &self,
         committed: &[u8],
@@ -1319,6 +1321,7 @@ const _: fn() = || {
 /// match positions so we can compute 1-based line numbers without
 /// pre-scanning the entire committed region.
 #[inline]
+#[allow(clippy::naive_bytecount)]
 fn count_newlines(data: &[u8]) -> u64 {
     data.iter().filter(|&&b| b == b'\n').count() as u64
 }
