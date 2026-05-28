@@ -2,7 +2,7 @@
 //! `-o <file>` / `-o <dir>` explicit paths.
 
 use std::fs;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tempfile::tempdir;
 
 fn secrets_json(dir: &std::path::Path) -> std::path::PathBuf {
@@ -35,6 +35,7 @@ fn dash_o_dash_writes_to_stdout_not_a_file() {
         .arg("-o")
         .arg("-")
         .env("SANITIZE_LOG", "error")
+        .stdin(Stdio::null())
         .output()
         .unwrap();
 
@@ -77,6 +78,7 @@ fn dash_o_dash_works_with_structured_json() {
         .arg("-o")
         .arg("-")
         .env("SANITIZE_LOG", "error")
+        .stdin(Stdio::null())
         .output()
         .unwrap();
 
@@ -143,6 +145,7 @@ fn explicit_output_file_is_written() {
         .arg("-o")
         .arg(&out)
         .env("SANITIZE_LOG", "error")
+        .stdin(Stdio::null())
         .status()
         .unwrap();
 
@@ -176,6 +179,7 @@ fn output_dir_receives_all_sanitized_files() {
         .arg("-o")
         .arg(&out_dir)
         .env("SANITIZE_LOG", "error")
+        .stdin(Stdio::null())
         .status()
         .unwrap();
 
