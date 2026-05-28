@@ -91,7 +91,9 @@ impl JsonLinesProcessor {
             } else {
                 serde_json::to_vec_pretty(&value)
             }
-            .map_err(|e| SanitizeError::IoError(format!("JSONL serialize error: {}", e)))?;
+            .map_err(|e| {
+                SanitizeError::IoError(std::io::Error::other(format!("JSONL serialize error: {e}")))
+            })?;
 
             writer.write_all(&serialised)?;
             writer.write_all(b"\n")?;

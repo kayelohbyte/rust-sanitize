@@ -68,7 +68,9 @@ impl Processor for JsonProcessor {
         } else {
             serde_json::to_vec_pretty(&value)
         }
-        .map_err(|e| SanitizeError::IoError(format!("JSON serialize error: {}", e)))?;
+        .map_err(|e| {
+            SanitizeError::IoError(std::io::Error::other(format!("JSON serialize error: {e}")))
+        })?;
 
         Ok(output)
     }

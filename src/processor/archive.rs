@@ -105,6 +105,12 @@ use crate::processor::limits::{
 /// Per-entry result from parallel archive processing: `(source_index, sanitized_bytes_and_stats)`.
 type ParEntryResult = (usize, Result<(Vec<u8>, ArchiveStats)>);
 
+/// Callback invoked with `(entry_name, sanitized_bytes)` after each file entry
+/// inside an archive is processed. Used by callers that need to inspect the
+/// sanitized content without buffering the entire archive (e.g. log context
+/// extraction).
+pub type EntryCallback = Arc<dyn Fn(&str, &[u8]) + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // ArchiveFilter
 // ---------------------------------------------------------------------------
@@ -381,6 +387,9 @@ pub struct ArchiveProcessor {
     /// streaming scanner for every entry. Trades format preservation
     /// for maximum sanitization coverage.
     force_text: bool,
+    /// Optional callback invoked with `(entry_name, sanitized_bytes)` after
+    /// each file entry is processed. Only called for regular file entries.
+    entry_callback: Option<EntryCallback>,
 }
 
 impl ArchiveProcessor {
@@ -408,6 +417,7 @@ impl ArchiveProcessor {
             parallel_threshold: PARALLEL_ENTRY_THRESHOLD,
             filter: ArchiveFilter::default(),
             force_text: false,
+            entry_callback: None,
         }
     }
 
@@ -460,6 +470,20 @@ impl ArchiveProcessor {
     pub fn with_force_text(mut self, force_text: bool) -> Self {
         self.force_text = force_text;
         self
+    }
+
+    /// Register a callback that is invoked with `(entry_name, sanitized_bytes)`
+    /// after each regular file entry is fully processed.
+    #[must_use]
+    pub fn with_entry_callback(mut self, callback: EntryCallback) -> Self {
+        self.entry_callback = Some(callback);
+        self
+    }
+
+    fn emit_entry_bytes(&self, name: &str, bytes: &[u8]) {
+        if let Some(cb) = &self.entry_callback {
+            cb(name, bytes);
+        }
     }
 
     /// Find the first profile matching a filename.
@@ -940,6 +964,7 @@ impl ArchiveProcessor {
                 let (sanitized_buf, entry_stats) =
                     sanitized[i].take().expect("parallel result missing");
                 stats.merge(&entry_stats);
+                self.emit_entry_bytes(&entry.path, &sanitized_buf);
 
                 let mut new_header = entry.header.clone();
                 let safe_path = sanitize_tar_entry_name(&entry.path);
@@ -985,6 +1010,7 @@ impl ArchiveProcessor {
                 let (sanitized_buf, entry_stats) =
                     processor.sanitize_entry_bytes(&entry.path, &entry.data, size_hint, depth)?;
                 stats.merge(&entry_stats);
+                processor.emit_entry_bytes(&entry.path, &sanitized_buf);
                 let mut new_header = entry.header.clone();
                 let safe_path = sanitize_tar_entry_name(&entry.path);
                 new_header.set_path(&safe_path).map_err(|e| {
@@ -1052,6 +1078,7 @@ impl ArchiveProcessor {
                         depth,
                     )?;
                     drop(entry);
+                    self.emit_entry_bytes(&path, &sanitized_buf);
 
                     let mut new_header = header.clone();
                     let safe_path = sanitize_tar_entry_name(&path);
@@ -1283,6 +1310,7 @@ impl ArchiveProcessor {
                     .take()
                     .expect("file entry sanitization result missing");
                 stats.merge(&entry_stats);
+                self.emit_entry_bytes(&meta.name, &sanitized_buf);
                 zip_out.start_file(&meta.name, options).map_err(|e| {
                     SanitizeError::ArchiveError(format!("start file '{}': {}", meta.name, e))
                 })?;
@@ -1335,6 +1363,7 @@ impl ArchiveProcessor {
                 let (sanitized_buf, entry_stats) =
                     self.sanitize_entry_bytes(&meta.name, &data, Some(meta.size), depth)?;
                 drop(data);
+                self.emit_entry_bytes(&meta.name, &sanitized_buf);
 
                 zip_out.start_file(&meta.name, options).map_err(|e| {
                     SanitizeError::ArchiveError(format!("start file '{}': {}", meta.name, e))

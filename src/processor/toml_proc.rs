@@ -62,8 +62,9 @@ impl Processor for TomlProcessor {
 
         walk_toml(&mut value, "", profile, store, 0)?;
 
-        let output = toml::to_string_pretty(&value)
-            .map_err(|e| SanitizeError::IoError(format!("TOML serialize error: {}", e)))?;
+        let output = toml::to_string_pretty(&value).map_err(|e| {
+            SanitizeError::IoError(std::io::Error::other(format!("TOML serialize error: {e}")))
+        })?;
 
         Ok(output.into_bytes())
     }

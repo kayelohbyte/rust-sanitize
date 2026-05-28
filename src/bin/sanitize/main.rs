@@ -291,7 +291,12 @@ struct Cli {
     report: Option<Option<PathBuf>>,
 
     /// Report format: json (default), sarif, or html.
-    #[arg(long, value_name = "FORMAT", default_value = "json", hide_possible_values = true)]
+    #[arg(
+        long,
+        value_name = "FORMAT",
+        default_value = "json",
+        hide_possible_values = true
+    )]
     report_format: ReportFormat,
 
     /// Abort on the first error instead of skipping and continuing.
@@ -5958,26 +5963,24 @@ fn run_sanitize(
 
     // When --extract-context is active without an explicit --report path, derive
     // a report file path next to the output so context data is not lost.
-    let auto_report_path: Option<PathBuf> =
-        if cli.extract_context && cli.report.is_none() {
-            derive_auto_report_path(&input_targets, "json")
-        } else {
-            None
-        };
+    let auto_report_path: Option<PathBuf> = if cli.extract_context && cli.report.is_none() {
+        derive_auto_report_path(&input_targets, "json")
+    } else {
+        None
+    };
 
     // When --report is given with no path, pre-compute the auto file path
     // (must happen before input_targets is consumed by into_iter below).
-    let report_no_path_auto: Option<PathBuf> =
-        if matches!(&cli.report, Some(None)) {
-            let ext = match cli.report_format {
-                ReportFormat::Sarif => "sarif",
-                ReportFormat::Html => "html",
-                ReportFormat::Json => "json",
-            };
-            derive_auto_report_path(&input_targets, ext)
-        } else {
-            None
+    let report_no_path_auto: Option<PathBuf> = if matches!(&cli.report, Some(None)) {
+        let ext = match cli.report_format {
+            ReportFormat::Sarif => "sarif",
+            ReportFormat::Html => "html",
+            ReportFormat::Json => "json",
         };
+        derive_auto_report_path(&input_targets, ext)
+    } else {
+        None
+    };
 
     // --- --strip-values early exit -----------------------------------------
     // Bypass the full sanitization pipeline: emit key structure only (no values).

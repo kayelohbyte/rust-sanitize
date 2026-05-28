@@ -157,7 +157,7 @@ pub use log_context::{
     DEFAULT_CONTEXT_LINES, DEFAULT_KEYWORDS, DEFAULT_MAX_MATCHES,
 };
 pub use processor::archive::{
-    ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress, ArchiveStats,
+    ArchiveFilter, ArchiveFormat, ArchiveProcessor, ArchiveProgress, ArchiveStats, EntryCallback,
 };
 pub use processor::limits::DEFAULT_ARCHIVE_DEPTH;
 pub use processor::{

@@ -82,8 +82,9 @@ impl Processor for CsvProcessor {
                 .clone();
 
             // Write header row.
-            wtr.write_record(headers.iter())
-                .map_err(|e| SanitizeError::IoError(format!("CSV write error: {}", e)))?;
+            wtr.write_record(headers.iter()).map_err(|e| {
+                SanitizeError::IoError(std::io::Error::other(format!("CSV write error: {e}")))
+            })?;
 
             // Map each column index to the index of its first matching rule (if any).
             // Uses pattern_matches directly to avoid allocating a temporary
@@ -129,12 +130,14 @@ impl Processor for CsvProcessor {
                 }
             }
 
-            wtr.write_record(&row)
-                .map_err(|e| SanitizeError::IoError(format!("CSV write error: {}", e)))?;
+            wtr.write_record(&row).map_err(|e| {
+                SanitizeError::IoError(std::io::Error::other(format!("CSV write error: {e}")))
+            })?;
         }
 
-        wtr.flush()
-            .map_err(|e| SanitizeError::IoError(format!("CSV flush error: {}", e)))?;
+        wtr.flush().map_err(|e| {
+            SanitizeError::IoError(std::io::Error::other(format!("CSV flush error: {e}")))
+        })?;
         drop(wtr);
 
         Ok(output)

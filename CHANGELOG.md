@@ -83,6 +83,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`FakeIp` strategy now preserves input length** — previously `FakeIp::replace`
+  always emitted a `10.x.x.x` address (variable length), so a 15-character input
+  like `192.168.100.200` could produce a 12-character output. The implementation
+  now preserves dots at their original positions and replaces every other character
+  with a deterministic decimal digit, guaranteeing `output.len() == original.len()`
+  for any input. The `10.0.0.0/8` range guarantee is removed; replacements are
+  clearly synthetic (hash-derived digits) rather than routable-range constrained.
+
 - **`--format jsonl` / `--format ndjson` rejected by CLI** — `jsonl` and `ndjson`
   were missing from `VALID_FORMATS` and from `format_to_ext`, so passing
   `--format jsonl` produced an "invalid format" error even though the JSONL

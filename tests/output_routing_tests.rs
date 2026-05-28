@@ -50,7 +50,10 @@ fn dash_o_dash_writes_to_stdout_not_a_file() {
         !stdout.contains("SUPERSECRET"),
         "raw secret must not appear on stdout"
     );
-    assert!(stdout.contains("token:"), "non-secret content must be present");
+    assert!(
+        stdout.contains("token:"),
+        "non-secret content must be present"
+    );
 
     // No literal file named `-` must be created.
     assert!(

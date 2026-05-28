@@ -78,14 +78,18 @@ impl Processor for XmlProcessor {
                     // Process attributes.
                     let current_path = element_stack.join("/");
                     let new_elem = process_attributes(e, &current_path, profile, store)?;
-                    writer
-                        .write_event(Event::Start(new_elem))
-                        .map_err(|e| SanitizeError::IoError(format!("XML write error: {}", e)))?;
+                    writer.write_event(Event::Start(new_elem)).map_err(|e| {
+                        SanitizeError::IoError(std::io::Error::other(format!(
+                            "XML write error: {e}"
+                        )))
+                    })?;
                 }
                 Ok(Event::End(ref e)) => {
-                    writer
-                        .write_event(Event::End(e.clone()))
-                        .map_err(|e| SanitizeError::IoError(format!("XML write error: {}", e)))?;
+                    writer.write_event(Event::End(e.clone())).map_err(|e| {
+                        SanitizeError::IoError(std::io::Error::other(format!(
+                            "XML write error: {e}"
+                        )))
+                    })?;
                     element_stack.pop();
                 }
                 Ok(Event::Empty(ref e)) => {
@@ -96,9 +100,11 @@ impl Processor for XmlProcessor {
                         format!("{}/{}", element_stack.join("/"), name)
                     };
                     let new_elem = process_attributes(e, &path, profile, store)?;
-                    writer
-                        .write_event(Event::Empty(new_elem))
-                        .map_err(|e| SanitizeError::IoError(format!("XML write error: {}", e)))?;
+                    writer.write_event(Event::Empty(new_elem)).map_err(|e| {
+                        SanitizeError::IoError(std::io::Error::other(format!(
+                            "XML write error: {e}"
+                        )))
+                    })?;
                 }
                 Ok(Event::Text(ref e)) => {
                     let current_path = element_stack.join("/");
@@ -111,19 +117,25 @@ impl Processor for XmlProcessor {
                         writer
                             .write_event(Event::Text(BytesText::new(&replaced)))
                             .map_err(|e| {
-                                SanitizeError::IoError(format!("XML write error: {}", e))
+                                SanitizeError::IoError(std::io::Error::other(format!(
+                                    "XML write error: {e}"
+                                )))
                             })?;
                     } else {
                         writer.write_event(Event::Text(e.clone())).map_err(|e| {
-                            SanitizeError::IoError(format!("XML write error: {}", e))
+                            SanitizeError::IoError(std::io::Error::other(format!(
+                                "XML write error: {e}"
+                            )))
                         })?;
                     }
                 }
                 Ok(Event::Eof) => break,
                 Ok(e) => {
-                    writer
-                        .write_event(e)
-                        .map_err(|er| SanitizeError::IoError(format!("XML write error: {}", er)))?;
+                    writer.write_event(e).map_err(|er| {
+                        SanitizeError::IoError(std::io::Error::other(format!(
+                            "XML write error: {er}"
+                        )))
+                    })?;
                 }
                 Err(e) => {
                     return Err(SanitizeError::ParseError {

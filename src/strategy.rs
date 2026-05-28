@@ -326,9 +326,12 @@ impl Strategy for RandomUuid {
 // 3. FakeIp
 // ---------------------------------------------------------------------------
 
-/// Generates a fake IPv4 address in the `10.0.0.0/8` reserved range.
+/// Generates a length-preserving fake IP address.
 ///
-/// Avoids `.0` in the last octet to prevent confusion with network addresses.
+/// Dots (`.`) are preserved in their original positions; every other
+/// character is replaced with a deterministic decimal digit derived from
+/// `entropy`. The output is always the same byte length as `original`,
+/// preserving column widths and log formatting.
 pub struct FakeIp;
 
 impl FakeIp {
@@ -349,12 +352,20 @@ impl Strategy for FakeIp {
         "fake_ip"
     }
 
-    fn replace(&self, _original: &str, entropy: &[u8; 32]) -> String {
-        let a = entropy[0];
-        let b = entropy[1];
-        // Ensure last octet is ≥ 1 (avoid x.x.x.0).
-        let c = entropy[2].max(1);
-        format!("10.{}.{}.{}", a, b, c)
+    fn replace(&self, original: &str, entropy: &[u8; 32]) -> String {
+        // Preserve dots; replace every other character with a deterministic
+        // digit so the output has the same byte length as the original.
+        let mut buf = String::with_capacity(original.len());
+        let mut hi = 0usize;
+        for ch in original.chars() {
+            if ch == '.' {
+                buf.push('.');
+            } else {
+                buf.push((b'0' + entropy[hi % 32] % 10) as char);
+                hi += 1;
+            }
+        }
+        buf
     }
 }
 
@@ -596,16 +607,35 @@ mod tests {
     #[test]
     fn fake_ip_format() {
         let s = FakeIp::new();
-        let out = s.replace("192.168.1.1", &test_entropy());
-        assert!(out.starts_with("10."), "must be in 10.0.0.0/8: {}", out);
-        let octets: Vec<&str> = out.split('.').collect();
-        assert_eq!(octets.len(), 4);
-        for octet in &octets {
-            let _n: u8 = octet.parse().expect("octet must be a valid u8");
-        }
-        // Last octet ≥ 1.
-        let last: u8 = octets[3].parse().unwrap();
-        assert!(last >= 1, "last octet must be ≥ 1");
+        let input = "192.168.1.1";
+        let out = s.replace(input, &test_entropy());
+        // Length preserved.
+        assert_eq!(
+            out.len(),
+            input.len(),
+            "FakeIp must preserve length: {}",
+            out
+        );
+        // Dot positions preserved.
+        let in_dots: Vec<usize> = input
+            .char_indices()
+            .filter(|&(_, c)| c == '.')
+            .map(|(i, _)| i)
+            .collect();
+        let out_dots: Vec<usize> = out
+            .char_indices()
+            .filter(|&(_, c)| c == '.')
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(out_dots, in_dots, "FakeIp must preserve dot positions");
+        // Non-dot characters must be ASCII digits.
+        assert!(
+            out.chars().all(|c| c == '.' || c.is_ascii_digit()),
+            "FakeIp output must contain only digits and dots: {}",
+            out
+        );
+        // Must differ from input.
+        assert_ne!(out, input, "FakeIp must change the IP");
     }
 
     // ---- PreserveLength ----
@@ -731,7 +761,11 @@ mod tests {
         let s2 = store.get_or_insert(&Category::IpV4, "192.168.1.1").unwrap();
         // Random entropy, but store caches first result.
         assert_eq!(s1, s2);
-        assert!(s1.starts_with("10."));
+        assert_eq!(
+            s1.len(),
+            "192.168.1.1".len(),
+            "FakeIp must preserve input length"
+        );
     }
 
     #[test]

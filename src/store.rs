@@ -340,6 +340,10 @@ impl MappingStore {
     /// Entries whose insertion index is ≥ `snapshot` are yielded; older
     /// entries are skipped. Still O(n) in total store size, but avoids
     /// allocating a `HashSet` of all prior keys.
+    ///
+    /// Implementation note: the inner `.collect::<Vec<_>>()` inside the
+    /// `flat_map` is required to release the DashMap shard lock before
+    /// yielding items — it allocates one `Vec` per category shard visited.
     pub fn iter_since(
         &self,
         snapshot: usize,
@@ -371,6 +375,9 @@ impl MappingStore {
     ///
     /// Note: iteration over `DashMap` is not snapshot-consistent if concurrent
     /// inserts are happening. Call this after all workers have finished.
+    ///
+    /// Implementation note: allocates one `Vec` per category shard to release
+    /// the DashMap shard lock between categories.
     pub fn iter(&self) -> impl Iterator<Item = (Category, CompactString, CompactString)> + '_ {
         self.forward.iter().flat_map(|outer| {
             let cat = outer.key().clone();

@@ -594,8 +594,11 @@ fn process_sub_content(content: &str, rule: &FieldRule, store: &MappingStore) ->
         }
     };
 
-    String::from_utf8(out)
-        .map_err(|e| SanitizeError::IoError(format!("sub-processor output is not UTF-8: {e}")))
+    String::from_utf8(out).map_err(|e| {
+        SanitizeError::IoError(std::io::Error::other(format!(
+            "sub-processor output is not UTF-8: {e}"
+        )))
+    })
 }
 
 // ---------------------------------------------------------------------------

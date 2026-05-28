@@ -446,7 +446,7 @@ pub struct MatchLocation {
 /// Returned by [`StreamScanner::scan_reader`] and
 /// [`StreamScanner::scan_bytes`] to provide visibility into what
 /// the scanner did.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ScanStats {
     /// Total bytes read from the input.
     pub bytes_processed: u64,
@@ -910,9 +910,7 @@ impl StreamScanner {
             on_match,
         )?;
 
-        writer
-            .write_all(&scratch.output)
-            .map_err(|e| SanitizeError::IoError(e.to_string()))?;
+        writer.write_all(&scratch.output)?;
         stats.bytes_output += scratch.output.len() as u64;
 
         Ok(commit_point)
@@ -1321,9 +1319,8 @@ const _: fn() = || {
 /// match positions so we can compute 1-based line numbers without
 /// pre-scanning the entire committed region.
 #[inline]
-#[allow(clippy::naive_bytecount)]
 fn count_newlines(data: &[u8]) -> u64 {
-    data.iter().filter(|&&b| b == b'\n').count() as u64
+    bytecount::count(data, b'\n') as u64
 }
 
 /// Read up to `buf.len()` bytes from `reader`, retrying on `Interrupted`.
@@ -1336,7 +1333,7 @@ fn read_fully<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
             Ok(0) => break, // EOF
             Ok(n) => total += n,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(SanitizeError::IoError(e.to_string())),
+            Err(e) => return Err(SanitizeError::from(e)),
         }
     }
     Ok(total)
@@ -1673,6 +1670,115 @@ mod tests {
         let scanner = StreamScanner::new(vec![], store, ScanConfig::new(1, 0)).unwrap();
         let (output, _) = scanner.scan_bytes(b"hello").unwrap();
         assert_eq!(output, b"hello");
+    }
+
+    // ---- ScanStats equality (exercises the PartialEq derive) ----
+
+    #[test]
+    fn scan_stats_equality() {
+        let scanner = test_scanner(vec![email_pattern()]);
+        let input = b"hello alice@corp.com world";
+        let (_, stats_a) = scanner.scan_bytes(input).unwrap();
+        let (_, stats_b) = scanner.scan_bytes(input).unwrap();
+        // Identical inputs produce identical stats.
+        assert_eq!(
+            stats_a, stats_b,
+            "identical inputs must produce identical stats"
+        );
+        // Values are correct — not just equal to each other.
+        assert_eq!(stats_a.matches_found, 1, "one email in input");
+        assert_eq!(stats_a.replacements_applied, 1);
+        assert_eq!(stats_a.bytes_processed, input.len() as u64);
+        assert_eq!(*stats_a.pattern_counts.get("email").unwrap_or(&0), 1);
+        // No-match run produces zeroed counters.
+        let (_, stats_empty) = scanner.scan_bytes(b"no matches here").unwrap();
+        assert_ne!(stats_a, stats_empty);
+        assert_eq!(stats_empty.matches_found, 0);
+        assert_eq!(stats_empty.replacements_applied, 0);
+    }
+
+    // ---- on_match line number and byte offset accuracy ----
+
+    #[test]
+    fn on_match_reports_correct_line_and_byte_offset() {
+        // alice@corp.com starts after "line one\n" (9 bytes) → byte 9, line 2.
+        // bob@corp.com starts after "line one\nalice@corp.com\nline three\n"
+        //   = 9 + 14 + 1 + 10 + 1 = 35 bytes → byte 35, line 4.
+        let scanner = test_scanner(vec![email_pattern()]);
+        let input = b"line one\nalice@corp.com\nline three\nbob@corp.com\n";
+        let mut locations = Vec::new();
+        let mut output = Vec::new();
+        scanner
+            .scan_reader_with_callbacks(
+                &input[..],
+                &mut output,
+                None,
+                |_| {},
+                |loc| locations.push(loc),
+            )
+            .unwrap();
+        assert_eq!(locations.len(), 2);
+        assert_eq!(locations[0].line, 2, "alice must be on line 2");
+        assert_eq!(locations[0].byte_offset, 9, "alice must start at byte 9");
+        assert_eq!(locations[1].line, 4, "bob must be on line 4");
+        assert_eq!(locations[1].byte_offset, 35, "bob must start at byte 35");
+    }
+
+    // ---- Cross-chunk newline accumulation ----
+
+    #[test]
+    fn on_match_line_numbers_stable_across_chunk_sizes() {
+        // alice@corp.com starts after "line one\n" (9 bytes) → byte 9, line 2.
+        // bob@corp.com starts after "line one\nalice@corp.com\nline three\n"
+        //   = 9 + 14 + 1 + 10 + 1 = 35 bytes → byte 35, line 4.
+        // Running the same input through different chunk sizes exercises
+        // newlines_before_window accumulation across chunk boundaries.
+        let input = b"line one\nalice@corp.com\nline three\nbob@corp.com\n";
+        let gen = Arc::new(HmacGenerator::new([42u8; 32]));
+        let store = Arc::new(MappingStore::new(gen, None));
+
+        for chunk_size in [16usize, 20, 24, 32, 64] {
+            let scanner = StreamScanner::new(
+                vec![email_pattern()],
+                Arc::clone(&store),
+                ScanConfig::new(chunk_size, 14),
+            )
+            .unwrap();
+
+            let mut locations = Vec::new();
+            let mut output = Vec::new();
+            scanner
+                .scan_reader_with_callbacks(
+                    &input[..],
+                    &mut output,
+                    None,
+                    |_| {},
+                    |loc| locations.push(loc),
+                )
+                .unwrap();
+
+            assert_eq!(
+                locations.len(),
+                2,
+                "chunk_size={chunk_size}: expected 2 matches"
+            );
+            assert_eq!(
+                locations[0].line, 2,
+                "chunk_size={chunk_size}: alice must be on line 2"
+            );
+            assert_eq!(
+                locations[0].byte_offset, 9,
+                "chunk_size={chunk_size}: alice must start at byte 9"
+            );
+            assert_eq!(
+                locations[1].line, 4,
+                "chunk_size={chunk_size}: bob must be on line 4"
+            );
+            assert_eq!(
+                locations[1].byte_offset, 35,
+                "chunk_size={chunk_size}: bob must start at byte 35"
+            );
+        }
     }
 
     // ---- Bytes output tracking ----

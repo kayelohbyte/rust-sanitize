@@ -1,6 +1,6 @@
 # Architecture
 
-> **sanitize-engine** v0.9.0 — Deterministic, one-way data sanitization.
+> **sanitize-engine** v0.10.0 — Deterministic, one-way data sanitization.
 
 This document describes the internal architecture of the sanitization
 engine.  It is aimed at contributors and operators who need to

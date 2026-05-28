@@ -323,7 +323,9 @@ fn llm_with_extract_context_includes_notable_events_section() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn llm_does_not_write_per_file_output() {
+fn llm_file_input_uses_reference_mode() {
+    // --llm with a file input (no --output) is reference mode: the sanitized
+    // file is written to its auto-derived path and the prompt lists that path.
     let dir = tempdir().unwrap();
     let s = secrets_file(dir.path());
     let input = dir.path().join("data.log");
@@ -341,14 +343,24 @@ fn llm_does_not_write_per_file_output() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // Auto-derived sanitized file must be written to disk.
     assert!(
-        !expected_out.exists(),
-        "--llm should not produce a sanitized output file"
+        expected_out.exists(),
+        "--llm with file input must write the sanitized output file"
     );
-    // The prompt must be on stdout
+    let sanitized = fs::read_to_string(&expected_out).unwrap();
+    assert!(
+        !sanitized.contains("MYSECRET"),
+        "output file must be sanitized"
+    );
+    // Prompt must reference the file path, not inline content.
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("<content name="),
-        "prompt should be on stdout, got:\n{stdout}"
+        stdout.contains("## Sanitized Files"),
+        "prompt must list sanitized files, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("<content name="),
+        "reference mode must not inline content blocks, got:\n{stdout}"
     );
 }

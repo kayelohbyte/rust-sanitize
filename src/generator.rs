@@ -510,13 +510,17 @@ fn format_azure_resource_id_lp(hash: &[u8; 32], original: &str, target: usize) -
 
     // Split on `/`, rebuild with deterministic replacement for non-known segments.
     let parts: Vec<&str> = original.split('/').collect();
+    let mut prev_was_providers = false;
     for (pi, part) in parts.iter().enumerate() {
         if pi > 0 {
             buf.push('/');
         }
-        if part.is_empty() || KNOWN_SEGMENTS.contains(part) || part.contains('.') {
-            // Preserve empty segments (leading `/`), known names, and
-            // dotted provider names like `Microsoft.Compute`.
+        // Dotted segments (e.g. `Microsoft.Compute`) are only preserved when
+        // they immediately follow a `providers` segment. Preserving all dotted
+        // segments would accidentally pass through IPs or hostnames that appear
+        // elsewhere in the path.
+        let is_provider_namespace = prev_was_providers && part.contains('.');
+        if part.is_empty() || KNOWN_SEGMENTS.contains(part) || is_provider_namespace {
             buf.push_str(part);
         } else {
             // Replace this segment character-by-character to preserve byte length.
@@ -527,6 +531,7 @@ fn format_azure_resource_id_lp(hash: &[u8; 32], original: &str, target: usize) -
                 }
             }
         }
+        prev_was_providers = *part == "providers" || *part == "Providers";
     }
     if buf.len() != target {
         return pad_or_truncate(&buf, target, hash);
@@ -980,6 +985,27 @@ mod tests {
         assert!(
             out.contains("Microsoft.Compute"),
             "must preserve dotted provider name"
+        );
+    }
+
+    #[test]
+    fn azure_dotted_segment_outside_providers_is_replaced() {
+        let gen = HmacGenerator::new([11u8; 32]);
+        // A dotted segment that is NOT immediately after `providers/` must be
+        // treated as a variable component and replaced, not passed through.
+        // Before the fix, part.contains('.') caused this to be preserved.
+        let orig = "/subscriptions/10.0.0.1/resourceGroups/rg-prod";
+        let out = gen.generate(&Category::AzureResourceId, orig);
+        assert_eq!(out.len(), orig.len(), "length must be preserved");
+        assert!(out.contains("/subscriptions/"), "subscriptions preserved");
+        assert!(out.contains("/resourceGroups/"), "resourceGroups preserved");
+        assert!(
+            !out.contains("10.0.0.1"),
+            "dotted non-provider segment must be replaced, got: {out}"
+        );
+        assert!(
+            !out.contains("rg-prod"),
+            "variable resource group name must be replaced, got: {out}"
         );
     }
 }

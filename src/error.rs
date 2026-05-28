@@ -21,7 +21,7 @@ pub enum SanitizeError {
     InvalidSeedLength(usize),
 
     #[error("I/O error: {0}")]
-    IoError(String),
+    IoError(#[from] std::io::Error),
 
     #[error("parse error ({format}): {message}")]
     ParseError { format: String, message: String },
@@ -63,12 +63,6 @@ pub enum SanitizeError {
     ArchiveError(String),
 }
 
-impl From<std::io::Error> for SanitizeError {
-    fn from(e: std::io::Error) -> Self {
-        SanitizeError::IoError(e.to_string())
-    }
-}
-
 pub type Result<T> = std::result::Result<T, SanitizeError>;
 
 #[cfg(test)]
@@ -81,6 +75,16 @@ mod tests {
         let err = SanitizeError::from(io_err);
         assert!(matches!(err, SanitizeError::IoError(_)));
         assert!(err.to_string().contains("file not found"));
+    }
+
+    #[test]
+    fn io_error_exposes_kind() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        if let SanitizeError::IoError(inner) = SanitizeError::from(io_err) {
+            assert_eq!(inner.kind(), std::io::ErrorKind::PermissionDenied);
+        } else {
+            panic!("expected IoError");
+        }
     }
 
     #[test]

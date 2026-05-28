@@ -73,8 +73,9 @@ impl Processor for YamlProcessor {
 
         walk_yaml(&mut value, "", profile, store, 0)?;
 
-        let output = serde_yaml_ng::to_string(&value)
-            .map_err(|e| SanitizeError::IoError(format!("YAML serialize error: {}", e)))?;
+        let output = serde_yaml_ng::to_string(&value).map_err(|e| {
+            SanitizeError::IoError(std::io::Error::other(format!("YAML serialize error: {e}")))
+        })?;
 
         Ok(output.into_bytes())
     }
