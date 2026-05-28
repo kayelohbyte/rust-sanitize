@@ -668,7 +668,8 @@ mod tests {
     #[test]
     fn reader_finds_error_line() {
         let r = reader_of(&["INFO start", "ERROR disk full", "INFO done"]);
-        let result = extract_context_reader(r, &LogContextConfig::new().with_context_lines(0)).unwrap();
+        let result =
+            extract_context_reader(r, &LogContextConfig::new().with_context_lines(0)).unwrap();
         assert_eq!(result.match_count, 1);
         assert_eq!(result.matches[0].line_number, 2);
         assert_eq!(result.matches[0].line, "ERROR disk full");
@@ -677,7 +678,9 @@ mod tests {
     #[test]
     fn reader_before_and_after_context() {
         let r = reader_of(&["a", "b", "ERROR c", "d", "e"]);
-        let config = LogContextConfig::new().with_keywords(["error"]).with_context_lines(1);
+        let config = LogContextConfig::new()
+            .with_keywords(["error"])
+            .with_context_lines(1);
         let result = extract_context_reader(r, &config).unwrap();
         assert_eq!(result.matches[0].before, vec!["b"]);
         assert_eq!(result.matches[0].after, vec!["d"]);
@@ -686,7 +689,8 @@ mod tests {
     #[test]
     fn reader_case_insensitive_by_default() {
         let r = reader_of(&["Warning: high load", "WARNING again", "warn: slow"]);
-        let result = extract_context_reader(r, &LogContextConfig::new().with_context_lines(0)).unwrap();
+        let result =
+            extract_context_reader(r, &LogContextConfig::new().with_context_lines(0)).unwrap();
         assert_eq!(result.match_count, 3);
     }
 
@@ -707,7 +711,9 @@ mod tests {
         let lines: Vec<String> = (0..10).map(|i| format!("ERROR line {i}")).collect();
         let strs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
         let r = reader_of(&strs);
-        let config = LogContextConfig::new().with_context_lines(0).with_max_matches(3);
+        let config = LogContextConfig::new()
+            .with_context_lines(0)
+            .with_max_matches(3);
         let result = extract_context_reader(r, &config).unwrap();
         assert_eq!(result.match_count, 3);
         assert!(result.truncated);
@@ -717,7 +723,9 @@ mod tests {
     fn reader_after_context_clipped_at_eof() {
         // Match is near the end — after-context window can't be fully filled.
         let r = reader_of(&["a", "b", "ERROR c"]);
-        let config = LogContextConfig::new().with_keywords(["error"]).with_context_lines(3);
+        let config = LogContextConfig::new()
+            .with_keywords(["error"])
+            .with_context_lines(3);
         let result = extract_context_reader(r, &config).unwrap();
         assert_eq!(result.match_count, 1);
         // Only 0 lines after the match before EOF.
@@ -727,7 +735,8 @@ mod tests {
     #[test]
     fn reader_total_lines_counted() {
         let r = reader_of(&["a", "b", "c", "d", "e"]);
-        let result = extract_context_reader(r, &LogContextConfig::new().with_context_lines(0)).unwrap();
+        let result =
+            extract_context_reader(r, &LogContextConfig::new().with_context_lines(0)).unwrap();
         assert_eq!(result.total_lines, 5);
         assert_eq!(result.match_count, 0);
     }
@@ -735,7 +744,8 @@ mod tests {
     #[test]
     fn reader_empty_input() {
         let r = reader_of(&[]);
-        let result = extract_context_reader(r, &LogContextConfig::new().with_context_lines(0)).unwrap();
+        let result =
+            extract_context_reader(r, &LogContextConfig::new().with_context_lines(0)).unwrap();
         assert_eq!(result.total_lines, 0);
         assert_eq!(result.match_count, 0);
     }

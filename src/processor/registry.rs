@@ -218,7 +218,9 @@ mod tests {
             vec![FieldRule::new("*.secret").with_category(Category::Custom("s".into()))],
         )
         .with_extension(".json");
-        let result = reg.process(br#"{"secret":"abc"}"#, &profile, &store).unwrap();
+        let result = reg
+            .process(br#"{"secret":"abc"}"#, &profile, &store)
+            .unwrap();
         assert!(result.is_some());
     }
 

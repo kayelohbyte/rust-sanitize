@@ -187,6 +187,7 @@ mod tests {
     use crate::category::Category;
     use crate::generator::HmacGenerator;
     use crate::processor::profile::FieldRule;
+    use std::fmt::Write as _;
     use std::sync::Arc;
 
     fn make_store() -> MappingStore {
@@ -317,11 +318,22 @@ mod tests {
         let store = make_store();
         let proc = XmlProcessor;
         // Build XML that exceeds XML_DEPTH (256) levels of nesting.
-        let open: String = (0..260).map(|i| format!("<l{i}>")).collect();
-        let close: String = (0..260).rev().map(|i| format!("</l{i}>")).collect();
+        let open: String = (0..260).fold(String::new(), |mut s, i| {
+            write!(s, "<l{i}>").unwrap();
+            s
+        });
+        let close: String = (0..260).rev().fold(String::new(), |mut s, i| {
+            write!(s, "</l{i}>").unwrap();
+            s
+        });
         let content = format!("{open}secret{close}");
         let profile = FileTypeProfile::new("xml", vec![]);
-        let err = proc.process(content.as_bytes(), &profile, &store).unwrap_err();
-        assert!(matches!(err, crate::error::SanitizeError::RecursionDepthExceeded(_)));
+        let err = proc
+            .process(content.as_bytes(), &profile, &store)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::SanitizeError::RecursionDepthExceeded(_)
+        ));
     }
 }

@@ -1050,7 +1050,10 @@ label = "openai_key"
         // comment lines. Before the fix, detect() saw '#' first, fell through
         // to the TOML fallback, and failed to parse valid YAML.
         let content = "# Global sanitize allowlist — add patterns here.\n# Auto-loaded on every plain run.\n\n- pattern: foo\n  kind: allow\n";
-        assert_eq!(SecretsFormat::detect(content.as_bytes()), SecretsFormat::Yaml);
+        assert_eq!(
+            SecretsFormat::detect(content.as_bytes()),
+            SecretsFormat::Yaml
+        );
     }
 
     #[test]

@@ -667,9 +667,9 @@ mod tests {
         let new_entries: Vec<_> = store.iter_since(snap).collect();
         assert_eq!(new_entries.len(), 2);
         // None of the new entries should be the pre-snapshot email.
-        assert!(!new_entries.iter().any(|(cat, orig, _)| {
-            *cat == Category::Email && orig.as_str() == "old@a.com"
-        }));
+        assert!(!new_entries
+            .iter()
+            .any(|(cat, orig, _)| { *cat == Category::Email && orig.as_str() == "old@a.com" }));
     }
 
     #[test]
@@ -703,7 +703,9 @@ mod tests {
         assert!(store.allowlist().is_some());
 
         // Allowlisted value must be returned verbatim.
-        let result = store.get_or_insert(&Category::Hostname, "localhost").unwrap();
+        let result = store
+            .get_or_insert(&Category::Hostname, "localhost")
+            .unwrap();
         assert_eq!(result.as_str(), "localhost");
     }
 
@@ -714,7 +716,9 @@ mod tests {
         let gen = Arc::new(HmacGenerator::new([42u8; 32]));
         let store = MappingStore::new_with_allowlist(gen, None, Arc::new(matcher));
 
-        let result = store.get_or_insert(&Category::Hostname, "prod.corp.com").unwrap();
+        let result = store
+            .get_or_insert(&Category::Hostname, "prod.corp.com")
+            .unwrap();
         assert_ne!(result.as_str(), "prod.corp.com");
     }
 }

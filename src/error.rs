@@ -85,13 +85,26 @@ mod tests {
 
     #[test]
     fn display_variants_are_actionable() {
-        assert!(SanitizeError::CapacityExceeded { current: 5, limit: 3 }
-            .to_string().contains("5"));
-        assert!(SanitizeError::InputTooLarge { size: 100, limit: 50 }
-            .to_string().contains("100"));
+        assert!(SanitizeError::CapacityExceeded {
+            current: 5,
+            limit: 3
+        }
+        .to_string()
+        .contains('5'));
+        assert!(SanitizeError::InputTooLarge {
+            size: 100,
+            limit: 50
+        }
+        .to_string()
+        .contains("100"));
         assert!(SanitizeError::RecursionDepthExceeded("too deep".into())
-            .to_string().contains("too deep"));
-        assert!(SanitizeError::SecretsEmptyPassword.to_string().contains("empty"));
-        assert!(SanitizeError::SecretsDecryptFailed.to_string().contains("wrong password"));
+            .to_string()
+            .contains("too deep"));
+        assert!(SanitizeError::SecretsEmptyPassword
+            .to_string()
+            .contains("empty"));
+        assert!(SanitizeError::SecretsDecryptFailed
+            .to_string()
+            .contains("wrong password"));
     }
 }

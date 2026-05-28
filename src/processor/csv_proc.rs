@@ -187,7 +187,7 @@ mod tests {
     fn can_handle_requires_csv_profile() {
         let proc = CsvProcessor;
         let yes = FileTypeProfile::new("csv", vec![]).with_extension(".csv");
-        let no  = FileTypeProfile::new("json", vec![]).with_extension(".json");
+        let no = FileTypeProfile::new("json", vec![]).with_extension(".json");
         assert!(proc.can_handle(b"a,b,c\n1,2,3\n", &yes));
         assert!(!proc.can_handle(b"a,b,c\n1,2,3\n", &no));
     }

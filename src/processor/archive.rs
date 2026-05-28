@@ -2045,11 +2045,8 @@ mod tests {
 
     #[test]
     fn filter_only_and_exclude_combined() {
-        let f = ArchiveFilter::new(
-            vec!["config/".into()],
-            vec!["config/secrets.yaml".into()],
-        )
-        .unwrap();
+        let f =
+            ArchiveFilter::new(vec!["config/".into()], vec!["config/secrets.yaml".into()]).unwrap();
         assert!(f.passes("config/app.yaml"));
         assert!(!f.passes("config/secrets.yaml"));
         assert!(!f.passes("logs/server.log"));
@@ -2142,14 +2139,23 @@ mod tests {
         assert_eq!(stats.files_processed, 4);
 
         // Verify originals are gone (domain is preserved by email strategy, full addresses must not appear).
-        let originals = ["alice@corp.com", "bob@corp.com", "carol@corp.com", "dave@corp.com"];
+        let originals = [
+            "alice@corp.com",
+            "bob@corp.com",
+            "carol@corp.com",
+            "dave@corp.com",
+        ];
         let mut archive = tar::Archive::new(&output[..]);
         for entry in archive.entries().unwrap() {
             let mut e = entry.unwrap();
             let mut content = String::new();
             e.read_to_string(&mut content).unwrap();
             for orig in &originals {
-                assert!(!content.contains(orig), "original secret leaked in {:?}", e.path());
+                assert!(
+                    !content.contains(orig),
+                    "original secret leaked in {:?}",
+                    e.path()
+                );
             }
         }
     }
@@ -2192,7 +2198,12 @@ mod tests {
 
         assert_eq!(stats.files_processed, 4);
 
-        let originals = ["alice@corp.com", "bob@corp.com", "carol@corp.com", "dave@corp.com"];
+        let originals = [
+            "alice@corp.com",
+            "bob@corp.com",
+            "carol@corp.com",
+            "dave@corp.com",
+        ];
         let out_data = writer.into_inner();
         let mut zip_out = zip::ZipArchive::new(Cursor::new(out_data)).unwrap();
         for i in 0..zip_out.len() {
@@ -2200,7 +2211,10 @@ mod tests {
             let mut content = String::new();
             entry.read_to_string(&mut content).unwrap();
             for orig in &originals {
-                assert!(!content.contains(orig), "original secret leaked in entry {i}");
+                assert!(
+                    !content.contains(orig),
+                    "original secret leaked in entry {i}"
+                );
             }
         }
     }
@@ -2222,7 +2236,12 @@ mod tests {
         assert_eq!(stats.structured_hits, 2); // two JSON files
         assert_eq!(stats.scanner_fallback, 2); // two plain text files
 
-        let originals = ["alice@corp.com", "bob@corp.com", "carol@corp.com", "dave@corp.com"];
+        let originals = [
+            "alice@corp.com",
+            "bob@corp.com",
+            "carol@corp.com",
+            "dave@corp.com",
+        ];
         let mut archive = tar::Archive::new(&output[..]);
         for entry in archive.entries().unwrap() {
             let mut e = entry.unwrap();
@@ -2261,7 +2280,10 @@ mod tests {
                 let mut ie = inner_entry.unwrap();
                 let mut content = String::new();
                 ie.read_to_string(&mut content).unwrap();
-                assert!(!content.contains("alice@corp.com"), "secret survived nested tar");
+                assert!(
+                    !content.contains("alice@corp.com"),
+                    "secret survived nested tar"
+                );
             }
         }
     }
@@ -2287,7 +2309,10 @@ mod tests {
                 let mut ze = zip_out.by_index(i).unwrap();
                 let mut content = String::new();
                 ze.read_to_string(&mut content).unwrap();
-                assert!(!content.contains("SUPERSECRET"), "secret survived zip-in-tar");
+                assert!(
+                    !content.contains("SUPERSECRET"),
+                    "secret survived zip-in-tar"
+                );
             }
         }
     }
@@ -2307,11 +2332,22 @@ mod tests {
         let out_bytes = writer.into_inner();
         let mut outer = zip::ZipArchive::new(Cursor::new(out_bytes)).unwrap();
         let mut inner_bytes = Vec::new();
-        outer.by_index(0).unwrap().read_to_end(&mut inner_bytes).unwrap();
+        outer
+            .by_index(0)
+            .unwrap()
+            .read_to_end(&mut inner_bytes)
+            .unwrap();
         let mut inner = zip::ZipArchive::new(Cursor::new(inner_bytes)).unwrap();
         let mut content = String::new();
-        inner.by_index(0).unwrap().read_to_string(&mut content).unwrap();
-        assert!(!content.contains("alice@corp.com"), "secret survived zip-in-zip");
+        inner
+            .by_index(0)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert!(
+            !content.contains("alice@corp.com"),
+            "secret survived zip-in-zip"
+        );
     }
 
     #[test]

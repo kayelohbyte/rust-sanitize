@@ -300,7 +300,10 @@ mod tests {
         let bad = b"\xff\xfe invalid";
         let profile = FileTypeProfile::new("yaml", vec![]);
         let err = proc.process(bad, &profile, &store).unwrap_err();
-        assert!(matches!(err, crate::error::SanitizeError::ParseError { .. }));
+        assert!(matches!(
+            err,
+            crate::error::SanitizeError::ParseError { .. }
+        ));
     }
 
     #[test]
@@ -310,7 +313,10 @@ mod tests {
         let bad = b"key: [unclosed";
         let profile = FileTypeProfile::new("yaml", vec![]);
         let err = proc.process(bad, &profile, &store).unwrap_err();
-        assert!(matches!(err, crate::error::SanitizeError::ParseError { .. }));
+        assert!(matches!(
+            err,
+            crate::error::SanitizeError::ParseError { .. }
+        ));
     }
 
     #[test]
