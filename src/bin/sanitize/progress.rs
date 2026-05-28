@@ -29,6 +29,7 @@ pub(crate) struct ProgressPolicy {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProgressContext {
     pub(crate) stderr_is_terminal: bool,
+    pub(crate) stdout_is_terminal: bool,
     pub(crate) is_ci: bool,
     pub(crate) term_is_dumb: bool,
     pub(crate) json_logs: bool,
@@ -41,6 +42,7 @@ impl ProgressContext {
 
         Self {
             stderr_is_terminal: io::stderr().is_terminal(),
+            stdout_is_terminal: io::stdout().is_terminal(),
             is_ci: ci,
             term_is_dumb: term.eq_ignore_ascii_case("dumb"),
             json_logs: log_format == "json",
@@ -60,7 +62,13 @@ impl ProgressPolicy {
                 milestone_updates: true,
             },
             ProgressMode::Auto => {
+                // Live spinner uses \r to overwrite the current line. If
+                // sanitized output is also going to the terminal (stdout is a
+                // TTY), the shared cursor causes spinner text to interleave
+                // with the output. Disable live updates in that case and let
+                // milestone lines (which use \n) appear above the output.
                 let allow_live = context.stderr_is_terminal
+                    && !context.stdout_is_terminal
                     && !context.is_ci
                     && !context.term_is_dumb
                     && !context.json_logs;

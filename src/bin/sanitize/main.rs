@@ -4923,6 +4923,7 @@ fn process_archive(
 ) -> Result<bool, String> {
     let label = format!("Processing archive {}", input.display());
 
+    let filter_active = !filter.is_empty();
     with_progress_scope(progress, &label, |progress| {
         let base_proc = ArchiveProcessor::new(
             Arc::clone(deps.registry),
@@ -5060,6 +5061,14 @@ fn process_archive(
             record_archive_stats(rb, &stats);
         }
         print_archive_stats(output_path, &stats);
+
+        if filter_active && stats.files_processed == 0 && stats.entries_filtered > 0 {
+            warn!(
+                archive = %input.display(),
+                filtered = stats.entries_filtered,
+                "no archive entries matched the --only/--exclude filter — output archive is empty"
+            );
+        }
 
         Ok(stats.files_processed > 0)
     })
@@ -6568,6 +6577,7 @@ mod tests {
     ) -> ProgressContext {
         ProgressContext {
             stderr_is_terminal,
+            stdout_is_terminal: false,
             is_ci,
             term_is_dumb,
             json_logs,
