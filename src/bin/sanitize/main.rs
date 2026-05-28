@@ -98,11 +98,12 @@ use sanitize_engine::secrets::{
 use sanitize_engine::{
     atomic_write, extract_context, extract_context_reader, format_llm_prompt,
     format_llm_prompt_reference, strip_values_from_text, ArchiveFilter, ArchiveFormat,
-    ArchiveProcessor, ArchiveProgress, AtomicFileWriter, FieldNameSignal, FileReport,
-    FileTypeProfile, HmacGenerator, LlmEntry, LlmPathEntry, LogContextConfig, MappingStore,
-    ProcessorRegistry, RandomGenerator, ReplacementGenerator, ReportBuilder, ReportMetadata,
-    ScanConfig, ScanPattern, ScanStats, StreamScanner, DEFAULT_ARCHIVE_DEPTH,
-    DEFAULT_CONTEXT_LINES, DEFAULT_FIELD_SIGNAL_THRESHOLD, DEFAULT_MAX_MATCHES,
+    ArchiveProcessor, ArchiveProgress, AtomicFileWriter, EntryCallback, FieldNameSignal,
+    FileReport, FileTypeProfile, HmacGenerator, LlmEntry, LlmPathEntry, LogContextConfig,
+    LogContextResult, MappingStore, ProcessorRegistry, RandomGenerator, ReplacementGenerator,
+    ReportBuilder, ReportMetadata, ScanConfig, ScanPattern, ScanStats, StreamScanner,
+    DEFAULT_ARCHIVE_DEPTH, DEFAULT_CONTEXT_LINES, DEFAULT_FIELD_SIGNAL_THRESHOLD,
+    DEFAULT_MAX_MATCHES,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -216,37 +217,22 @@ enum ReportFormat {
         Use `sanitize encrypt` / `sanitize decrypt` to manage encrypted secrets files.",
     after_help = "\
 EXAMPLES:\n  \
-  # Plaintext secrets file (default — no password needed):\n  \
   sanitize data.log -s secrets.yaml\n  \
   sanitize data.log -s secrets.yaml -o clean.log\n  \
   grep \"error\" log.txt | sanitize -s secrets.yaml\n\n  \
-  # Encrypted secrets file (requires --encrypted-secrets):\n  \
+  # Encrypted secrets:\n  \
   sanitize data.log -s s.enc --encrypted-secrets -p\n  \
-  sanitize data.log -s s.enc --encrypted-secrets -P /run/secrets/pw\n  \
   SANITIZE_PASSWORD=hunter2 sanitize data.log -s s.enc --encrypted-secrets\n\n  \
-  # Encrypt / decrypt secrets files:\n  \
-  sanitize encrypt secrets.json secrets.json.enc --password\n  \
-  sanitize decrypt secrets.json.enc secrets.json --password\n\n  \
-  # Deterministic replacements with encrypted secrets:\n  \
-  sanitize data.csv -s s.enc --encrypted-secrets -p -d\n\n  \
-  # Extract error/warning context into the JSON report (--report required):\n  \
-  sanitize app.log -s s.enc --encrypted-secrets -p --report report.json --extract-context\n  \
-  cat app.log | sanitize -s s.enc --encrypted-secrets -p --report - --extract-context\n\n  \
-  # Custom keywords and wider context window:\n  \
-  sanitize app.log -s s.enc --encrypted-secrets -p --report - \\\n    \
-    --extract-context --context-keywords timeout,oomkilled --context-lines 20\n\n  \
-  # Strip values to generate a profile template (no secrets file needed):\n  \
-  sanitize gitlab.rb --strip-values -o gitlab.rb.template\n  \
-  cat config.rb | sanitize --strip-values\n\n  \
-  # Inline mode: embed sanitized content in the prompt (pipe to clipboard, LLM, etc.):\n  \
+  # Extract notable log events into a report:\n  \
+  sanitize app.log -s secrets.yaml --extract-context\n  \
+  sanitize app.log -s secrets.yaml --extract-context --context-keywords timeout,oomkilled\n\n  \
+  # LLM prompt (file inputs write sanitized files to disk + list paths in prompt):\n  \
   sanitize app.log -s secrets.yaml --llm | pbcopy\n  \
-  sanitize config.yaml -s s.enc --encrypted-secrets -p --llm review-config\n  \
   sanitize nginx.conf --app nginx --llm review-security\n  \
-  sanitize app.log -s s.yaml --llm --extract-context --context-lines 15\n  \
-  sanitize app.log -s s.yaml --llm /path/to/custom-template.txt\n\n  \
-  # Reference mode: write sanitized files to disk, prompt lists absolute paths:\n  \
-  sanitize app.log -s s.yaml --llm --output /tmp/sanitized/app.log\n  \
-  sanitize logs/ -s s.yaml --llm review-security --output /tmp/sanitized/"
+  sanitize logs/ -s s.yaml --llm review-security --output /tmp/sanitized/\n\n  \
+  # Strip values to generate a profile template:\n  \
+  sanitize gitlab.rb --strip-values -o gitlab.rb.template\n\nDOCS:\n  \
+  https://docs.rs/rust-sanitize"
 )]
 struct Cli {
     /// Subcommand: encrypt, decrypt, or omit for default sanitize mode.
@@ -269,37 +255,20 @@ struct Cli {
     #[arg(short = 's', long = "secrets-file", value_name = "FILE")]
     secrets_file: Option<PathBuf>,
 
-    /// Path to a file-type profile (JSON or YAML) defining which structured
-    /// fields to sanitize. Each profile entry names a processor, file
-    /// extensions, and field-path rules (e.g. `*.password`, `database.host`).
-    ///
-    /// Requires --secrets-file. The tool runs a structured pass (replacing
-    /// named fields) followed by a scanner pass (catching any remaining
-    /// secrets). The secrets file may be empty on the first run — discovered
-    /// field values are appended to it automatically so subsequent runs can
-    /// catch those same values everywhere.
+    /// File-type profile (JSON/YAML) for structured field sanitization. Requires --secrets-file.
     #[arg(long = "profile", value_name = "FILE")]
     profile: Option<PathBuf>,
 
-    /// Trigger an interactive password prompt for decrypting the secrets
-    /// file (masked input, never echoed). Requires `--encrypted-secrets`.
-    /// Providing this flag without `--encrypted-secrets` is an error.
-    /// For non-interactive automation use `--password-file` or the
-    /// `SANITIZE_PASSWORD` environment variable instead.
+    /// Interactive password prompt for `--encrypted-secrets` (masked input).
     #[arg(short = 'p', long)]
     password: bool,
 
-    /// Read the decryption password from a file. Requires `--encrypted-secrets`.
-    /// The file must have permissions 0600 or 0400 (owner-only).
-    /// Trailing newline is stripped.
+    /// Read decryption password from a file (must be 0600/0400). Requires `--encrypted-secrets`.
     #[arg(short = 'P', long = "password-file", value_name = "FILE")]
     password_file: Option<PathBuf>,
 
-    /// Treat the secrets file as AES-256-GCM encrypted and decrypt it
-    /// before loading. Requires a password via `-p`, `--password-file`,
-    /// or the `SANITIZE_PASSWORD` environment variable. Without this
-    /// flag the file is loaded as plaintext (JSON / YAML / TOML);
-    /// providing any password input without this flag is an error.
+    /// Treat the secrets file as AES-256-GCM encrypted. Requires a password via
+    /// `-p`, `--password-file`, or `SANITIZE_PASSWORD`.
     #[arg(long)]
     encrypted_secrets: bool,
 
@@ -313,50 +282,31 @@ struct Cli {
     #[arg(short = 'n', long)]
     dry_run: bool,
 
-    /// Exit with code 2 if any matches are found. Useful for CI
-    /// pipelines that should fail when secrets are detected.
+    /// Exit 2 if any matches are found. Useful in CI to fail on detected secrets.
     #[arg(long)]
     fail_on_match: bool,
 
-    /// Write a report to the given path (or stderr if no path).
-    /// The report includes file-level match counts, per-pattern stats,
-    /// processing duration, and tool metadata. No original secret values
-    /// are included. Use --report-format to select the output format.
+    /// Write a report to PATH (auto-derived when omitted). See --report-format.
     #[arg(short = 'r', long, value_name = "PATH")]
     report: Option<Option<PathBuf>>,
 
-    /// Output format for --report.
-    /// json (default): structured JSON; sarif: SARIF 2.1.0 for GitHub Advanced
-    /// Security / VS Code / SIEMs; html: self-contained human-readable summary.
-    #[arg(long, value_name = "FORMAT", default_value = "json")]
+    /// Report format: json (default), sarif, or html.
+    #[arg(long, value_name = "FORMAT", default_value = "json", hide_possible_values = true)]
     report_format: ReportFormat,
 
     /// Abort on the first error instead of skipping and continuing.
     #[arg(long)]
     strict: bool,
 
-    /// Use HMAC-deterministic replacements so that identical inputs
-    /// always produce identical outputs across runs (requires a stable
-    /// seed derived from the secrets key).
+    /// HMAC-deterministic replacements — identical inputs produce identical outputs across runs.
     #[arg(short = 'd', long)]
     deterministic: bool,
 
-    /// Disable the structured-to-scanner handoff. When a profile is active
-    /// and `--secrets-file` is provided, values discovered in typed fields are
-    /// appended to that file as `kind: literal` entries so the scanner pass
-    /// can catch those same values in logs, comments, and unstructured text.
-    /// Pass this flag to suppress that write.
+    /// Suppress writing newly-discovered field values back to the secrets file.
     #[arg(long)]
     no_structured_handoff: bool,
 
-    /// Disable the field-name signal heuristic. When a structured profile is
-    /// active, keys matching built-in sensitive keywords (password, secret,
-    /// token, api_key, …) are automatically flagged based on their value's
-    /// Shannon entropy — even without an explicit FieldRule. The default
-    /// entropy thresholds are 3.0 bits/char for strong keywords and 3.5 for
-    /// ambiguous ones. Pass this flag to rely solely on explicit FieldRules
-    /// and secrets patterns. Adjust per-signal thresholds in your secrets
-    /// file with `kind: field-name` entries instead of disabling entirely.
+    /// Disable automatic entropy-based flagging of sensitive-named fields (password, token, …).
     #[arg(long)]
     no_field_signal: bool,
 
@@ -364,50 +314,23 @@ struct Cli {
     #[arg(long)]
     include_binary: bool,
 
-    /// When a directory is given as input, also walk hidden files and
-    /// directories (those whose name starts with `.`). VCS metadata
-    /// directories (.git, .hg, .svn, .bzr) are always skipped regardless
-    /// of this flag.
+    /// Walk hidden files/directories during directory input (VCS dirs always skipped).
     #[arg(long)]
     hidden: bool,
 
-    /// Enable Shannon entropy detection for high-entropy tokens not caught by
-    /// pattern matching. THRESHOLD is bits per character (e.g. 4.5). Tokens
-    /// of 20–200 alphanumeric characters whose entropy meets or exceeds this
-    /// value are treated as secrets. Off by default. Supplement with
-    /// `kind: entropy` entries in the secrets file for finer control.
+    /// Flag high-entropy tokens ≥ THRESHOLD bits/char (e.g. 4.5). Off by default.
     #[arg(long, value_name = "THRESHOLD")]
     entropy_threshold: Option<f64>,
 
-    /// Exclude paths matching these glob patterns from scanning.
-    /// Patterns are matched against the path relative to the input root
-    /// (or against the filename alone when no `/` is present in the pattern).
-    /// A trailing `/` excludes the entire subtree.
-    /// Merged with `exclude` entries in `.sanitize.toml`; CLI patterns are
-    /// applied in addition to, not instead of, project config patterns.
-    /// Example: --exclude-path "tests/fixtures/" --exclude-path "**/*.generated.*"
+    /// Exclude paths matching GLOB. Repeatable. Merged with `.sanitize.toml` excludes.
     #[arg(long, value_name = "GLOB", num_args = 1)]
     exclude_path: Vec<String>,
 
-    /// Only process files matching these glob patterns during directory walks.
-    /// Patterns are matched against the path relative to the input root
-    /// (or against the filename alone when no `/` is present in the pattern).
-    /// A trailing `/` includes the entire subtree.
-    /// When both --include-path and --exclude-path match a file, exclusion wins.
-    /// Has no effect on explicitly named file arguments or archive entries.
-    /// Example: --include-path "**/*.log" --include-path "**/*.conf"
+    /// Only process paths matching GLOB during directory walks. Exclusion wins on conflict.
     #[arg(long, value_name = "GLOB", num_args = 1)]
     include_path: Vec<String>,
 
-    /// Bypass all structured processors (JSON, YAML, XML, TOML, etc.) and
-    /// run only the streaming scanner on every file.
-    ///
-    /// Use this when you are uncertain about your field rules or want
-    /// a guarantee that every byte in every file is pattern-scanned.
-    /// The output is the same byte length as the input but structural
-    /// formatting may differ for structured file types.
-    /// Under normal operation the structured + scan double-pass handles
-    /// this automatically; this flag disables the structured pass entirely.
+    /// Skip structured processors; scan every byte with the streaming scanner only.
     #[arg(long)]
     force_text: bool,
 
@@ -416,14 +339,10 @@ struct Cli {
     /// Slack, OpenAI, Anthropic, HuggingFace, SendGrid, npm), JWTs, emails,
     /// IPv4/IPv6, UUIDs, MAC addresses, PEM headers, and credential URLs.
     /// Additive with `--secrets-file`, `--app`, and `--profile`.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     use_default: bool,
 
-    /// Number of worker threads. When multiple input files are provided,
-    /// files are processed in parallel up to this limit. For a single
-    /// archive input, entries are sanitized in parallel using the same
-    /// budget. Defaults to the number of logical CPUs. Capped to the
-    /// system's available parallelism.
+    /// Worker thread count (default: logical CPU count).
     #[arg(long, value_name = "N")]
     threads: Option<usize>,
 
@@ -468,9 +387,7 @@ struct Cli {
     #[arg(long, hide = true)]
     no_progress: bool,
 
-    /// Suppress the post-run redaction summary and all decorative stderr output.
-    /// Implies --progress off. Use in scripts or pipelines where only the exit
-    /// code matters.
+    /// Suppress the post-run summary and all decorative stderr output.
     #[arg(long)]
     quiet: bool,
 
@@ -478,24 +395,11 @@ struct Cli {
     #[arg(long, value_name = "MS", default_value_t = DEFAULT_PROGRESS_INTERVAL_MS, hide = true)]
     progress_interval_ms: u64,
 
-    /// Write per-file findings as newline-delimited JSON (NDJSON) to PATH.
-    /// Omit PATH to write to stdout. Use "-" explicitly for stdout.
-    /// Each line is a JSON object: one `{"type":"file",...}` per processed
-    /// file, followed by a `{"type":"summary",...}` line. Compatible with
-    /// `jq`, SIEM ingest, and other line-oriented JSON tools.
-    /// In default sanitize mode prefer an explicit path so sanitized content
-    /// on stdout is not mixed with findings.
+    /// Write per-file findings as NDJSON to PATH (stdout when omitted). Compatible with `jq` / SIEMs.
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "-")]
     findings: Option<PathBuf>,
 
-    /// After sanitizing, extract lines matching error/warning keywords with
-    /// surrounding context and include them in the JSON report. Useful when
-    /// sending a large log to support: sanitize the full file, then share
-    /// only the relevant excerpts via `--report`.
-    ///
-    /// Use `--context-lines` to control how many surrounding lines to capture,
-    /// `--context-keywords` to add your own keywords, and `--context-keywords-replace`
-    /// to use only your keywords instead of the built-in list.
+    /// Extract error/warning lines with surrounding context into the report.
     #[arg(long)]
     extract_context: bool,
 
@@ -503,46 +407,27 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = 10)]
     context_lines: usize,
 
-    /// Comma-separated extra keywords to search for when `--extract-context`
-    /// is set. Merged with the built-in list (error, failure, warning, warn,
-    /// fatal, exception, critical, panic, timeout, oomkilled) by default.
-    /// Use `--context-keywords-replace` to suppress the built-in list and use
-    /// only these keywords.
-    ///
-    /// Example: --extract-context --context-keywords "connection refused,ECONNREFUSED"
+    /// Extra keywords for `--extract-context` (comma-separated, merged with built-ins).
     #[arg(long, value_name = "KEYWORDS", value_delimiter = ',')]
     context_keywords: Vec<String>,
 
-    /// Replace the built-in keyword list entirely with the keywords given by
-    /// `--context-keywords`. Without this flag, custom keywords are merged
-    /// with the built-ins. Has no effect if `--context-keywords` is not set.
+    /// Use only `--context-keywords`; replace the built-in keyword list entirely.
     #[arg(long)]
     context_keywords_replace: bool,
 
-    /// Maximum number of keyword matches to capture per file when
-    /// `--extract-context` is set. Matches beyond this limit are silently
-    /// dropped and `truncated` is set to `true` in the report. Default: 50.
+    /// Max keyword matches per file for `--extract-context` (default: 50).
     #[arg(long, value_name = "N", default_value_t = 50)]
     max_context_matches: usize,
 
-    /// Maximum number of per-match line numbers to record in the report when
-    /// `--report` is active. Each entry stores the 1-based line number, byte
-    /// offset, and pattern label for one scanner match. Set to 0 to disable
-    /// line-number tracking entirely (useful for very large files where even
-    /// the cap overhead is undesirable). Default: 500.
+    /// Max match locations recorded per file in the report (default: 500; 0 to disable).
     #[arg(long, value_name = "N", default_value_t = 500)]
     max_match_locations: usize,
 
-    /// Use case-sensitive keyword matching when `--extract-context` is set.
-    /// By default matching is case-insensitive (`ERROR`, `error`, and `Error`
-    /// all match the keyword `error`).
+    /// Case-sensitive keyword matching for `--extract-context` (default: case-insensitive).
     #[arg(long)]
     context_case_sensitive: bool,
 
-    /// Strip all values from structured output, emitting only keys and
-    /// structure. Useful for generating a profile template from a real
-    /// config file without exposing any secret values. Bypasses the
-    /// sanitization pipeline — no secrets file is required.
+    /// Emit only keys/structure (no values). Useful for generating profile templates.
     #[arg(long)]
     strip_values: bool,
 
@@ -565,48 +450,17 @@ struct Cli {
     strip_comment_prefix: String,
 
     /// Format sanitized output as an LLM-ready prompt on stdout.
-    /// TEMPLATE chooses the instruction set:
-    ///
-    /// - `troubleshoot`    (default) — incident triage: root cause, event sequence, remediation
-    /// - `review-config`             — config review: misconfigurations, best practices
-    /// - `review-security`           — security posture: auth, exposure, TLS, CVEs, hardcoded secrets
-    ///
-    /// TEMPLATE may also be a path to a custom template file.
-    /// Combine with `--extract-context` to include notable log events.
-    ///
-    /// Without `--output` (inline mode): sanitized content is embedded directly
-    /// in `<content>` blocks in the prompt.
-    ///
-    /// With `--output` (reference mode): sanitized files are written to disk and
-    /// the prompt lists their absolute paths — for large file sets or agentic
-    /// LLMs that can read files with their own tools.
+    /// TEMPLATE: troubleshoot (default), review-config, review-security, or a path.
+    /// File inputs write sanitized files to disk and list paths in the prompt.
+    /// Stdin-only inputs embed content inline.
     #[arg(long, value_name = "TEMPLATE", default_missing_value = "troubleshoot", num_args = 0..=1)]
     llm: Option<String>,
 
-    /// Load built-in secrets patterns and structured field profiles for one or
-    /// more applications. Comma-separated list of app names.
-    ///
-    /// Example: `--app gitlab`  `--app gitlab,nginx,postgresql`
-    ///
-    /// Can be combined with `--secrets-file` (additive) and `--profile`
-    /// (profiles are merged).
-    ///
-    /// Run `sanitize apps` to list available app names and descriptions.
+    /// Load built-in patterns/profiles for an app (comma-separated). Run `sanitize apps` for names.
     #[arg(long, value_delimiter = ',', value_name = "APPS")]
     app: Vec<String>,
 
-    /// Allow a specific value through unchanged. Repeatable.
-    ///
-    /// Matched values are not replaced and not recorded in the mapping store,
-    /// so they will also pass through in any other files processed in the same
-    /// run. Three pattern forms are supported:
-    ///
-    /// - Exact: `--allow localhost`
-    /// - Glob (`*` wildcard): `--allow "*.internal"`  `--allow "192.168.1.*"`
-    /// - Regex (prefix with `regex:`): `--allow "regex:^10\.[0-9]+\.[0-9]+\.[0-9]+$"`
-    ///
-    /// Allowlist entries can also be placed in the secrets file as
-    /// `kind: allow` entries.
+    /// Allow a value unchanged. Supports exact, glob (`*`), or `regex:` prefix. Repeatable.
     #[arg(long = "allow", value_name = "PATTERN")]
     allow: Vec<String>,
 }
@@ -1043,7 +897,7 @@ struct ScanArgs {
 
     /// Load the built-in balanced detection patterns without a secrets file.
     /// Same as the main `--use-default` flag.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     use_default: bool,
 }
 
@@ -2615,6 +2469,45 @@ fn uniquify_output_path(path: PathBuf, used: &mut HashSet<PathBuf>) -> PathBuf {
     }
 }
 
+/// Derive a report path when none was explicitly given. `ext` is the file
+/// extension without a leading dot (e.g. `"json"`, `"sarif"`, `"html"`).
+/// Returns `None` when all targets are stdin.
+///
+/// Single file: `<output_dir>/<input_stem>.extracted.<ext>`
+/// Multiple files: `<common_output_dir>/sanitize-extracted.<ext>`, falling
+///   back to `./sanitize-extracted.<ext>` when outputs are in different dirs.
+fn derive_auto_report_path(targets: &[InputTarget], ext: &str) -> Option<PathBuf> {
+    let files: Vec<(&Path, &Path)> = targets
+        .iter()
+        .filter_map(|t| match t {
+            InputTarget::File { input, output } => Some((input.as_path(), output.as_path())),
+            InputTarget::Stdin { .. } => None,
+        })
+        .collect();
+
+    if files.is_empty() {
+        return None;
+    }
+
+    if files.len() == 1 {
+        let (input, output) = files[0];
+        let stem = input.file_stem()?.to_str()?;
+        let dir = output.parent().unwrap_or(Path::new("."));
+        Some(dir.join(format!("{stem}.extracted.{ext}")))
+    } else {
+        let first_dir = files[0].1.parent().unwrap_or(Path::new("."));
+        let all_same_dir = files
+            .iter()
+            .all(|(_, o)| o.parent().unwrap_or(Path::new(".")) == first_dir);
+        let dir = if all_same_dir {
+            first_dir
+        } else {
+            Path::new(".")
+        };
+        Some(dir.join(format!("sanitize-extracted.{ext}")))
+    }
+}
+
 enum InputTarget {
     Stdin { output: Option<PathBuf> },
     File { input: PathBuf, output: PathBuf },
@@ -3830,6 +3723,12 @@ fn process_stdin_streaming<R: io::Read>(
     max_match_locations: usize,
     entropy_histogram_acc: Option<&Arc<Mutex<Vec<EntropyBuckets>>>>,
 ) -> Result<bool, String> {
+    // Treat "-" as a sentinel meaning stdout.
+    let output_path = if output_path.is_some_and(|p| p == Path::new("-")) {
+        None
+    } else {
+        output_path
+    };
     let label = if cli.dry_run {
         "Scanning stdin (dry-run)"
     } else {
@@ -4925,6 +4824,13 @@ fn process_archive(
 
     let filter_active = !filter.is_empty();
     with_progress_scope(progress, &label, |progress| {
+        let context_map: Option<Arc<Mutex<HashMap<String, LogContextResult>>>> =
+            if cli.extract_context && report_builder.is_some() {
+                Some(Arc::new(Mutex::new(HashMap::new())))
+            } else {
+                None
+            };
+
         let base_proc = ArchiveProcessor::new(
             Arc::clone(deps.registry),
             Arc::clone(deps.scanner),
@@ -4940,6 +4846,21 @@ fn process_archive(
         // rayon thread pool.
         let base_proc = if suppress_inner_parallelism {
             base_proc.with_parallel_threshold(usize::MAX)
+        } else {
+            base_proc
+        };
+
+        let base_proc = if let Some(ctx_map) = &context_map {
+            let ctx_map = Arc::clone(ctx_map);
+            let config = build_log_context_config(cli);
+            let cb: EntryCallback = Arc::new(move |name: &str, bytes: &[u8]| {
+                let text = String::from_utf8_lossy(bytes);
+                let result = extract_context(&text, &config);
+                if let Ok(mut map) = ctx_map.lock() {
+                    map.insert(name.to_string(), result);
+                }
+            });
+            base_proc.with_entry_callback(cb)
         } else {
             base_proc
         };
@@ -5059,6 +4980,13 @@ fn process_archive(
 
         if let Some(rb) = report_builder {
             record_archive_stats(rb, &stats);
+            if let Some(ctx_map) = context_map {
+                if let Ok(map) = ctx_map.lock() {
+                    for (path, result) in map.iter() {
+                        rb.set_file_log_context(path, result.clone());
+                    }
+                }
+            }
         }
         print_archive_stats(output_path, &stats);
 
@@ -5978,8 +5906,11 @@ fn run_sanitize(
     // Force report building when --llm or --findings is active so we have
     // per-file stats available for those output paths. Also enabled by default
     // so the post-run redaction summary can be printed (suppressed by --quiet).
-    let report_enabled =
-        cli.report.is_some() || cli.llm.is_some() || cli.findings.is_some() || !cli.quiet;
+    let report_enabled = cli.report.is_some()
+        || cli.llm.is_some()
+        || cli.findings.is_some()
+        || cli.extract_context
+        || !cli.quiet;
     let report_builder = if report_enabled {
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -6005,11 +5936,18 @@ fn run_sanitize(
         None
     };
 
-    // Reference mode: --llm + --output → write sanitized files to disk and emit
-    // a prompt listing their absolute paths instead of inlining content.
-    // Inline mode (default): --llm alone → bytes are collected and embedded in
-    // <content> blocks in the prompt (no files written to disk).
-    let reference_mode = cli.llm.is_some() && cli.output.is_some();
+    let input_targets = plan_input_targets(&cli).map_err(|e| (e, 1))?;
+
+    // Reference mode: sanitized files are written to disk and the prompt lists
+    // their absolute paths so an agentic LLM can read them directly.
+    // Triggered when --llm is active and there is at least one file input
+    // (explicit --output or auto-derived output paths both work).
+    // Inline mode: stdin-only invocations — content is embedded in <content>
+    // blocks in the prompt because there are no on-disk files to reference.
+    let has_file_targets = input_targets
+        .iter()
+        .any(|t| matches!(t, InputTarget::File { .. }));
+    let reference_mode = cli.llm.is_some() && (cli.output.is_some() || has_file_targets);
 
     // --- LLM collector (only allocated for inline mode) ----------------------
     let llm_collector: Option<LlmCollector> = if cli.llm.is_some() && !reference_mode {
@@ -6018,7 +5956,28 @@ fn run_sanitize(
         None
     };
 
-    let input_targets = plan_input_targets(&cli).map_err(|e| (e, 1))?;
+    // When --extract-context is active without an explicit --report path, derive
+    // a report file path next to the output so context data is not lost.
+    let auto_report_path: Option<PathBuf> =
+        if cli.extract_context && cli.report.is_none() {
+            derive_auto_report_path(&input_targets, "json")
+        } else {
+            None
+        };
+
+    // When --report is given with no path, pre-compute the auto file path
+    // (must happen before input_targets is consumed by into_iter below).
+    let report_no_path_auto: Option<PathBuf> =
+        if matches!(&cli.report, Some(None)) {
+            let ext = match cli.report_format {
+                ReportFormat::Sarif => "sarif",
+                ReportFormat::Html => "html",
+                ReportFormat::Json => "json",
+            };
+            derive_auto_report_path(&input_targets, ext)
+        } else {
+            None
+        };
 
     // --- --strip-values early exit -----------------------------------------
     // Bypass the full sanitization pipeline: emit key structure only (no values).
@@ -6429,9 +6388,30 @@ fn run_sanitize(
                     info!(report = %path.display(), format = ?cli.report_format, "report written");
                 }
                 None => {
-                    eprintln!("{content}");
+                    if let Some(ref path) = report_no_path_auto {
+                        atomic_write(path, content.as_bytes()).map_err(|e| {
+                            (
+                                format!("failed to write report to {}: {e}", path.display()),
+                                1,
+                            )
+                        })?;
+                        eprintln!("Report written to {}", path.display());
+                    } else {
+                        eprintln!("{content}");
+                    }
                 }
             }
+        } else if let Some(ref path) = auto_report_path {
+            let content = report
+                .to_json_pretty()
+                .map_err(|e| (format!("failed to serialize report: {e}"), 1))?;
+            atomic_write(path, content.as_bytes()).map_err(|e| {
+                (
+                    format!("failed to write report to {}: {e}", path.display()),
+                    1,
+                )
+            })?;
+            eprintln!("Report written to {}", path.display());
         }
 
         // --- NDJSON findings (--findings / scan --json) ---
