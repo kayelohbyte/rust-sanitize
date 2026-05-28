@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`-o -` with file inputs now writes to stdout** — passing `-o -` (the
+  conventional stdout sentinel) when the input was a file path caused the
+  sanitized output to be written to a literal file named `-` in the working
+  directory instead of standard output. Both the buffered structured path
+  (`write_output`) and the streaming `AtomicFileWriter` path in
+  `process_plain_file` now treat `-` as a stdout sentinel, matching the
+  behaviour already supported for stdin.
+
 - **GitHub Actions template expressions over-redacted** — `${{ secrets.X }}`
   expressions (using the `${{…}}` syntax) were being flagged by streaming
   patterns. Added `"${{*}}"` to the `apps/github-actions/secrets.yaml`

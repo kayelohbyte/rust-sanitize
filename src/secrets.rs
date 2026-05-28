@@ -232,13 +232,20 @@ impl SecretsFormat {
     /// Try to auto-detect format from content.
     pub fn detect(content: &[u8]) -> Self {
         let s = String::from_utf8_lossy(content);
-        let trimmed = s.trim_start();
-        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+        // Skip leading comment lines — both YAML and TOML use `#`, so a file
+        // that opens with comments must be scanned further to find the first
+        // meaningful token.
+        let first_meaningful = s
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .unwrap_or("");
+        if first_meaningful.starts_with('[') || first_meaningful.starts_with('{') {
             // `[` is ambiguous: JSON arrays and TOML table headers both start
             // with it. We pick JSON here because our secrets files are never
             // bare TOML tables, and a wrong guess produces a clear parse error.
             Self::Json
-        } else if trimmed.starts_with('-') || trimmed.starts_with("---") {
+        } else if first_meaningful.starts_with('-') || first_meaningful.starts_with("---") {
             Self::Yaml
         } else {
             // Fallback: assume TOML
@@ -1035,6 +1042,43 @@ label = "openai_key"
             Some(SecretsFormat::Toml)
         );
         assert_eq!(SecretsFormat::from_extension("secrets.txt"), None);
+    }
+
+    #[test]
+    fn detect_yaml_with_leading_comment_header() {
+        // Regression: the auto-provisioned global secrets file opens with '#'
+        // comment lines. Before the fix, detect() saw '#' first, fell through
+        // to the TOML fallback, and failed to parse valid YAML.
+        let content = "# Global sanitize allowlist — add patterns here.\n# Auto-loaded on every plain run.\n\n- pattern: foo\n  kind: allow\n";
+        assert_eq!(SecretsFormat::detect(content.as_bytes()), SecretsFormat::Yaml);
+    }
+
+    #[test]
+    fn detect_yaml_comment_header_parses_correctly() {
+        // Round-trip: same shape as the auto-provisioned file must load without error.
+        let content = "# Global sanitize allowlist — add patterns or kind:regex entries here.\n# Auto-loaded on every plain run. Edit freely; deleted values take effect immediately.\n\n- pattern: ''\n  kind: allow\n  category: ''\n  values:\n  - localhost\n  - 127.0.0.1\n";
+        let entries = parse_secrets(content.as_bytes(), None)
+            .expect("auto-provisioned secrets file with comment header must parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "allow");
+        assert!(entries[0].values.contains(&"localhost".to_string()));
+    }
+
+    #[test]
+    fn detect_json_array() {
+        assert_eq!(
+            SecretsFormat::detect(b"[{\"pattern\": \"foo\"}]"),
+            SecretsFormat::Json
+        );
+    }
+
+    #[test]
+    fn detect_toml_fallback() {
+        // TOML that doesn't open with '[' or '{' — must not be mistaken for YAML.
+        assert_eq!(
+            SecretsFormat::detect(b"# toml comment\nkey = \"value\""),
+            SecretsFormat::Toml
+        );
     }
 
     // ---- Defaults ----

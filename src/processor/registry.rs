@@ -136,3 +136,104 @@ impl Default for ProcessorRegistry {
         Self::with_builtins()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::category::Category;
+    use crate::generator::HmacGenerator;
+    use crate::processor::profile::{FieldRule, FileTypeProfile};
+    use std::sync::Arc;
+
+    fn make_store() -> MappingStore {
+        let gen = Arc::new(HmacGenerator::new([42u8; 32]));
+        MappingStore::new(gen, None)
+    }
+
+    #[test]
+    fn new_registry_is_empty() {
+        let reg = ProcessorRegistry::new();
+        assert!(reg.is_empty());
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn with_builtins_registers_known_processors() {
+        let reg = ProcessorRegistry::with_builtins();
+        assert!(!reg.is_empty());
+        let names = reg.names();
+        for expected in &["json", "yaml", "xml", "csv", "toml", "jsonl"] {
+            assert!(names.contains(expected), "missing processor: {expected}");
+        }
+    }
+
+    #[test]
+    fn register_and_get_roundtrip() {
+        let mut reg = ProcessorRegistry::new();
+        reg.register(Arc::new(crate::processor::json_proc::JsonProcessor));
+        assert!(reg.get("json").is_some());
+        assert!(reg.get("xml").is_none());
+    }
+
+    #[test]
+    fn register_overwrites_existing() {
+        let mut reg = ProcessorRegistry::new();
+        reg.register(Arc::new(crate::processor::json_proc::JsonProcessor));
+        reg.register(Arc::new(crate::processor::json_proc::JsonProcessor));
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn names_lists_all_registered() {
+        let mut reg = ProcessorRegistry::new();
+        reg.register(Arc::new(crate::processor::json_proc::JsonProcessor));
+        reg.register(Arc::new(crate::processor::yaml_proc::YamlProcessor));
+        let names = reg.names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"json"));
+        assert!(names.contains(&"yaml"));
+    }
+
+    #[test]
+    fn find_processor_by_profile_name() {
+        let reg = ProcessorRegistry::with_builtins();
+        let profile = FileTypeProfile::new("json", vec![]).with_extension(".json");
+        let content = b"{}";
+        assert!(reg.find_processor(content, &profile).is_some());
+    }
+
+    #[test]
+    fn find_processor_returns_none_for_unrecognised_content() {
+        let reg = ProcessorRegistry::new(); // empty — nothing registered
+        let profile = FileTypeProfile::new("json", vec![]).with_extension(".json");
+        assert!(reg.find_processor(b"{}", &profile).is_none());
+    }
+
+    #[test]
+    fn process_returns_some_for_matching_content() {
+        let reg = ProcessorRegistry::with_builtins();
+        let store = make_store();
+        let profile = FileTypeProfile::new(
+            "json",
+            vec![FieldRule::new("*.secret").with_category(Category::Custom("s".into()))],
+        )
+        .with_extension(".json");
+        let result = reg.process(br#"{"secret":"abc"}"#, &profile, &store).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn process_returns_none_when_no_processor_matches() {
+        let reg = ProcessorRegistry::new(); // empty
+        let store = make_store();
+        let profile = FileTypeProfile::new("json", vec![]).with_extension(".json");
+        let result = reg.process(b"{}", &profile, &store).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn default_impl_gives_builtins() {
+        let reg = ProcessorRegistry::default();
+        assert!(reg.get("json").is_some());
+    }
+}

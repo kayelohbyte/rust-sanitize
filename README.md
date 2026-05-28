@@ -18,6 +18,12 @@ Works as a **CLI**, a **Rust library**, and an **MCP server** — so AI assistan
 
 Install the MCP server and your AI assistant can sanitize files directly — secrets stay inside the audited Rust process and never enter the context window.
 
+**Step 1 — Install the binaries**
+
+Download `sanitize` and `sanitize-mcp` for your platform from the [Releases](https://github.com/kayelohbyte/rust-sanitize/releases) page and place them on your `$PATH` (e.g. `/usr/local/bin/`). No Deno or Node required — the runtime is embedded.
+
+**Step 2 — Register with your AI tool**
+
 **Claude Code:**
 
 ```bash

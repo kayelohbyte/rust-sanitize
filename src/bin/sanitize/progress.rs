@@ -66,7 +66,9 @@ impl ProgressPolicy {
                     && !context.json_logs;
                 Self {
                     live_updates: allow_live,
-                    milestone_updates: allow_live,
+                    // Milestone lines are plain eprintln! — useful in non-TTY
+                    // and background runs even when live spinner is suppressed.
+                    milestone_updates: !context.json_logs,
                 }
             }
         }

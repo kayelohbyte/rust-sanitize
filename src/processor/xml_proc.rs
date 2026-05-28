@@ -231,4 +231,97 @@ mod tests {
         assert!(!out.contains("db.corp.com"));
         assert!(out.contains("5432"));
     }
+
+    #[test]
+    fn can_handle_xml_declaration() {
+        let proc = XmlProcessor;
+        let profile = FileTypeProfile::new("other", vec![]).with_extension(".txt");
+        assert!(proc.can_handle(b"<?xml version=\"1.0\"?><root/>", &profile));
+    }
+
+    #[test]
+    fn can_handle_bare_tag() {
+        let proc = XmlProcessor;
+        let profile = FileTypeProfile::new("other", vec![]).with_extension(".txt");
+        assert!(proc.can_handle(b"<root><child/></root>", &profile));
+    }
+
+    #[test]
+    fn can_handle_by_profile_name() {
+        let proc = XmlProcessor;
+        let profile = FileTypeProfile::new("xml", vec![]).with_extension(".xml");
+        assert!(proc.can_handle(b"not xml at all", &profile));
+    }
+
+    #[test]
+    fn can_handle_rejects_plaintext() {
+        let proc = XmlProcessor;
+        let profile = FileTypeProfile::new("json", vec![]).with_extension(".json");
+        assert!(!proc.can_handle(b"just some plain text", &profile));
+    }
+
+    #[test]
+    fn empty_element_attributes_replaced() {
+        let store = make_store();
+        let proc = XmlProcessor;
+        let content = b"<config><server host=\"prod.corp.com\" port=\"443\"/></config>";
+        let profile = FileTypeProfile::new(
+            "xml",
+            vec![FieldRule::new("config/server/@host").with_category(Category::Hostname)],
+        );
+        let result = proc.process(content, &profile, &store).unwrap();
+        let out = String::from_utf8(result).unwrap();
+        assert!(!out.contains("prod.corp.com"));
+        assert!(out.contains("443"));
+    }
+
+    #[test]
+    fn empty_element_at_root_level() {
+        let store = make_store();
+        let proc = XmlProcessor;
+        let content = b"<server host=\"root.corp.com\"/>";
+        let profile = FileTypeProfile::new(
+            "xml",
+            vec![FieldRule::new("server/@host").with_category(Category::Hostname)],
+        );
+        let result = proc.process(content, &profile, &store).unwrap();
+        let out = String::from_utf8(result).unwrap();
+        assert!(!out.contains("root.corp.com"));
+    }
+
+    #[test]
+    fn unmatched_attributes_pass_through() {
+        let store = make_store();
+        let proc = XmlProcessor;
+        let content = b"<config><db host=\"db.corp.com\" port=\"5432\"/></config>";
+        let profile = FileTypeProfile::new("xml", vec![]); // no field rules
+        let result = proc.process(content, &profile, &store).unwrap();
+        let out = String::from_utf8(result).unwrap();
+        assert!(out.contains("db.corp.com"));
+        assert!(out.contains("5432"));
+    }
+
+    #[test]
+    fn other_xml_events_pass_through() {
+        let store = make_store();
+        let proc = XmlProcessor;
+        let content = b"<?xml version=\"1.0\"?><!-- comment --><root><child>value</child></root>";
+        let profile = FileTypeProfile::new("xml", vec![]);
+        let result = proc.process(content, &profile, &store).unwrap();
+        let out = String::from_utf8(result).unwrap();
+        assert!(out.contains("value"));
+    }
+
+    #[test]
+    fn depth_limit_exceeded_returns_error() {
+        let store = make_store();
+        let proc = XmlProcessor;
+        // Build XML that exceeds XML_DEPTH (256) levels of nesting.
+        let open: String = (0..260).map(|i| format!("<l{i}>")).collect();
+        let close: String = (0..260).rev().map(|i| format!("</l{i}>")).collect();
+        let content = format!("{open}secret{close}");
+        let profile = FileTypeProfile::new("xml", vec![]);
+        let err = proc.process(content.as_bytes(), &profile, &store).unwrap_err();
+        assert!(matches!(err, crate::error::SanitizeError::RecursionDepthExceeded(_)));
+    }
 }

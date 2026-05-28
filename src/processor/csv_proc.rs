@@ -184,6 +184,94 @@ mod tests {
     }
 
     #[test]
+    fn can_handle_requires_csv_profile() {
+        let proc = CsvProcessor;
+        let yes = FileTypeProfile::new("csv", vec![]).with_extension(".csv");
+        let no  = FileTypeProfile::new("json", vec![]).with_extension(".json");
+        assert!(proc.can_handle(b"a,b,c\n1,2,3\n", &yes));
+        assert!(!proc.can_handle(b"a,b,c\n1,2,3\n", &no));
+    }
+
+    #[test]
+    fn tsv_delimiter() {
+        let store = make_store();
+        let proc = CsvProcessor;
+        let content = b"name\temail\nAlice\talice@corp.com\n";
+        let mut profile = FileTypeProfile::new(
+            "csv",
+            vec![FieldRule::new("email").with_category(Category::Email)],
+        );
+        profile.options.insert("delimiter".into(), "\t".into());
+
+        let result = proc.process(content, &profile, &store).unwrap();
+        let out = String::from_utf8(result).unwrap();
+        assert!(!out.contains("alice@corp.com"));
+        assert!(out.contains("Alice"));
+    }
+
+    #[test]
+    fn no_header_mode_matches_by_column_index() {
+        let store = make_store();
+        let proc = CsvProcessor;
+        // Column 1 (0-indexed) should be replaced.
+        let content = b"Alice,alice@corp.com,Engineering\n";
+        let mut profile = FileTypeProfile::new(
+            "csv",
+            vec![FieldRule::new("1").with_category(Category::Email)],
+        );
+        profile.options.insert("has_header".into(), "false".into());
+
+        let result = proc.process(content, &profile, &store).unwrap();
+        let out = String::from_utf8(result).unwrap();
+        assert!(!out.contains("alice@corp.com"));
+        assert!(out.contains("Alice"));
+        assert!(out.contains("Engineering"));
+    }
+
+    #[test]
+    fn header_only_no_data_rows() {
+        let store = make_store();
+        let proc = CsvProcessor;
+        let content = b"name,email,department\n";
+        let profile = FileTypeProfile::new(
+            "csv",
+            vec![FieldRule::new("email").with_category(Category::Email)],
+        );
+        let result = proc.process(content, &profile, &store).unwrap();
+        let out = String::from_utf8(result).unwrap();
+        assert!(out.contains("name,email,department"));
+    }
+
+    #[test]
+    fn empty_field_passes_through() {
+        let store = make_store();
+        let proc = CsvProcessor;
+        let content = b"email\n\nalice@corp.com\n";
+        let profile = FileTypeProfile::new(
+            "csv",
+            vec![FieldRule::new("email").with_category(Category::Email)],
+        );
+        let result = proc.process(content, &profile, &store).unwrap();
+        let out = String::from_utf8(result).unwrap();
+        assert!(!out.contains("alice@corp.com"));
+    }
+
+    #[test]
+    fn unmatched_columns_pass_through_unchanged() {
+        let store = make_store();
+        let proc = CsvProcessor;
+        let content = b"id,email\n42,alice@corp.com\n";
+        let profile = FileTypeProfile::new(
+            "csv",
+            vec![FieldRule::new("email").with_category(Category::Email)],
+        );
+        let result = proc.process(content, &profile, &store).unwrap();
+        let out = String::from_utf8(result).unwrap();
+        assert!(out.contains("42"), "id column must be preserved");
+        assert!(!out.contains("alice@corp.com"));
+    }
+
+    #[test]
     fn csv_deterministic_replacement() {
         let store = make_store();
         let proc = CsvProcessor;

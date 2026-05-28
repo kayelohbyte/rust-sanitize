@@ -658,6 +658,88 @@ mod tests {
         assert_eq!(result.matches[0].keyword, "Timeout");
     }
 
+    // ---- extract_context_reader ----
+
+    fn reader_of(lines: &[&str]) -> std::io::BufReader<std::io::Cursor<Vec<u8>>> {
+        let s = lines.join("\n");
+        std::io::BufReader::new(std::io::Cursor::new(s.into_bytes()))
+    }
+
+    #[test]
+    fn reader_finds_error_line() {
+        let r = reader_of(&["INFO start", "ERROR disk full", "INFO done"]);
+        let result = extract_context_reader(r, &LogContextConfig::new().with_context_lines(0)).unwrap();
+        assert_eq!(result.match_count, 1);
+        assert_eq!(result.matches[0].line_number, 2);
+        assert_eq!(result.matches[0].line, "ERROR disk full");
+    }
+
+    #[test]
+    fn reader_before_and_after_context() {
+        let r = reader_of(&["a", "b", "ERROR c", "d", "e"]);
+        let config = LogContextConfig::new().with_keywords(["error"]).with_context_lines(1);
+        let result = extract_context_reader(r, &config).unwrap();
+        assert_eq!(result.matches[0].before, vec!["b"]);
+        assert_eq!(result.matches[0].after, vec!["d"]);
+    }
+
+    #[test]
+    fn reader_case_insensitive_by_default() {
+        let r = reader_of(&["Warning: high load", "WARNING again", "warn: slow"]);
+        let result = extract_context_reader(r, &LogContextConfig::new().with_context_lines(0)).unwrap();
+        assert_eq!(result.match_count, 3);
+    }
+
+    #[test]
+    fn reader_case_sensitive_skips_uppercase() {
+        let r = reader_of(&["ERROR upper", "error lower"]);
+        let config = LogContextConfig::new()
+            .with_keywords(["error"])
+            .case_sensitive(true)
+            .with_context_lines(0);
+        let result = extract_context_reader(r, &config).unwrap();
+        assert_eq!(result.match_count, 1);
+        assert_eq!(result.matches[0].line, "error lower");
+    }
+
+    #[test]
+    fn reader_truncates_at_max_matches() {
+        let lines: Vec<String> = (0..10).map(|i| format!("ERROR line {i}")).collect();
+        let strs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let r = reader_of(&strs);
+        let config = LogContextConfig::new().with_context_lines(0).with_max_matches(3);
+        let result = extract_context_reader(r, &config).unwrap();
+        assert_eq!(result.match_count, 3);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn reader_after_context_clipped_at_eof() {
+        // Match is near the end — after-context window can't be fully filled.
+        let r = reader_of(&["a", "b", "ERROR c"]);
+        let config = LogContextConfig::new().with_keywords(["error"]).with_context_lines(3);
+        let result = extract_context_reader(r, &config).unwrap();
+        assert_eq!(result.match_count, 1);
+        // Only 0 lines after the match before EOF.
+        assert!(result.matches[0].after.is_empty());
+    }
+
+    #[test]
+    fn reader_total_lines_counted() {
+        let r = reader_of(&["a", "b", "c", "d", "e"]);
+        let result = extract_context_reader(r, &LogContextConfig::new().with_context_lines(0)).unwrap();
+        assert_eq!(result.total_lines, 5);
+        assert_eq!(result.match_count, 0);
+    }
+
+    #[test]
+    fn reader_empty_input() {
+        let r = reader_of(&[]);
+        let result = extract_context_reader(r, &LogContextConfig::new().with_context_lines(0)).unwrap();
+        assert_eq!(result.total_lines, 0);
+        assert_eq!(result.match_count, 0);
+    }
+
     // ---- serialization ----
 
     #[test]

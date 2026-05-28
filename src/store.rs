@@ -617,4 +617,104 @@ mod tests {
             }
         }
     }
+
+    // --- is_empty / clear ---
+
+    #[test]
+    fn is_empty_on_new_store() {
+        let store = hmac_store(None);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn is_empty_false_after_insert() {
+        let store = hmac_store(None);
+        store.get_or_insert(&Category::Email, "a@a.com").unwrap();
+        assert!(!store.is_empty());
+    }
+
+    #[test]
+    fn clear_resets_store() {
+        let mut store = hmac_store(None);
+        store.get_or_insert(&Category::Email, "a@a.com").unwrap();
+        store.get_or_insert(&Category::IpV4, "1.2.3.4").unwrap();
+        assert_eq!(store.len(), 2);
+        store.clear();
+        assert_eq!(store.len(), 0);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn clear_then_reinsert_works() {
+        let mut store = hmac_store(None);
+        store.get_or_insert(&Category::Email, "a@a.com").unwrap();
+        store.clear();
+        let result = store.get_or_insert(&Category::Email, "a@a.com");
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 1);
+    }
+
+    // --- snapshot / iter_since ---
+
+    #[test]
+    fn snapshot_and_iter_since_yields_only_new() {
+        let store = hmac_store(None);
+        store.get_or_insert(&Category::Email, "old@a.com").unwrap();
+        let snap = store.snapshot();
+        store.get_or_insert(&Category::IpV4, "1.2.3.4").unwrap();
+        store.get_or_insert(&Category::Name, "Alice").unwrap();
+
+        let new_entries: Vec<_> = store.iter_since(snap).collect();
+        assert_eq!(new_entries.len(), 2);
+        // None of the new entries should be the pre-snapshot email.
+        assert!(!new_entries.iter().any(|(cat, orig, _)| {
+            *cat == Category::Email && orig.as_str() == "old@a.com"
+        }));
+    }
+
+    #[test]
+    fn iter_since_zero_yields_all() {
+        let store = hmac_store(None);
+        store.get_or_insert(&Category::Email, "a@a.com").unwrap();
+        store.get_or_insert(&Category::IpV4, "1.2.3.4").unwrap();
+        let all: Vec<_> = store.iter_since(0).collect();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn iter_since_at_end_yields_nothing() {
+        let store = hmac_store(None);
+        store.get_or_insert(&Category::Email, "a@a.com").unwrap();
+        let snap = store.snapshot();
+        let new: Vec<_> = store.iter_since(snap).collect();
+        assert!(new.is_empty());
+    }
+
+    // --- new_with_allowlist ---
+
+    #[test]
+    fn allowlist_passes_value_through_unchanged() {
+        use crate::allowlist::AllowlistMatcher;
+        let (matcher, _) =
+            AllowlistMatcher::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]);
+        let gen = Arc::new(HmacGenerator::new([42u8; 32]));
+        let store = MappingStore::new_with_allowlist(gen, None, Arc::new(matcher));
+
+        assert!(store.allowlist().is_some());
+
+        // Allowlisted value must be returned verbatim.
+        let result = store.get_or_insert(&Category::Hostname, "localhost").unwrap();
+        assert_eq!(result.as_str(), "localhost");
+    }
+
+    #[test]
+    fn allowlist_still_replaces_non_listed() {
+        use crate::allowlist::AllowlistMatcher;
+        let (matcher, _) = AllowlistMatcher::new(vec!["localhost".to_string()]);
+        let gen = Arc::new(HmacGenerator::new([42u8; 32]));
+        let store = MappingStore::new_with_allowlist(gen, None, Arc::new(matcher));
+
+        let result = store.get_or_insert(&Category::Hostname, "prod.corp.com").unwrap();
+        assert_ne!(result.as_str(), "prod.corp.com");
+    }
 }

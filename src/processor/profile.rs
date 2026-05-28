@@ -489,3 +489,87 @@ impl<'de> Deserialize<'de> for Category {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- FieldRule builders ----
+
+    #[test]
+    fn field_rule_with_min_length() {
+        let rule = FieldRule::new("*.password").with_min_length(8);
+        assert_eq!(rule.min_length, Some(8));
+    }
+
+    #[test]
+    fn field_rule_with_category() {
+        let rule = FieldRule::new("*.email").with_category(Category::Email);
+        assert_eq!(rule.category, Some(Category::Email));
+    }
+
+    #[test]
+    fn field_rule_with_label() {
+        let rule = FieldRule::new("*.token").with_label("my-token");
+        assert_eq!(rule.label.as_deref(), Some("my-token"));
+    }
+
+    // ---- FileTypeProfile builders ----
+
+    #[test]
+    fn profile_with_include_narrows_match() {
+        let profile = FileTypeProfile::new("json", vec![])
+            .with_extension(".json")
+            .with_include("config*.json");
+
+        assert!(profile.matches_filename("config.json"));
+        assert!(profile.matches_filename("config-prod.json"));
+        assert!(!profile.matches_filename("events.json"));
+    }
+
+    #[test]
+    fn profile_with_exclude_blocks_match() {
+        let profile = FileTypeProfile::new("json", vec![])
+            .with_extension(".json")
+            .with_exclude("*.log.json");
+
+        assert!(profile.matches_filename("config.json"));
+        assert!(!profile.matches_filename("server.log.json"));
+    }
+
+    #[test]
+    fn profile_include_and_exclude_combined() {
+        let profile = FileTypeProfile::new("json", vec![])
+            .with_extension(".json")
+            .with_include("config*.json")
+            .with_exclude("config-secret.json");
+
+        assert!(profile.matches_filename("config-prod.json"));
+        assert!(!profile.matches_filename("config-secret.json"));
+        assert!(!profile.matches_filename("events.json"));
+    }
+
+    #[test]
+    fn profile_no_extensions_matches_nothing() {
+        let profile = FileTypeProfile::new("json", vec![]);
+        assert!(!profile.matches_filename("anything.json"));
+    }
+
+    // ---- Category serde roundtrip ----
+
+    #[test]
+    fn category_serialize_deserialize_roundtrip() {
+        let cases: &[(&str, Category)] = &[
+            ("email", Category::Email),
+            ("ipv4", Category::IpV4),
+            ("custom:my_key", Category::Custom("my_key".into())),
+        ];
+        for (s, expected) in cases {
+            let json = format!("\"{}\"", s);
+            let got: Category = serde_json::from_str(&json).unwrap();
+            assert_eq!(got, *expected, "deserializing {s}");
+            let serialized = serde_json::to_string(&got).unwrap();
+            assert_eq!(serialized, json, "serializing {s}");
+        }
+    }
+}

@@ -229,6 +229,91 @@ mod tests {
     }
 
     #[test]
+    fn can_handle_by_profile_name() {
+        let proc = YamlProcessor;
+        let profile = FileTypeProfile::new("yaml", vec![]).with_extension(".yaml");
+        assert!(proc.can_handle(b"anything", &profile));
+    }
+
+    #[test]
+    fn can_handle_detects_document_marker() {
+        let proc = YamlProcessor;
+        let profile = FileTypeProfile::new("json", vec![]).with_extension(".json");
+        assert!(proc.can_handle(b"---\nkey: value\n", &profile));
+    }
+
+    #[test]
+    fn can_handle_detects_key_value_heuristic() {
+        let proc = YamlProcessor;
+        let profile = FileTypeProfile::new("other", vec![]).with_extension(".conf");
+        assert!(proc.can_handle(b"host: localhost\nport: 5432\n", &profile));
+    }
+
+    #[test]
+    fn can_handle_detects_sequence_heuristic() {
+        let proc = YamlProcessor;
+        let profile = FileTypeProfile::new("other", vec![]).with_extension(".txt");
+        assert!(proc.can_handle(b"- item1\n- item2\n", &profile));
+    }
+
+    #[test]
+    fn can_handle_rejects_plaintext() {
+        let proc = YamlProcessor;
+        let profile = FileTypeProfile::new("json", vec![]).with_extension(".json");
+        assert!(!proc.can_handle(b"just plain text with no yaml markers", &profile));
+    }
+
+    #[test]
+    fn non_string_scalars_not_targeted_pass_through() {
+        let store = make_store();
+        let proc = YamlProcessor;
+        // Only target the 'secret' field; booleans and numbers are untouched.
+        let content = b"enabled: true\ncount: 42\nsecret: hunter2\n";
+        let profile = FileTypeProfile::new(
+            "yaml",
+            vec![FieldRule::new("secret").with_category(Category::Custom("pw".into()))],
+        );
+        let result = proc.process(content, &profile, &store).unwrap();
+        let out = String::from_utf8(result).unwrap();
+        assert!(!out.contains("hunter2"), "secret must be replaced");
+        assert!(out.contains("42"), "integer must be preserved");
+    }
+
+    #[test]
+    fn deeply_nested_yaml_replaced() {
+        let store = make_store();
+        let proc = YamlProcessor;
+        let content = b"a:\n  b:\n    c:\n      secret: hunter2\n";
+        let profile = FileTypeProfile::new(
+            "yaml",
+            vec![FieldRule::new("a.b.c.secret").with_category(Category::Custom("pw".into()))],
+        );
+        let result = proc.process(content, &profile, &store).unwrap();
+        let out = String::from_utf8(result).unwrap();
+        assert!(!out.contains("hunter2"));
+    }
+
+    #[test]
+    fn invalid_utf8_returns_parse_error() {
+        let store = make_store();
+        let proc = YamlProcessor;
+        let bad = b"\xff\xfe invalid";
+        let profile = FileTypeProfile::new("yaml", vec![]);
+        let err = proc.process(bad, &profile, &store).unwrap_err();
+        assert!(matches!(err, crate::error::SanitizeError::ParseError { .. }));
+    }
+
+    #[test]
+    fn invalid_yaml_returns_parse_error() {
+        let store = make_store();
+        let proc = YamlProcessor;
+        let bad = b"key: [unclosed";
+        let profile = FileTypeProfile::new("yaml", vec![]);
+        let err = proc.process(bad, &profile, &store).unwrap_err();
+        assert!(matches!(err, crate::error::SanitizeError::ParseError { .. }));
+    }
+
+    #[test]
     fn yaml_sequence_traversal() {
         let store = make_store();
         let proc = YamlProcessor;

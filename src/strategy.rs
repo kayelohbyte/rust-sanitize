@@ -794,4 +794,73 @@ mod tests {
         }
         assert_eq!(store.len(), 2000);
     }
+
+    // ---- Property tests: structural invariants on generated values ----
+
+    mod property {
+        use super::*;
+        use crate::store::MappingStore;
+        use proptest::prelude::*;
+
+        fn hmac_store() -> MappingStore {
+            let gen = Arc::new(crate::generator::HmacGenerator::new([77u8; 32]));
+            MappingStore::new(gen, None)
+        }
+
+        proptest! {
+            #[test]
+            fn email_output_is_email_shaped(
+                local in "[a-z]{3,8}",
+                domain in "[a-z]{3,8}",
+                tld in "[a-z]{2,4}",
+            ) {
+                let input = format!("{local}@{domain}.{tld}");
+                let store = hmac_store();
+                let out = store.get_or_insert(&Category::Email, &input).unwrap();
+                prop_assert_eq!(out.chars().filter(|&c| c == '@').count(), 1);
+                let after = out.split('@').nth(1).unwrap_or("");
+                prop_assert!(after.contains('.'), "no dot in domain part: {out}");
+                prop_assert_eq!(out.len(), input.len());
+            }
+
+            #[test]
+            fn ipv4_output_preserves_dot_structure(
+                a in 0u8..=255u8,
+                b in 0u8..=255u8,
+                c in 0u8..=255u8,
+                d in 0u8..=255u8,
+            ) {
+                let input = format!("{a}.{b}.{c}.{d}");
+                let store = hmac_store();
+                let out = store.get_or_insert(&Category::IpV4, &input).unwrap();
+                // The strategy preserves dot positions and digit counts but does
+                // not clamp octet values to 0-255 (e.g. 114 → 987 is valid output).
+                // Invariant: 4 dot-separated groups, each containing only digits,
+                // each with the same digit count as the original octet.
+                let in_parts: Vec<&str> = input.split('.').collect();
+                let out_parts: Vec<&str> = out.split('.').collect();
+                prop_assert_eq!(out_parts.len(), 4);
+                for (inp, outp) in in_parts.iter().zip(out_parts.iter()) {
+                    prop_assert_eq!(inp.len(), outp.len());
+                    prop_assert!(outp.chars().all(|c| c.is_ascii_digit()));
+                }
+            }
+
+            #[test]
+            fn same_input_always_same_output(s in "[a-z0-9]{4,12}@[a-z]{4,8}\\.com") {
+                let store = hmac_store();
+                let out1 = store.get_or_insert(&Category::Email, &s).unwrap();
+                let out2 = store.get_or_insert(&Category::Email, &s).unwrap();
+                prop_assert_eq!(out1, out2);
+            }
+
+            #[test]
+            fn different_categories_produce_different_outputs(s in "[a-z]{6,10}") {
+                let store = hmac_store();
+                let as_email = store.get_or_insert(&Category::Email, &format!("{s}@corp.com")).unwrap();
+                let as_name  = store.get_or_insert(&Category::Name,  &format!("{s}@corp.com")).unwrap();
+                prop_assert_ne!(as_email, as_name);
+            }
+        }
+    }
 }

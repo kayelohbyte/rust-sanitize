@@ -4101,6 +4101,13 @@ fn process_plain_file(
             .starts_with(".env")
     };
 
+    // Treat "-" as a sentinel meaning stdout (mirrors stdin's "-" convention).
+    let output_path = if output_path.is_some_and(|p| p == Path::new("-")) {
+        None
+    } else {
+        output_path
+    };
+
     let mut had_matches = false;
 
     // --- Bounded-memory scanner path for known structured extensions ---
@@ -5117,14 +5124,15 @@ fn print_archive_stats(output: &Path, stats: &sanitize_engine::ArchiveStats) {
 }
 
 /// Write output bytes atomically to the given path, or stdout.
+/// `"-"` is treated as a stdout sentinel.
 fn write_output(output_path: Option<&Path>, data: &[u8]) -> Result<(), String> {
     match output_path {
-        Some(path) => {
+        Some(path) if path != Path::new("-") => {
             atomic_write(path, data)
                 .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
             info!(output = %path.display(), "output written");
         }
-        None => {
+        _ => {
             let stdout = io::stdout();
             let mut lock = stdout.lock();
             lock.write_all(data)
@@ -5549,10 +5557,9 @@ fn run_sanitize(
     if cli.secrets_file.is_none() && cli.app.is_empty() {
         let default_path = global_default_secrets_path();
         if !default_path.exists() {
-            // First run: create a minimal secrets file so the user has a
-            // visible, editable file to customise. Detection patterns are
-            // applied from hardcoded defaults; the file starts with just the
-            // allowlist so it stays small and readable.
+            // First run: create a secrets file with the balanced detection
+            // patterns and the default allowlist so it works out of the box
+            // and the user has a visible, editable file to customise.
             if let Some(parent) = default_path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -5567,8 +5574,17 @@ fn run_sanitize(
                 threshold: None,
                 charset: None,
             };
-            if let Ok(yaml) = serde_yaml_ng::to_string(&[allow_entry]) {
-                let header = "# Global sanitize allowlist — add patterns or kind:regex entries here.\n# Auto-loaded on every plain run. Edit freely; deleted values take effect immediately.\n\n";
+            let opts = GuidedOptions {
+                preset: GuidedPreset::Balanced,
+                domains: vec![],
+                providers: vec![],
+                exclude_noise_ids: false,
+                formats: vec![],
+            };
+            let mut entries = build_guided_entries(&opts);
+            entries.push(allow_entry);
+            if let Ok(yaml) = serde_yaml_ng::to_string(&entries) {
+                let header = "# Global sanitize secrets — balanced detection patterns + allowlist.\n# Auto-loaded on every plain run. Edit freely; deleted values take effect immediately.\n\n";
                 let _ = fs::write(&default_path, format!("{header}{yaml}"));
             }
         }
@@ -6695,8 +6711,10 @@ mod tests {
             ProgressMode::Auto,
             make_progress_context(true, true, false, false),
         );
+        // In CI (non-TTY) the spinner is suppressed, but milestone lines are
+        // plain eprintln! and remain enabled unless --json-logs is active.
         assert!(!policy.live_updates);
-        assert!(!policy.milestone_updates);
+        assert!(policy.milestone_updates);
     }
 
     #[test]

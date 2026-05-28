@@ -2001,4 +2001,344 @@ mod tests {
     fn zip_entry_name_absolute_dotdot_combo() {
         assert_eq!(sanitize_zip_entry_name("/../etc/passwd"), "etc/passwd");
     }
+
+    // -- ArchiveFilter tests ------------------------------------------------
+
+    #[test]
+    fn filter_empty_passes_everything() {
+        let f = ArchiveFilter::new(vec![], vec![]).unwrap();
+        assert!(f.is_empty());
+        assert!(f.passes("config/app.yaml"));
+        assert!(f.passes("logs/server.log"));
+    }
+
+    #[test]
+    fn filter_only_glob_includes_match() {
+        let f = ArchiveFilter::new(vec!["**/*.json".into()], vec![]).unwrap();
+        assert!(!f.is_empty());
+        assert!(f.passes("config/settings.json"));
+        assert!(f.passes("deep/nested/file.json"));
+        assert!(!f.passes("config/settings.yaml"));
+    }
+
+    #[test]
+    fn filter_only_dir_prefix_includes_subtree() {
+        let f = ArchiveFilter::new(vec!["config/".into()], vec![]).unwrap();
+        assert!(f.passes("config/app.yaml"));
+        assert!(f.passes("config/nested/db.yaml"));
+        assert!(!f.passes("logs/server.log"));
+    }
+
+    #[test]
+    fn filter_dir_prefix_exact_match() {
+        let f = ArchiveFilter::new(vec!["config/".into()], vec![]).unwrap();
+        // Exact prefix without trailing separator should also match.
+        assert!(f.passes("config"));
+    }
+
+    #[test]
+    fn filter_exclude_removes_match() {
+        let f = ArchiveFilter::new(vec![], vec!["**/*.log".into()]).unwrap();
+        assert!(!f.passes("logs/server.log"));
+        assert!(f.passes("config/app.yaml"));
+    }
+
+    #[test]
+    fn filter_only_and_exclude_combined() {
+        let f = ArchiveFilter::new(
+            vec!["config/".into()],
+            vec!["config/secrets.yaml".into()],
+        )
+        .unwrap();
+        assert!(f.passes("config/app.yaml"));
+        assert!(!f.passes("config/secrets.yaml"));
+        assert!(!f.passes("logs/server.log"));
+    }
+
+    #[test]
+    fn filter_invalid_glob_returns_error() {
+        assert!(ArchiveFilter::new(vec!["[invalid".into()], vec![]).is_err());
+        assert!(ArchiveFilter::new(vec![], vec!["[bad".into()]).is_err());
+    }
+
+    // -- ArchiveProcessor builder methods -----------------------------------
+
+    #[test]
+    fn builder_with_max_depth_clamps_at_max() {
+        let proc = make_archive_processor().with_max_depth(999);
+        assert_eq!(proc.max_depth, MAX_ARCHIVE_DEPTH);
+    }
+
+    #[test]
+    fn builder_with_max_depth_sets_value() {
+        let proc = make_archive_processor().with_max_depth(2);
+        assert_eq!(proc.max_depth, 2);
+    }
+
+    #[test]
+    fn builder_with_parallel_threshold_sets_value() {
+        let proc = make_archive_processor().with_parallel_threshold(usize::MAX);
+        assert_eq!(proc.parallel_threshold, usize::MAX);
+    }
+
+    #[test]
+    fn builder_with_force_text_enables_flag() {
+        let proc = make_archive_processor().with_force_text(true);
+        assert!(proc.force_text);
+    }
+
+    #[test]
+    fn builder_with_filter_applied_to_zip() {
+        let proc = make_archive_processor()
+            .with_filter(ArchiveFilter::new(vec!["**/*.json".into()], vec![]).unwrap());
+
+        let zip_data = build_test_zip(&[
+            ("config.json", br#"{"email":"alice@corp.com"}"#),
+            ("notes.txt", b"alice@corp.com"),
+        ]);
+
+        let reader = Cursor::new(zip_data);
+        let mut writer = Cursor::new(Vec::new());
+        let stats = proc.process_zip(reader, &mut writer).unwrap();
+
+        // notes.txt is excluded by the filter — only config.json processed.
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.entries_filtered, 1);
+    }
+
+    #[test]
+    fn builder_with_filter_applied_to_tar() {
+        let proc = make_archive_processor()
+            .with_filter(ArchiveFilter::new(vec!["**/*.json".into()], vec![]).unwrap());
+
+        let tar_data = build_test_tar(&[
+            ("config.json", br#"{"email":"alice@corp.com"}"#),
+            ("notes.txt", b"alice@corp.com"),
+        ]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&tar_data[..], &mut output).unwrap();
+
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.entries_filtered, 1);
+    }
+
+    // -- Parallel path tests ------------------------------------------------
+
+    #[test]
+    fn parallel_tar_sanitizes_all_entries() {
+        // parallel_threshold(0) forces parallel execution regardless of entry count.
+        let proc = make_archive_processor().with_parallel_threshold(0);
+        let tar_data = build_test_tar(&[
+            ("a.txt", b"alice@corp.com"),
+            ("b.txt", b"bob@corp.com"),
+            ("c.txt", b"carol@corp.com"),
+            ("d.txt", b"dave@corp.com"),
+        ]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&tar_data[..], &mut output).unwrap();
+
+        assert_eq!(stats.files_processed, 4);
+
+        // Verify originals are gone (domain is preserved by email strategy, full addresses must not appear).
+        let originals = ["alice@corp.com", "bob@corp.com", "carol@corp.com", "dave@corp.com"];
+        let mut archive = tar::Archive::new(&output[..]);
+        for entry in archive.entries().unwrap() {
+            let mut e = entry.unwrap();
+            let mut content = String::new();
+            e.read_to_string(&mut content).unwrap();
+            for orig in &originals {
+                assert!(!content.contains(orig), "original secret leaked in {:?}", e.path());
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_tar_preserves_entry_order() {
+        let proc = make_archive_processor().with_parallel_threshold(0);
+        let tar_data = build_test_tar(&[
+            ("first.txt", b"alice@corp.com"),
+            ("second.txt", b"hello"),
+            ("third.txt", b"bob@corp.com"),
+        ]);
+
+        let mut output = Vec::new();
+        proc.process_tar(&tar_data[..], &mut output).unwrap();
+
+        let mut archive = tar::Archive::new(&output[..]);
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(names, vec!["first.txt", "second.txt", "third.txt"]);
+    }
+
+    #[test]
+    fn parallel_zip_sanitizes_all_entries() {
+        let proc = make_archive_processor().with_parallel_threshold(0);
+        let zip_data = build_test_zip(&[
+            ("a.txt", b"alice@corp.com"),
+            ("b.txt", b"bob@corp.com"),
+            ("c.txt", b"carol@corp.com"),
+            ("d.txt", b"dave@corp.com"),
+        ]);
+
+        let reader = Cursor::new(zip_data);
+        let mut writer = Cursor::new(Vec::new());
+        let stats = proc.process_zip(reader, &mut writer).unwrap();
+
+        assert_eq!(stats.files_processed, 4);
+
+        let originals = ["alice@corp.com", "bob@corp.com", "carol@corp.com", "dave@corp.com"];
+        let out_data = writer.into_inner();
+        let mut zip_out = zip::ZipArchive::new(Cursor::new(out_data)).unwrap();
+        for i in 0..zip_out.len() {
+            let mut entry = zip_out.by_index(i).unwrap();
+            let mut content = String::new();
+            entry.read_to_string(&mut content).unwrap();
+            for orig in &originals {
+                assert!(!content.contains(orig), "original secret leaked in entry {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_tar_mixed_structured_and_scanner() {
+        let proc = make_archive_processor().with_parallel_threshold(0);
+        let tar_data = build_test_tar(&[
+            ("config.json", br#"{"email":"alice@corp.com","port":5432}"#),
+            ("notes.txt", b"contact bob@corp.com for help"),
+            ("data.json", br#"{"email":"carol@corp.com"}"#),
+            ("readme.txt", b"dave@corp.com is the owner"),
+        ]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&tar_data[..], &mut output).unwrap();
+
+        assert_eq!(stats.files_processed, 4);
+        assert_eq!(stats.structured_hits, 2); // two JSON files
+        assert_eq!(stats.scanner_fallback, 2); // two plain text files
+
+        let originals = ["alice@corp.com", "bob@corp.com", "carol@corp.com", "dave@corp.com"];
+        let mut archive = tar::Archive::new(&output[..]);
+        for entry in archive.entries().unwrap() {
+            let mut e = entry.unwrap();
+            let mut content = String::new();
+            e.read_to_string(&mut content).unwrap();
+            for orig in &originals {
+                assert!(!content.contains(orig), "original secret leaked");
+            }
+        }
+    }
+
+    // -- Nested archive tests -----------------------------------------------
+
+    #[test]
+    fn tar_in_tar_secrets_sanitized() {
+        // Build inner tar with a secret.
+        let inner_tar = build_test_tar(&[("inner.txt", b"alice@corp.com")]);
+
+        // Embed the inner tar as an entry in the outer tar.
+        let outer_tar = build_test_tar(&[("nested.tar", &inner_tar)]);
+
+        let proc = make_archive_processor();
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&outer_tar[..], &mut output).unwrap();
+
+        assert_eq!(stats.nested_archives, 1);
+
+        // Unpack the outer tar and read the inner tar's content.
+        let mut outer = tar::Archive::new(&output[..]);
+        for entry in outer.entries().unwrap() {
+            let mut e = entry.unwrap();
+            let mut inner_bytes = Vec::new();
+            e.read_to_end(&mut inner_bytes).unwrap();
+            let mut inner = tar::Archive::new(&inner_bytes[..]);
+            for inner_entry in inner.entries().unwrap() {
+                let mut ie = inner_entry.unwrap();
+                let mut content = String::new();
+                ie.read_to_string(&mut content).unwrap();
+                assert!(!content.contains("alice@corp.com"), "secret survived nested tar");
+            }
+        }
+    }
+
+    #[test]
+    fn zip_in_tar_secrets_sanitized() {
+        let inner_zip = build_test_zip(&[("inner.txt", b"SUPERSECRET")]);
+        let outer_tar = build_test_tar(&[("nested.zip", &inner_zip)]);
+
+        let proc = make_archive_processor();
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&outer_tar[..], &mut output).unwrap();
+
+        assert_eq!(stats.nested_archives, 1);
+
+        let mut outer = tar::Archive::new(&output[..]);
+        for entry in outer.entries().unwrap() {
+            let mut e = entry.unwrap();
+            let mut zip_bytes = Vec::new();
+            e.read_to_end(&mut zip_bytes).unwrap();
+            let mut zip_out = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+            for i in 0..zip_out.len() {
+                let mut ze = zip_out.by_index(i).unwrap();
+                let mut content = String::new();
+                ze.read_to_string(&mut content).unwrap();
+                assert!(!content.contains("SUPERSECRET"), "secret survived zip-in-tar");
+            }
+        }
+    }
+
+    #[test]
+    fn zip_in_zip_secrets_sanitized() {
+        let inner_zip = build_test_zip(&[("secret.txt", b"alice@corp.com")]);
+        let outer_zip = build_test_zip(&[("nested.zip", &inner_zip)]);
+
+        let proc = make_archive_processor();
+        let reader = Cursor::new(outer_zip);
+        let mut writer = Cursor::new(Vec::new());
+        let stats = proc.process_zip(reader, &mut writer).unwrap();
+
+        assert_eq!(stats.nested_archives, 1);
+
+        let out_bytes = writer.into_inner();
+        let mut outer = zip::ZipArchive::new(Cursor::new(out_bytes)).unwrap();
+        let mut inner_bytes = Vec::new();
+        outer.by_index(0).unwrap().read_to_end(&mut inner_bytes).unwrap();
+        let mut inner = zip::ZipArchive::new(Cursor::new(inner_bytes)).unwrap();
+        let mut content = String::new();
+        inner.by_index(0).unwrap().read_to_string(&mut content).unwrap();
+        assert!(!content.contains("alice@corp.com"), "secret survived zip-in-zip");
+    }
+
+    #[test]
+    fn nested_archive_depth_limit_returns_error() {
+        // Build an archive nested max_depth + 1 levels deep.
+        // Default max_depth is DEFAULT_ARCHIVE_DEPTH (3); use a proc with depth=1.
+        let proc = make_archive_processor().with_max_depth(1);
+
+        let innermost = build_test_tar(&[("file.txt", b"secret")]);
+        let middle = build_test_tar(&[("inner.tar", &innermost)]);
+        let outer = build_test_tar(&[("middle.tar", &middle)]);
+
+        let mut output = Vec::new();
+        let err = proc.process_tar(&outer[..], &mut output).unwrap_err();
+        assert!(matches!(err, SanitizeError::RecursionDepthExceeded(_)));
+    }
+
+    #[test]
+    fn force_text_skips_structured_processor() {
+        let proc = make_archive_processor().with_force_text(true);
+        let tar_data = build_test_tar(&[("config.json", br#"{"email":"alice@corp.com"}"#)]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&tar_data[..], &mut output).unwrap();
+
+        // With force_text, JSON is scanned as plain text — no structured hit.
+        assert_eq!(stats.scanner_fallback, 1);
+        assert_eq!(stats.structured_hits, 0);
+    }
 }

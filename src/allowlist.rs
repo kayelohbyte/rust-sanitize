@@ -110,6 +110,11 @@ impl AllowlistMatcher {
             }
 
             for ch in ['^', '$', '+', '(', ')'] {
+                // '$' followed by '{' is template-variable syntax (e.g. ${VAR}),
+                // not a regex end-anchor — skip the warning for that form.
+                if ch == '$' && !pat.replace("${", "").contains('$') {
+                    continue;
+                }
                 if pat.contains(ch) {
                     warnings.push(format!(
                         "allowlist pattern '{pat}' contains regex character '{ch}'; \
