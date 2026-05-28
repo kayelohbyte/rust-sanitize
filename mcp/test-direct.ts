@@ -1075,6 +1075,113 @@ test("files path guard", "SANITIZE_MCP_FILES_DENYLIST does not block non-matchin
 });
 
 // ===========================================================================
+// output_file / output_dir (write-to-disk mode)
+// ===========================================================================
+
+test("output_file", "content + output_file writes to disk, no content returned", async (s) => {
+  const tmpFile = await Deno.makeTempFile({ suffix: ".txt" });
+  try {
+    const r = toolText(await s.send("tools/call", {
+      name: "sanitize",
+      arguments: {
+        content: "password: hunter2\nhost: example.com",
+        output_file: tmpFile,
+        patterns: [{ name: "pw", pattern: "hunter2", category: "auth_token", kind: "literal" }],
+      },
+    }));
+    const parsed = JSON.parse(r);
+    ok(parsed.written === true, "written flag must be true");
+    ok(parsed.output === tmpFile, "output path must match");
+    ok(typeof parsed.size === "number" && parsed.size > 0, "size must be positive");
+    const disk = await Deno.readTextFile(tmpFile);
+    ok(!disk.includes("hunter2"), "raw secret must not appear in output file");
+    ok(disk.includes("host: example.com"), "non-secret content must be preserved");
+  } finally { await Deno.remove(tmpFile).catch(() => {}); }
+});
+
+test("output_file", "files + output_file writes to disk, no content returned", async (s) => {
+  const inFile = await Deno.makeTempFile({ suffix: ".txt" });
+  const outFile = await Deno.makeTempFile({ suffix: ".txt" });
+  try {
+    await Deno.writeTextFile(inFile, "token: hunter2\n");
+    const r = toolText(await s.send("tools/call", {
+      name: "sanitize",
+      arguments: {
+        files: [inFile],
+        output_file: outFile,
+        patterns: [{ name: "pw", pattern: "hunter2", category: "auth_token", kind: "literal" }],
+      },
+    }));
+    const parsed = JSON.parse(r);
+    ok(Array.isArray(parsed.results), "results must be an array");
+    ok(parsed.results[0].written === true, "written flag must be true");
+    ok(parsed.results[0].output === outFile, "output path must match");
+    const disk = await Deno.readTextFile(outFile);
+    ok(!disk.includes("hunter2"), "raw secret must not appear in output file");
+  } finally {
+    await Deno.remove(inFile).catch(() => {});
+    await Deno.remove(outFile).catch(() => {});
+  }
+});
+
+test("output_file", "output_dir writes multiple files to directory", async (s) => {
+  const in1 = await Deno.makeTempFile({ suffix: ".txt" });
+  const in2 = await Deno.makeTempFile({ suffix: ".txt" });
+  const outDir = await Deno.makeTempDir();
+  try {
+    await Deno.writeTextFile(in1, "key: hunter2\n");
+    await Deno.writeTextFile(in2, "pass: hunter2\n");
+    const r = toolText(await s.send("tools/call", {
+      name: "sanitize",
+      arguments: {
+        files: [in1, in2],
+        output_dir: outDir,
+        patterns: [{ name: "pw", pattern: "hunter2", category: "auth_token", kind: "literal" }],
+      },
+    }));
+    const parsed = JSON.parse(r);
+    ok(Array.isArray(parsed.results) && parsed.results.length === 2, "two results expected");
+    for (const result of parsed.results) {
+      ok(result.written === true, "written flag must be true for each result");
+      ok(result.output.startsWith(outDir), "output must be inside output_dir");
+      const disk = await Deno.readTextFile(result.output);
+      ok(!disk.includes("hunter2"), "raw secret must not appear in output file");
+    }
+  } finally {
+    await Deno.remove(in1).catch(() => {});
+    await Deno.remove(in2).catch(() => {});
+    await Deno.remove(outDir, { recursive: true }).catch(() => {});
+  }
+});
+
+test("output_file", "error: output_file and output_dir are mutually exclusive", async (s) => {
+  const r = await s.send("tools/call", {
+    name: "sanitize",
+    arguments: {
+      content: "test",
+      output_file: "/tmp/a.txt",
+      output_dir: "/tmp/outdir",
+      patterns: [{ name: "x", pattern: "test", category: "custom:x" }],
+    },
+  });
+  ok(toolIsError(r), "must return error");
+  has(toolText(r), "mutually exclusive");
+});
+
+test("output_file", "error: output_file with multiple files rejected", async (s) => {
+  const r = await s.send("tools/call", {
+    name: "sanitize",
+    arguments: {
+      files: ["/tmp/a.txt", "/tmp/b.txt"],
+      output_file: "/tmp/out.txt",
+      patterns: [{ name: "x", pattern: "test", category: "custom:x" }],
+    },
+  });
+  ok(toolIsError(r), "must return error");
+  has(toolText(r), "single input");
+});
+
+// ===========================================================================
 // Runner
 // ===========================================================================
 

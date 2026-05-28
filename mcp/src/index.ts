@@ -261,7 +261,7 @@ function checkContentSize(content: string, label = "content"): void {
  * Capped at 200 chars to avoid leaking unexpectedly verbose output.
  */
 function safeStderr(result: RunResult): string {
-  const raw = safeStderr(result);
+  const raw = result.stderr.trim();
   return raw.length > 200 ? raw.slice(0, 200) + "…" : raw;
 }
 
@@ -459,16 +459,21 @@ function buildSecretsJson(patterns: InlinePattern[]): string {
 // ---------------------------------------------------------------------------
 
 interface FileResult {
-  input: string;     // original path as passed in `files`
-  file: string;      // sanitized output filename (CLI naming: {stem}-sanitized.{ext})
-  content?: string;  // present for text/structured outputs
-  binary?: boolean;  // true when output is a binary archive — content not returned inline
-  size?: number;     // byte size when binary is true
+  input: string;      // original path as passed in `files`
+  file: string;       // sanitized output filename (CLI naming: {stem}-sanitized.{ext})
+  output?: string;    // full output path when written directly to disk (output_file/output_dir mode)
+  content?: string;   // present for text/structured outputs (absent in write-to-disk mode)
+  binary?: boolean;   // true when output is a binary archive — content not returned inline
+  size?: number;      // byte size when binary is true, or when written to disk
+  written?: boolean;  // true when output was written directly to disk without returning content
 }
 
 interface SanitizeResult {
-  content?: string;       // populated for content-mode (inline text input)
-  results?: FileResult[]; // populated for files-mode (one or more file paths)
+  content?: string;        // populated for content-mode (inline text input)
+  results?: FileResult[];  // populated for files-mode (one or more file paths)
+  output?: string;         // output path in content-mode write-to-disk (output_file set)
+  size?: number;           // byte size when content-mode output was written to disk
+  written?: boolean;       // true when output was written directly to disk
   report?: unknown;
 }
 
@@ -481,6 +486,8 @@ interface ArchiveFilter {
 async function toolSanitize(params: {
   content?: string;
   files?: string[];
+  output_file?: string;
+  output_dir?: string;
   archive_filters?: ArchiveFilter[];
   namespace?: string;
   seed?: string;
@@ -525,6 +532,22 @@ async function toolSanitize(params: {
     }
   } else {
     checkContentSize(params.content!);
+  }
+  if (params.output_file && params.output_dir) {
+    throw new Error("'output_file' and 'output_dir' are mutually exclusive — provide one or the other");
+  }
+  if (params.output_file) {
+    if (params.output_file.startsWith("-")) throw new Error("output_file must not start with '-'");
+    validatePath(params.output_file, "output_file", true);
+    validateFilesPath(params.output_file);
+    if (hasFiles && params.files!.length > 1) {
+      throw new Error("'output_file' can only be used with a single input; use 'output_dir' for multiple files");
+    }
+  }
+  if (params.output_dir) {
+    if (params.output_dir.startsWith("-")) throw new Error("output_dir must not start with '-'");
+    validatePath(params.output_dir, "output_dir", true);
+    validateFilesPath(params.output_dir);
   }
   for (const af of params.archive_filters ?? []) {
     for (const p of af.only ?? []) {
@@ -642,22 +665,34 @@ async function toolSanitize(params: {
     // Content mode — inline text via stdin
     // -----------------------------------------------------------------------
     if (hasContent) {
-      let content: string;
       if (params.llm_template) {
         // --llm writes the formatted prompt to stdout instead of the output file.
         const result = await runSanitize(["-", ...commonArgs], params.content!, env);
         if (result.exitCode !== 0) {
           throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
         }
-        content = result.stdout;
-      } else {
-        const outputPath = join(tmpDir, "output.txt");
-        const result = await runSanitize(["-", "--output", outputPath, ...commonArgs], params.content!, env);
+        if (reportPath) {
+          return { content: result.stdout, report: await readReport(reportPath, params.report_format) };
+        }
+        return { content: result.stdout };
+      }
+      if (params.output_file) {
+        // Write directly to caller's path — content never returned to LLM.
+        const result = await runSanitize(["-", "--output", params.output_file, ...commonArgs], params.content!, env);
         if (result.exitCode !== 0) {
           throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
         }
-        content = await Deno.readTextFile(outputPath);
+        const stat = await Deno.stat(params.output_file);
+        const base: SanitizeResult = { output: params.output_file, size: stat.size, written: true };
+        if (reportPath) base.report = await readReport(reportPath, params.report_format);
+        return base;
       }
+      const outputPath = join(tmpDir, "output.txt");
+      const result = await runSanitize(["-", "--output", outputPath, ...commonArgs], params.content!, env);
+      if (result.exitCode !== 0) {
+        throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
+      }
+      const content = await Deno.readTextFile(outputPath);
       if (reportPath) {
         return { content, report: await readReport(reportPath, params.report_format) };
       }
@@ -667,8 +702,6 @@ async function toolSanitize(params: {
     // -----------------------------------------------------------------------
     // Files mode — one or more paths (files, archives)
     // -----------------------------------------------------------------------
-    const outputDir = join(tmpDir, "out");
-    await Deno.mkdir(outputDir);
 
     // Build a filter lookup keyed on the path string as given.
     const filterMap = new Map<string, ArchiveFilter>();
@@ -685,6 +718,35 @@ async function toolSanitize(params: {
       if (filter?.only?.length) inputArgs.push("--only", ...filter.only);
       if (filter?.exclude?.length) inputArgs.push("--exclude", ...filter.exclude);
     }
+
+    // ── write-to-disk mode (output_file / output_dir) ───────────────────────
+    // Output goes directly to the caller's path; content is never returned.
+    const diskOutputTarget = params.output_file ?? params.output_dir;
+    if (diskOutputTarget) {
+      if (params.output_dir) {
+        await Deno.mkdir(params.output_dir, { recursive: true });
+      }
+      const result = await runSanitize([...inputArgs, "--output", diskOutputTarget, ...commonArgs], null, env);
+      if (result.exitCode !== 0) {
+        throw new Error(`sanitize exited with code ${result.exitCode}: ${safeStderr(result)}`);
+      }
+      if (params.llm_template) {
+        if (reportPath) return { content: result.stdout, report: await readReport(reportPath, params.report_format) };
+        return { content: result.stdout };
+      }
+      const usedNames = new Set<string>();
+      const fileResults: FileResult[] = params.files!.map((f) => {
+        const outputName = uniquifyName(predictOutputName(f), usedNames);
+        const outputPath = params.output_file ?? join(params.output_dir!, outputName);
+        return { input: f, file: outputName, output: outputPath, written: true };
+      });
+      if (reportPath) return { results: fileResults, report: await readReport(reportPath, params.report_format) };
+      return { results: fileResults };
+    }
+
+    // ── inline mode (default) — read output back and return to caller ────────
+    const outputDir = join(tmpDir, "out");
+    await Deno.mkdir(outputDir);
 
     const result = await runSanitize([...inputArgs, "--output", outputDir, ...commonArgs], null, env);
 
@@ -1160,6 +1222,12 @@ const SanitizeSchema = {
   files: z.array(z.string()).optional().describe(
     "One or more paths to sanitize (absolute or relative). Accepts plain files, archives (.zip, .tar.gz, etc.), or a mix. Archives are extracted and sanitized recursively. Use `archive_filters` to restrict which entries inside an archive are processed. Mutually exclusive with `content`. Raw file content never enters the LLM context — the sanitize engine processes files directly.",
   ),
+  output_file: z.string().optional().describe(
+    "Write the sanitized output directly to this file path. The sanitized content is NOT returned in the response — only the output path and byte size are reported. Mirrors `sanitize <input> -o <file>`. Valid for a single `files` entry or `content` input. Mutually exclusive with `output_dir`.",
+  ),
+  output_dir: z.string().optional().describe(
+    "Write sanitized outputs directly into this directory. The sanitized content is NOT returned in the response — only the output paths are reported. Mirrors `sanitize <inputs> -o <dir>`. Valid for any number of `files` inputs or `content` input. The directory is created if it does not exist. Mutually exclusive with `output_file`.",
+  ),
   archive_filters: z.array(ArchiveFilterSchema).optional().describe(
     "Per-archive entry filters. Each entry pairs an archive path (must match exactly what appears in `files`) with --only and/or --exclude glob patterns. Non-archive paths in `files` are unaffected.",
   ),
@@ -1436,10 +1504,11 @@ server.tool(
   async (params: SanitizeParams) => {
     try {
       const result = await toolSanitize(params);
-      // files-mode returns `results` array; content-mode returns plain `content`.
-      const text = result.results !== undefined || result.report !== undefined
-        ? JSON.stringify(result, null, 2)
-        : result.content!;
+      // Inline content-mode returns plain text; everything else (files-mode,
+      // write-to-disk mode, report responses) is serialised as JSON.
+      const text = result.content !== undefined && result.results === undefined && result.report === undefined && !result.written
+        ? result.content
+        : JSON.stringify(result, null, 2);
       return { content: [{ type: "text" as const, text }] };
     } catch (err) {
       return {
