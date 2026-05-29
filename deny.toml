@@ -1,4 +1,4 @@
-# Supply-chain security policy for sanitize-engine.
+# Supply-chain security policy for rust-sanitize.
 # Run with: cargo deny check
 
 [advisories]

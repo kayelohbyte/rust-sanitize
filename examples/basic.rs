@@ -1,4 +1,4 @@
-//! Basic usage of sanitize-engine as a library.
+//! Basic usage of rust-sanitize as a library.
 //!
 //! Run with: `cargo run --example basic`
 

@@ -219,7 +219,7 @@ jobs:
             curl --fail --silent --show-error \
               --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
               --upload-file "$f" \
-              "${API}/packages/generic/sanitize-engine/${TAG}/${filename}" &
+              "${API}/packages/generic/rust-sanitize/${TAG}/${filename}" &
             pids+=($!)
           done
           failed=0
@@ -233,7 +233,7 @@ jobs:
           first=true
           for f in artifacts/*; do
             filename=$(basename "$f")
-            url="${API}/packages/generic/sanitize-engine/${TAG}/${filename}"
+            url="${API}/packages/generic/rust-sanitize/${TAG}/${filename}"
             [ "$first" = true ] && first=false || LINKS+=","
             LINKS+=$(printf '{"name":"%s","url":"%s","link_type":"package"}' \
               "$filename" "$url")

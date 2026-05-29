@@ -1,4 +1,4 @@
-Prepare this Rust project (sanitize-engine) for its first public open source release.
+Prepare this Rust project (rust-sanitize) for its first public open source release.
 
 This is a security-focused CLI + library for deterministic, one-way data sanitization with:
 - Streaming scanner

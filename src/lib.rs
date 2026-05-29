@@ -1,4 +1,4 @@
-//! # sanitize-engine
+//! # rust-sanitize
 //!
 //! Deterministic, one-way data sanitization engine.
 //!

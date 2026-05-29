@@ -2049,7 +2049,7 @@ fn build_store(
                 use hmac::Hmac;
                 use sha2::Sha256;
                 let mut buf = Zeroizing::new([0u8; 32]);
-                let salt = b"sanitize-engine:deterministic-seed:v1";
+                let salt = b"rust-sanitize:deterministic-seed:v1";
                 pbkdf2::pbkdf2::<Hmac<Sha256>>(k.as_bytes(), salt, 600_000, buf.as_mut())
                     .expect("PBKDF2 output length is valid");
                 // Pass *buf directly into HmacGenerator; no named intermediate means

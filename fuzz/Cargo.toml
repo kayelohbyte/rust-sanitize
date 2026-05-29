@@ -1,5 +1,5 @@
 [package]
-name = "sanitize-engine-fuzz"
+name = "rust-sanitize-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-sanitize-engine = { path = "..", package = "rust-sanitize" }
+rust-sanitize = { path = "..", package = "rust-sanitize" }
 
 [[bin]]
 name = "fuzz_regex"

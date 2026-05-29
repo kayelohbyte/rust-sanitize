@@ -1,4 +1,4 @@
-# Contributing to sanitize-engine
+# Contributing to rust-sanitize
 
 Thank you for your interest in contributing! This document explains how to
 get started.

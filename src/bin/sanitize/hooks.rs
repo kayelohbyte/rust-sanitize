@@ -6,7 +6,7 @@ use std::process;
 // ─── install-hook implementation ─────────────────────────────────────────────
 
 /// Sentinel embedded in every installed hook so we can identify and remove it.
-pub(crate) const HOOK_MARKER: &str = "# installed-by: sanitize-engine";
+pub(crate) const HOOK_MARKER: &str = "# installed-by: rust-sanitize";
 
 /// Minimum version string embedded in the hook for runtime compatibility checks.
 const HOOK_MIN_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -157,7 +157,7 @@ fi
 _ver=$(sanitize --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 _req="{min_version}"
 if [ -n "$_ver" ] && [ "$(printf '%s\n' "$_req" "$_ver" | sort -V | head -1)" != "$_req" ]; then
-  printf 'sanitize: hook requires >= %s but found %s — update with: cargo install sanitize-engine\n' "$_req" "$_ver" >&2
+  printf 'sanitize: hook requires >= %s but found %s — update with: cargo install rust-sanitize\n' "$_req" "$_ver" >&2
   exit 1
 fi
 
@@ -205,7 +205,7 @@ fi
 _ver=$(sanitize --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 _req="{min_version}"
 if [ -n "$_ver" ] && [ "$(printf '%s\n' "$_req" "$_ver" | sort -V | head -1)" != "$_req" ]; then
-  printf 'sanitize: hook requires >= %s but found %s — update with: cargo install sanitize-engine\n' "$_req" "$_ver" >&2
+  printf 'sanitize: hook requires >= %s but found %s — update with: cargo install rust-sanitize\n' "$_req" "$_ver" >&2
   exit 1
 fi
 
@@ -248,7 +248,7 @@ fi
 _ver=$(sanitize --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 _req="{min_version}"
 if [ -n "$_ver" ] && [ "$(printf '%s\n' "$_req" "$_ver" | sort -V | head -1)" != "$_req" ]; then
-  printf 'sanitize: hook requires >= %s but found %s — update with: cargo install sanitize-engine\n' "$_req" "$_ver" >&2
+  printf 'sanitize: hook requires >= %s but found %s — update with: cargo install rust-sanitize\n' "$_req" "$_ver" >&2
   exit 1
 fi
 
@@ -337,7 +337,7 @@ fn detect_framework_hooks_dir(repo_root: &Path, hook_name: &str) -> Option<PathB
         eprintln!("  - repo: local");
         eprintln!("    hooks:");
         eprintln!("      - id: sanitize-scan");
-        eprintln!("        name: Scan for secrets (sanitize-engine)");
+        eprintln!("        name: Scan for secrets (rust-sanitize)");
         eprintln!("        entry: sanitize --dry-run --fail-on-match --use-default");
         eprintln!("        language: system");
         eprintln!("        pass_filenames: true");

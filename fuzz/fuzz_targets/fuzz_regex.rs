@@ -7,10 +7,10 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use sanitize_engine::category::Category;
-use sanitize_engine::generator::HmacGenerator;
-use sanitize_engine::scanner::{ScanConfig, ScanPattern, StreamScanner};
-use sanitize_engine::store::MappingStore;
+use rust_sanitize::category::Category;
+use rust_sanitize::generator::HmacGenerator;
+use rust_sanitize::scanner::{ScanConfig, ScanPattern, StreamScanner};
+use rust_sanitize::store::MappingStore;
 use std::sync::Arc;
 
 fuzz_target!(|data: &[u8]| {
