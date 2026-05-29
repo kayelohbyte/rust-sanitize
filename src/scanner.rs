@@ -408,8 +408,8 @@ struct ScanScratch {
 impl ScanScratch {
     fn new(pattern_count: usize, chunk_size: usize, overlap_size: usize) -> Self {
         Self {
-            all_matches: Vec::new(),
-            selected: Vec::new(),
+            all_matches: Vec::with_capacity(64),
+            selected: Vec::with_capacity(64),
             output: Vec::with_capacity(chunk_size + overlap_size),
             pattern_counts: vec![0u64; pattern_count],
         }

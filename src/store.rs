@@ -198,25 +198,21 @@ impl MappingStore {
 
         // Fast path: already mapped — zero allocation.
         // `inner.get(original)` accepts `&str` via `ZeroizingString: Borrow<str>`.
-        if let Some(inner) = self.forward.get(category) {
-            if let Some(existing) = inner.value().get(original) {
-                return Ok(existing.value().0.clone());
+        // Clone the Arc while we already hold the outer shard reference so the
+        // slow path below never needs to acquire the outer shard a second time.
+        let inner: Arc<InnerMap> = match self.forward.get(category) {
+            Some(outer) => {
+                if let Some(existing) = outer.value().get(original) {
+                    return Ok(existing.value().0.clone());
+                }
+                outer.value().clone()
             }
-        }
-
-        // Slow path: get or create the inner map for this category, then insert.
-        // Try a read-lock get first — inner maps are stable once created, so
-        // this is the common case for any category seen before. Only fall back
-        // to the write-locking entry() when creating a category's map for the
-        // first time (happens at most once per category per run).
-        let inner: Arc<InnerMap> = if let Some(existing) = self.forward.get(category) {
-            existing.value().clone()
-        } else {
-            self.forward
+            None => self
+                .forward
                 .entry(category.clone())
                 .or_insert_with(|| Arc::new(DashMap::new()))
                 .value()
-                .clone()
+                .clone(),
         };
 
         if let Some(limit) = self.capacity_limit {

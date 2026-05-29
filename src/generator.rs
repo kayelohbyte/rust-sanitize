@@ -144,9 +144,10 @@ fn format_replacement(category: &Category, hash: &[u8; 32], original: &str) -> S
     if target == 0 {
         return String::new();
     }
+    let hex = hex_bytes(hash);
     match category {
-        Category::Email => format_email_lp(hash, original, target),
-        Category::Name => format_name_lp(hash, target),
+        Category::Email => format_email_lp(&hex, original, target),
+        Category::Name => format_name_lp(hash, &hex, target),
         Category::Phone | Category::CreditCard | Category::IpV4 => {
             format_digits_lp(hash, original, target)
         }
@@ -154,14 +155,14 @@ fn format_replacement(category: &Category, hash: &[u8; 32], original: &str) -> S
             format_hex_digits_lp(hash, original, target)
         }
         Category::Ssn => format_ssn_lp(hash, original, target),
-        Category::Hostname => format_hostname_lp(hash, original, target),
+        Category::Hostname => format_hostname_lp(&hex, original, target),
         Category::Jwt => format_jwt_lp(hash, original, target),
-        Category::FilePath => format_filepath_lp(hash, original, target),
+        Category::FilePath => format_filepath_lp(&hex, original, target),
         Category::WindowsSid => format_windows_sid_lp(hash, original, target),
-        Category::Url => format_url_lp(hash, original, target),
-        Category::AwsArn => format_arn_lp(hash, original, target),
-        Category::AzureResourceId => format_azure_resource_id_lp(hash, original, target),
-        Category::AuthToken | Category::Custom(_) => format_custom_lp(hash, target),
+        Category::Url => format_url_lp(&hex, original, target),
+        Category::AwsArn => format_arn_lp(&hex, original, target),
+        Category::AzureResourceId => format_azure_resource_id_lp(&hex, original, target),
+        Category::AuthToken | Category::Custom(_) => format_custom_lp(&hex, target),
     }
 }
 
@@ -169,10 +170,10 @@ fn format_replacement(category: &Category, hash: &[u8; 32], original: &str) -> S
 // Length-preserving helpers
 // ---------------------------------------------------------------------------
 
-/// Pad `s` with deterministic hex characters from `hash`, or truncate,
+/// Pad `s` with deterministic hex characters from `hex`, or truncate,
 /// to reach exactly `target` bytes.  All generated content is ASCII so
 /// byte length equals character count for the produced output.
-fn pad_or_truncate(s: &str, target: usize, hash: &[u8; 32]) -> String {
+fn pad_or_truncate(s: &str, target: usize, hex: &[u8; 64]) -> String {
     let slen = s.len();
     if slen == target {
         return s.to_string();
@@ -180,13 +181,10 @@ fn pad_or_truncate(s: &str, target: usize, hash: &[u8; 32]) -> String {
     if slen > target {
         return s[..target].to_string();
     }
-    // Pad with deterministic hex chars derived from the hash.
-    let hex = hex_encode(hash);
-    let hex_bytes = hex.as_bytes();
     let mut buf = String::with_capacity(target);
     buf.push_str(s);
     for i in 0..target.saturating_sub(slen) {
-        buf.push(hex_bytes[i % 64] as char);
+        buf.push(hex[i % 64] as char);
     }
     buf
 }
@@ -194,21 +192,19 @@ fn pad_or_truncate(s: &str, target: usize, hash: &[u8; 32]) -> String {
 /// Length-preserving email replacement.
 /// Preserves the domain from the original; generates a hex username
 /// sized so the total byte length matches the original.
-fn format_email_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
+fn format_email_lp(hex: &[u8; 64], original: &str, target: usize) -> String {
     let domain = original
         .rfind('@')
         .map_or("x.co", |pos| &original[pos + 1..]);
     let at_domain = 1 + domain.len(); // "@" + domain
     if target <= at_domain {
         // Too short to fit @domain — use hex fallback.
-        return pad_or_truncate("", target, hash);
+        return pad_or_truncate("", target, hex);
     }
     let user_len = target - at_domain;
-    let hex = hex_encode(hash);
-    let hex_bytes = hex.as_bytes();
     let mut buf = String::with_capacity(target);
     for i in 0..user_len {
-        buf.push(hex_bytes[i % 64] as char);
+        buf.push(hex[i % 64] as char);
     }
     buf.push('@');
     buf.push_str(domain);
@@ -218,9 +214,9 @@ fn format_email_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
 /// Length-preserving name replacement.
 /// Generates a synthetic name via the hash-indexed table, then
 /// truncates or pads to match `target` bytes.
-fn format_name_lp(hash: &[u8; 32], target: usize) -> String {
+fn format_name_lp(hash: &[u8; 32], hex: &[u8; 64], target: usize) -> String {
     let raw = format_name(hash);
-    pad_or_truncate(&raw, target, hash)
+    pad_or_truncate(&raw, target, hex)
 }
 
 /// Replace each character matching `is_replaceable` with a deterministic
@@ -253,19 +249,21 @@ fn format_char_class_lp(
 /// ASCII digit with a deterministic digit derived from `hash`.
 /// Falls back to hex if the original contains no digits.
 fn format_digits_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
+    let hex = hex_bytes(hash);
     format_char_class_lp(
         hash,
         original,
         |c| c.is_ascii_digit(),
         |_, b| (b'0' + b % 10) as char,
     )
-    .unwrap_or_else(|| pad_or_truncate("", target, hash))
+    .unwrap_or_else(|| pad_or_truncate("", target, &hex))
 }
 
 /// Length-preserving hex-digit replacement (for IPv6, UUID, MAC, container ID).
 /// Preserves non-hex characters (colons, dashes, etc.); replaces each
 /// ASCII hex digit with a deterministic hex digit from `hash`, preserving case.
 fn format_hex_digits_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
+    let hex = hex_bytes(hash);
     format_char_class_lp(
         hash,
         original,
@@ -279,7 +277,7 @@ fn format_hex_digits_lp(hash: &[u8; 32], original: &str, target: usize) -> Strin
             }
         },
     )
-    .unwrap_or_else(|| pad_or_truncate("", target, hash))
+    .unwrap_or_else(|| pad_or_truncate("", target, &hex))
 }
 
 /// Length-preserving SSN replacement.
@@ -289,7 +287,8 @@ fn format_hex_digits_lp(hash: &[u8; 32], original: &str, target: usize) -> Strin
 fn format_ssn_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
     let has_digit = original.chars().any(|c| c.is_ascii_digit());
     if !has_digit {
-        return pad_or_truncate("", target, hash);
+        let hex = hex_bytes(hash);
+        return pad_or_truncate("", target, &hex);
     }
     let mut buf = String::with_capacity(target);
     let mut digit_idx = 0usize;
@@ -311,17 +310,15 @@ fn format_ssn_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
 /// Length-preserving hostname replacement.
 /// Preserves the suffix (everything from the first `.` onward) and
 /// fills the prefix with deterministic hex characters to match `target`.
-fn format_hostname_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
+fn format_hostname_lp(hex: &[u8; 64], original: &str, target: usize) -> String {
     let suffix = original.find('.').map_or("", |p| &original[p..]);
     let prefix_len = target.saturating_sub(suffix.len());
     if prefix_len == 0 {
-        return pad_or_truncate("", target, hash);
+        return pad_or_truncate("", target, hex);
     }
-    let hex = hex_encode(hash);
-    let hex_bytes = hex.as_bytes();
     let mut buf = String::with_capacity(target);
     for i in 0..prefix_len {
-        buf.push(hex_bytes[i % 64] as char);
+        buf.push(hex[i % 64] as char);
     }
     buf.push_str(suffix);
     buf
@@ -330,20 +327,18 @@ fn format_hostname_lp(hash: &[u8; 32], original: &str, target: usize) -> String 
 /// Length-preserving custom replacement.
 /// Uses `__SANITIZED_<hex>__` format when the target is long enough;
 /// falls back to bare hex for short targets.
-fn format_custom_lp(hash: &[u8; 32], target: usize) -> String {
+fn format_custom_lp(hex: &[u8; 64], target: usize) -> String {
     let prefix = "__SANITIZED_";
     let suffix = "__";
     let overhead = prefix.len() + suffix.len(); // 14
-    let hex = hex_encode(hash);
     if target <= overhead {
-        return pad_or_truncate("", target, hash);
+        return pad_or_truncate("", target, hex);
     }
     let hex_len = target - overhead;
-    let hex_bytes = hex.as_bytes();
     let mut buf = String::with_capacity(target);
     buf.push_str(prefix);
     for i in 0..hex_len {
-        buf.push(hex_bytes[i % 64] as char);
+        buf.push(hex[i % 64] as char);
     }
     buf.push_str(suffix);
     buf
@@ -374,7 +369,8 @@ fn format_jwt_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
         }
     }
     if !had_b64 {
-        return pad_or_truncate("", target, hash);
+        let hex = hex_bytes(hash);
+        return pad_or_truncate("", target, &hex);
     }
     buf
 }
@@ -382,15 +378,13 @@ fn format_jwt_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
 /// Length-preserving file path replacement.
 /// Preserves separators (`/`, `\`) and the final extension (from last `.`
 /// in the last segment). Replaces other characters with deterministic hex.
-fn format_filepath_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
+fn format_filepath_lp(hex: &[u8; 64], original: &str, target: usize) -> String {
     // Find the last path separator position to identify the filename segment.
     let last_sep = original.rfind(['/', '\\']).map_or(0, |p| p + 1);
     let filename = &original[last_sep..];
     // Find extension in the filename (last `.` that isn't at position 0).
     let ext_start = filename.rfind('.').filter(|&p| p > 0).map(|p| last_sep + p);
 
-    let hex = hex_encode(hash);
-    let hex_bytes = hex.as_bytes();
     let mut buf = String::with_capacity(target);
     let mut hi = 0usize;
 
@@ -401,14 +395,14 @@ fn format_filepath_lp(hash: &[u8; 32], original: &str, target: usize) -> String 
         } else {
             // Emit as many ASCII hex bytes as the original char's UTF-8 length.
             for _ in 0..ch.len_utf8() {
-                buf.push(hex_bytes[hi % 64] as char);
+                buf.push(hex[hi % 64] as char);
                 hi += 1;
             }
         }
     }
     // Ensure exact length (should be equal for ASCII, but guard anyway).
     if buf.len() != target {
-        return pad_or_truncate(&buf, target, hash);
+        return pad_or_truncate(&buf, target, hex);
     }
     buf
 }
@@ -419,7 +413,8 @@ fn format_filepath_lp(hash: &[u8; 32], original: &str, target: usize) -> String 
 fn format_windows_sid_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
     let has_digit = original.chars().any(|c| c.is_ascii_digit());
     if !has_digit {
-        return pad_or_truncate("", target, hash);
+        let hex = hex_bytes(hash);
+        return pad_or_truncate("", target, &hex);
     }
     let mut buf = String::with_capacity(target);
     let mut hi = 0usize;
@@ -444,17 +439,15 @@ fn format_windows_sid_lp(hash: &[u8; 32], original: &str, target: usize) -> Stri
 /// predicate identifies "structural" characters to preserve as-is.
 ///
 /// All non-structural characters are replaced byte-by-byte with deterministic
-/// hex characters derived from `hash`.  Returns `None` if the original
+/// hex characters derived from `hex`.  Returns `None` if the original
 /// contained no replaceable content (caller should fall back to
 /// [`pad_or_truncate`]).
 fn format_preserving_hex_lp(
-    hash: &[u8; 32],
+    hex: &[u8; 64],
     original: &str,
     target: usize,
     is_structural: impl Fn(char) -> bool,
 ) -> Option<String> {
-    let hex = hex_encode(hash);
-    let hex_bytes = hex.as_bytes();
     let mut buf = String::with_capacity(target);
     let mut hi = 0usize;
     let mut had_content = false;
@@ -464,7 +457,7 @@ fn format_preserving_hex_lp(
             buf.push(ch);
         } else {
             for _ in 0..ch.len_utf8() {
-                buf.push(hex_bytes[hi % 64] as char);
+                buf.push(hex[hi % 64] as char);
                 hi += 1;
             }
             had_content = true;
@@ -478,24 +471,24 @@ fn format_preserving_hex_lp(
 /// Preserves scheme prefix and structural characters
 /// (`://`, `/`, `?`, `=`, `&`, `#`, `:`); replaces content characters
 /// with deterministic hex.
-fn format_url_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
-    format_preserving_hex_lp(hash, original, target, |ch| "/:?=&#@.".contains(ch))
-        .unwrap_or_else(|| pad_or_truncate("", target, hash))
+fn format_url_lp(hex: &[u8; 64], original: &str, target: usize) -> String {
+    format_preserving_hex_lp(hex, original, target, |ch| "/:?=&#@.".contains(ch))
+        .unwrap_or_else(|| pad_or_truncate("", target, hex))
 }
 
 /// Length-preserving AWS ARN replacement.
 /// Preserves `:` and `/` separators; replaces alphanumeric content
 /// in account/resource segments with deterministic hex.
-fn format_arn_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
-    format_preserving_hex_lp(hash, original, target, |ch| ch == ':' || ch == '/')
-        .unwrap_or_else(|| pad_or_truncate("", target, hash))
+fn format_arn_lp(hex: &[u8; 64], original: &str, target: usize) -> String {
+    format_preserving_hex_lp(hex, original, target, |ch| ch == ':' || ch == '/')
+        .unwrap_or_else(|| pad_or_truncate("", target, hex))
 }
 
 /// Length-preserving Azure Resource ID replacement.
 /// Preserves `/` path separators and well-known Azure segment names
 /// (`subscriptions`, `resourceGroups`, `providers`, `resourcegroups`).
 /// Replaces variable segments (IDs, names) with deterministic hex.
-fn format_azure_resource_id_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
+fn format_azure_resource_id_lp(hex: &[u8; 64], original: &str, target: usize) -> String {
     const KNOWN_SEGMENTS: &[&str] = &[
         "subscriptions",
         "resourceGroups",
@@ -503,15 +496,12 @@ fn format_azure_resource_id_lp(hash: &[u8; 32], original: &str, target: usize) -
         "providers",
     ];
 
-    let hex = hex_encode(hash);
-    let hex_bytes = hex.as_bytes();
     let mut buf = String::with_capacity(target);
     let mut hi = 0usize;
 
     // Split on `/`, rebuild with deterministic replacement for non-known segments.
-    let parts: Vec<&str> = original.split('/').collect();
     let mut prev_was_providers = false;
-    for (pi, part) in parts.iter().enumerate() {
+    for (pi, part) in original.split('/').enumerate() {
         if pi > 0 {
             buf.push('/');
         }
@@ -520,21 +510,21 @@ fn format_azure_resource_id_lp(hash: &[u8; 32], original: &str, target: usize) -
         // segments would accidentally pass through IPs or hostnames that appear
         // elsewhere in the path.
         let is_provider_namespace = prev_was_providers && part.contains('.');
-        if part.is_empty() || KNOWN_SEGMENTS.contains(part) || is_provider_namespace {
+        if part.is_empty() || KNOWN_SEGMENTS.contains(&part) || is_provider_namespace {
             buf.push_str(part);
         } else {
             // Replace this segment character-by-character to preserve byte length.
             for ch in part.chars() {
                 for _ in 0..ch.len_utf8() {
-                    buf.push(hex_bytes[hi % 64] as char);
+                    buf.push(hex[hi % 64] as char);
                     hi += 1;
                 }
             }
         }
-        prev_was_providers = *part == "providers" || *part == "Providers";
+        prev_was_providers = part == "providers" || part == "Providers";
     }
     if buf.len() != target {
-        return pad_or_truncate(&buf, target, hash);
+        return pad_or_truncate(&buf, target, hex);
     }
     buf
 }
@@ -589,14 +579,15 @@ fn format_name(hash: &[u8; 32]) -> String {
     format!("{} {}", FIRST[fi], LAST[li])
 }
 
-/// Hex-encode 32 bytes → 64-char lowercase string.
-fn hex_encode(bytes: &[u8; 32]) -> String {
-    use std::fmt::Write;
-    let mut hex = String::with_capacity(64);
-    for b in bytes {
-        let _ = write!(hex, "{:02x}", b);
+/// Encode 32 bytes as 64 lowercase hex ASCII bytes on the stack.
+fn hex_bytes(bytes: &[u8; 32]) -> [u8; 64] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    for (i, &b) in bytes.iter().enumerate() {
+        out[i * 2] = HEX[(b >> 4) as usize];
+        out[i * 2 + 1] = HEX[(b & 0xf) as usize];
     }
-    hex
+    out
 }
 
 // ---------------------------------------------------------------------------
