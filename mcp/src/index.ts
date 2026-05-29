@@ -485,6 +485,7 @@ async function toolSanitize(params: {
   include_binary?: boolean;
   hidden?: boolean;
   exclude_path?: string[];
+  include_path?: string[];
   max_archive_depth?: number;
   entropy_threshold?: number;
   extract_context?: boolean;
@@ -618,6 +619,12 @@ async function toolSanitize(params: {
       for (const pattern of params.exclude_path) {
         if (pattern.startsWith("-")) throw new Error(`exclude_path '${pattern}' must not start with '-' (flag injection)`);
         commonArgs.push("--exclude-path", pattern);
+      }
+    }
+    if (params.include_path?.length) {
+      for (const pattern of params.include_path) {
+        if (pattern.startsWith("-")) throw new Error(`include_path '${pattern}' must not start with '-' (flag injection)`);
+        commonArgs.push("--include-path", pattern);
       }
     }
     if (params.entropy_threshold !== undefined) {
@@ -803,6 +810,7 @@ async function toolScan(params: {
   include_binary?: boolean;
   hidden?: boolean;
   exclude_path?: string[];
+  include_path?: string[];
   max_archive_depth?: number;
   entropy_threshold?: number;
   strict?: boolean;
@@ -898,6 +906,12 @@ async function toolScan(params: {
       for (const pattern of params.exclude_path) {
         if (pattern.startsWith("-")) throw new Error(`exclude_path '${pattern}' must not start with '-' (flag injection)`);
         commonArgs.push("--exclude-path", pattern);
+      }
+    }
+    if (params.include_path?.length) {
+      for (const pattern of params.include_path) {
+        if (pattern.startsWith("-")) throw new Error(`include_path '${pattern}' must not start with '-' (flag injection)`);
+        commonArgs.push("--include-path", pattern);
       }
     }
     if (params.entropy_threshold !== undefined) {
@@ -1305,7 +1319,7 @@ const SanitizeSchema = {
     .array(z.string())
     .optional()
     .describe(
-      "Values to pass through unchanged (not replaced, not recorded in the mapping store). Supports exact strings and * glob patterns — e.g. 'localhost', '*.internal', '192.168.1.*'.",
+      "Values to pass through unchanged (not replaced, not recorded in the mapping store). Supports exact strings, * glob patterns, and regex:<pattern> for full regex matching — e.g. 'localhost', '*.internal', '192.168.1.*', 'regex:^10\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+'.",
     ),
   format: FormatSchema,
   extract_context: z
@@ -1374,7 +1388,13 @@ const SanitizeSchema = {
     .array(z.string())
     .optional()
     .describe(
-      "Glob patterns for paths to exclude from processing. Matched relative to the input; patterns without '/' also match the basename. E.g. ['*.test.yaml', 'fixtures/**'].",
+      "Glob patterns for paths to exclude from processing. Matched relative to the input; patterns without '/' also match the basename. E.g. ['*.test.yaml', 'fixtures/**']. When both exclude_path and include_path match a file, exclusion wins.",
+    ),
+  include_path: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Glob patterns for paths to include during directory walks. Only files matching at least one pattern are processed; all others are skipped. Patterns without '/' also match the bare filename. Has no effect on explicitly named file arguments or archive entries. When both include_path and exclude_path match a file, exclusion wins. E.g. ['**/*.log', '**/*.conf'].",
     ),
   entropy_threshold: z
     .number()
@@ -1454,7 +1474,7 @@ const ScanSchema = {
     .array(z.string())
     .optional()
     .describe(
-      "Values to exclude from the scan report. Supports exact strings and * glob patterns. Useful for suppressing known-safe values that would otherwise appear as false positives.",
+      "Values to exclude from the scan report. Supports exact strings, * glob patterns, and regex:<pattern> for full regex matching. Useful for suppressing known-safe values that would otherwise appear as false positives.",
     ),
   format: FormatSchema,
   fail_on_match: z
@@ -1483,7 +1503,13 @@ const ScanSchema = {
     .array(z.string())
     .optional()
     .describe(
-      "Glob patterns for paths to exclude from scanning. Matched relative to the input; patterns without '/' also match the basename.",
+      "Glob patterns for paths to exclude from scanning. Matched relative to the input; patterns without '/' also match the basename. When both exclude_path and include_path match a file, exclusion wins.",
+    ),
+  include_path: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Glob patterns for paths to include during directory walks. Only files matching at least one pattern are scanned; all others are skipped. Patterns without '/' also match the bare filename. Has no effect on explicitly named file arguments or archive entries. When both include_path and exclude_path match a file, exclusion wins.",
     ),
   entropy_threshold: z
     .number()
@@ -1598,7 +1624,7 @@ server.tool(
     patterns: z
       .array(z.string())
       .min(1)
-      .describe("Allowlist patterns to test. Supports exact strings and * glob wildcards — e.g. 'localhost', '*.internal', '192.168.1.*'."),
+      .describe("Allowlist patterns to test. Supports exact strings, * glob wildcards, and regex:<pattern> for full regex matching — e.g. 'localhost', '*.internal', '192.168.1.*', 'regex:^10\\\\.[0-9]+'."),
     values: z
       .array(z.string())
       .min(1)

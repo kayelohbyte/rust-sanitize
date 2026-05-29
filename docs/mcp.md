@@ -466,16 +466,28 @@ Override the server-wide archive depth default on a per-call basis. The default 
 
 ### Path exclusions and hidden files
 
+Use `include_path` to restrict a directory walk to only specific file patterns, and `exclude_path` to drop paths from an otherwise-broad walk. When both match a file, exclusion wins. Neither flag affects explicitly named file arguments or archive entries — use `archive_filters` for archive entry filtering.
+
 ```json
 {
   "tool": "sanitize",
   "files": ["/repo/logs/"],
-  "exclude_path": ["tests/fixtures/", "vendor/", "**/*.generated.*"],
+  "include_path": ["**/*.log", "**/*.conf"],
+  "exclude_path": ["tests/fixtures/", "vendor/"],
   "hidden": true
 }
 ```
 
-`exclude_path` excludes paths matching glob patterns (trailing `/` prunes entire subtrees). `include_path` restricts the walk to only files matching those patterns — when both match, exclusion wins. `hidden` walks dot-files and dot-directories that would otherwise be skipped.
+```json
+{
+  "tool": "scan",
+  "files": ["/etc/"],
+  "include_path": ["**/*.conf", "**/*.yaml"],
+  "exclude_path": ["**/default/"]
+}
+```
+
+`hidden` walks dot-files and dot-directories that would otherwise be skipped.
 
 ### Strip config values (reveal structure only)
 
@@ -509,13 +521,17 @@ For colon-delimited formats (nginx, some `.conf` files):
 
 ### Test allowlist patterns
 
-Verify that glob patterns match the intended values before committing to a full run.
+Verify that allowlist patterns match the intended values before committing to a full run. Patterns support three forms:
+
+- **Exact string** — `"localhost"` matches only that literal value (case-insensitive).
+- **Glob** — `"*.internal"` matches any hostname ending with `.internal`. `*` does not cross `/`.
+- **Regex** — `"regex:^10\\.[0-9]+"` matches using a full regular expression. Prefix the pattern with `regex:`.
 
 ```json
 {
   "tool": "test_allowlist",
-  "patterns": ["*.internal", "192.168.1.*", "localhost"],
-  "values": ["db.internal", "192.168.1.50", "api.example.com", "localhost"]
+  "patterns": ["*.internal", "192.168.1.*", "localhost", "regex:^10\\.[0-9]+\\.[0-9]+\\.[0-9]+$"],
+  "values": ["db.internal", "192.168.1.50", "10.0.4.1", "api.example.com", "localhost"]
 }
 ```
 

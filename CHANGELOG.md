@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `TOKEN`, `API_KEY`, `PRIVATE_KEY`, `ACCESS_KEY`, or `AUTH`). The structured
   profile already handled map-form env vars; this closes the remaining gap.
 
+### Added
+
+- **MCP `include_path` parameter on `sanitize` and `scan`** — mirrors the CLI's `--include-path` flag. Pass an array of glob patterns to restrict directory walks to only matching files (e.g. `["**/*.log", "**/*.conf"]`). Has no effect on explicitly named file arguments or archive entries. When both `include_path` and `exclude_path` match a file, exclusion wins.
+
+- **`regex:<pattern>` allowlist syntax documented in MCP schemas** — the `allow` parameter on `sanitize` and `scan`, and the `patterns` parameter on `test_allowlist`, now document the `regex:<pattern>` prefix form for full regex matching alongside the existing exact-string and `*`-glob forms. The underlying CLI already supported this; the MCP schema descriptions and docs now surface it.
+
 ### Changed
 
 - **Default archive nesting depth raised from 3 to 5** — `DEFAULT_ARCHIVE_DEPTH` in the Rust library and `--max-archive-depth` CLI default now allow five levels of nested archives before returning an error. The MCP server default (`SANITIZE_MCP_MAX_ARCHIVE_DEPTH`) is updated to match. Use `--max-archive-depth` / `max_archive_depth` to override per-call; the hard cap remains 10.
