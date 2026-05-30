@@ -3,6 +3,11 @@
 Thank you for your interest in contributing! This document explains how to
 get started.
 
+Before writing code, read [DESIGN.md](DESIGN.md). It explains the
+non-negotiable constraints (determinism, length preservation, no secret
+logging, memory bounds, atomic writes) and will save you from opening a PR
+that can't be merged.
+
 ## Getting Started
 
 ```bash
