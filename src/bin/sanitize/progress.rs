@@ -30,6 +30,9 @@ pub(crate) struct ProgressPolicy {
 pub(crate) struct ProgressContext {
     pub(crate) stderr_is_terminal: bool,
     pub(crate) stdout_is_terminal: bool,
+    /// True when sanitized output is actually being written to stdout (not to
+    /// files). Only in this case does a stdout TTY conflict with the spinner.
+    pub(crate) stdout_is_output: bool,
     pub(crate) is_ci: bool,
     pub(crate) term_is_dumb: bool,
     pub(crate) json_logs: bool,
@@ -43,6 +46,7 @@ impl ProgressContext {
         Self {
             stderr_is_terminal: io::stderr().is_terminal(),
             stdout_is_terminal: io::stdout().is_terminal(),
+            stdout_is_output: false, // caller sets this based on CLI output destination
             is_ci: ci,
             term_is_dumb: term.eq_ignore_ascii_case("dumb"),
             json_logs: log_format == "json",
@@ -62,13 +66,13 @@ impl ProgressPolicy {
                 milestone_updates: true,
             },
             ProgressMode::Auto => {
-                // Live spinner uses \r to overwrite the current line. If
-                // sanitized output is also going to the terminal (stdout is a
-                // TTY), the shared cursor causes spinner text to interleave
-                // with the output. Disable live updates in that case and let
-                // milestone lines (which use \n) appear above the output.
+                // Live spinner uses \r to overwrite the current line. Only
+                // suppress it when output is actually going to stdout — that's
+                // when the shared cursor would cause interleaving. A stdout
+                // that is a TTY but isn't receiving output (e.g. writing to
+                // files) is fine.
                 let allow_live = context.stderr_is_terminal
-                    && !context.stdout_is_terminal
+                    && !(context.stdout_is_terminal && context.stdout_is_output)
                     && !context.is_ci
                     && !context.term_is_dumb
                     && !context.json_logs;
@@ -135,11 +139,10 @@ impl ProgressReporter {
                 label,
                 format_scan_progress(progress)
             ));
-        } else if self.policy.milestone_updates {
-            self.emit_milestone(
-                label,
-                Some(format!("processed {}", format_scan_progress(progress))),
-            );
+        } else {
+            // In non-TTY / milestone mode, per-chunk updates are too noisy.
+            // Route to debug so SANITIZE_LOG=debug still surfaces them.
+            tracing::debug!(task = label, progress = %format_scan_progress(progress), "scan progress");
         }
     }
 
@@ -162,8 +165,8 @@ impl ProgressReporter {
         if self.policy.live_updates {
             let frame = self.spinner_frame();
             self.render_live_line(format!("{} {}: {}", frame, label, detail));
-        } else if self.policy.milestone_updates {
-            self.emit_milestone(label, Some(detail));
+        } else {
+            tracing::debug!(task = label, detail = %detail, "archive progress");
         }
     }
 

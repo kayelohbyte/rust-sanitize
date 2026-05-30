@@ -2724,6 +2724,15 @@ impl IncludeList {
     }
 }
 
+/// Returns true when sanitized output will be written to stdout rather than
+/// to files. Only in that case does a stdout TTY conflict with the spinner.
+fn cli_writes_to_stdout(cli: &Cli) -> bool {
+    let explicit_stdout_out = cli.output.as_deref() == Some(Path::new("-"));
+    let stdin_only = cli.input.is_empty()
+        || cli.input.iter().all(|p| p.as_os_str() == "-");
+    explicit_stdout_out || (stdin_only && cli.output.is_none())
+}
+
 fn plan_input_targets(cli: &Cli) -> Result<Vec<InputTarget>, String> {
     let explicit_stdin_count = cli.input.iter().filter(|p| p.as_os_str() == "-").count();
 
@@ -5473,7 +5482,8 @@ fn run_sanitize(
     validate_args(&cli).map_err(|e| (e, 1))?;
 
     let progress_mode = cli.effective_progress_mode();
-    let progress_context = ProgressContext::detect(cli.effective_log_format());
+    let mut progress_context = ProgressContext::detect(cli.effective_log_format());
+    progress_context.stdout_is_output = cli_writes_to_stdout(&cli);
     let progress_policy = ProgressPolicy::from_mode(progress_mode, progress_context);
     let progress_reporter = if progress_policy.live_updates || progress_policy.milestone_updates {
         Some(Arc::new(Mutex::new(ProgressReporter::new(
@@ -6561,6 +6571,7 @@ mod tests {
         ProgressContext {
             stderr_is_terminal,
             stdout_is_terminal: false,
+            stdout_is_output: false,
             is_ci,
             term_is_dumb,
             json_logs,
@@ -6728,6 +6739,72 @@ mod tests {
         );
         assert!(policy.live_updates);
         assert!(policy.milestone_updates);
+    }
+
+    #[test]
+    fn progress_policy_auto_enables_live_when_stdout_is_tty_but_not_output_dest() {
+        // Writing to files: stdout is a TTY but output doesn't go there.
+        // This is the common `sanitize dir/` case — spinner should work.
+        let policy = ProgressPolicy::from_mode(
+            ProgressMode::Auto,
+            ProgressContext {
+                stderr_is_terminal: true,
+                stdout_is_terminal: true,
+                stdout_is_output: false,
+                is_ci: false,
+                term_is_dumb: false,
+                json_logs: false,
+            },
+        );
+        assert!(policy.live_updates);
+    }
+
+    #[test]
+    fn progress_policy_auto_disables_live_when_writing_to_stdout() {
+        // Piping output to stdout: spinner must be suppressed to avoid
+        // interleaving with sanitized content.
+        let policy = ProgressPolicy::from_mode(
+            ProgressMode::Auto,
+            ProgressContext {
+                stderr_is_terminal: true,
+                stdout_is_terminal: true,
+                stdout_is_output: true,
+                is_ci: false,
+                term_is_dumb: false,
+                json_logs: false,
+            },
+        );
+        assert!(!policy.live_updates);
+    }
+
+    #[test]
+    fn cli_writes_to_stdout_stdin_no_output() {
+        let cli = Cli::try_parse_from(["sanitize"]).unwrap();
+        assert!(cli_writes_to_stdout(&cli));
+    }
+
+    #[test]
+    fn cli_writes_to_stdout_explicit_dash_input() {
+        let cli = Cli::try_parse_from(["sanitize", "-"]).unwrap();
+        assert!(cli_writes_to_stdout(&cli));
+    }
+
+    #[test]
+    fn cli_writes_to_stdout_explicit_dash_output() {
+        let cli = Cli::try_parse_from(["sanitize", "file.txt", "-o", "-"]).unwrap();
+        assert!(cli_writes_to_stdout(&cli));
+    }
+
+    #[test]
+    fn cli_writes_to_stdout_file_input_no_output_is_false() {
+        let cli = Cli::try_parse_from(["sanitize", "file.txt"]).unwrap();
+        assert!(!cli_writes_to_stdout(&cli));
+    }
+
+    #[test]
+    fn cli_writes_to_stdout_dir_input_no_output_is_false() {
+        let cli = Cli::try_parse_from(["sanitize", "some_dir/"]).unwrap();
+        assert!(!cli_writes_to_stdout(&cli));
     }
 
     #[test]
