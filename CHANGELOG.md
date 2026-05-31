@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-30
+
+### Added
+
+- **38 new unit tests across binary modules** — `sanitize.rs` (10 tests for
+  `apply_settings_layer` and `apply_project_config_layer`), `crypto.rs` (7 tests
+  for `read_password_file_contents` edge cases including LF/CRLF stripping,
+  empty file, oversized file), `dispatch.rs` (5 tests for
+  `save_discovered_secrets`), `hooks.rs` (11 tests for `sh_quote` and
+  `build_hook_flags`), `config.rs` (5 tests for `find_project_config_from` and
+  `load_project_config`).
+
+### Changed
+
+- **Binary split into modules** — `main.rs` has been refactored into dedicated
+  modules: `cli_args.rs`, `commands.rs`, `crypto.rs`, `dispatch.rs`, `input.rs`,
+  `run_header.rs`, `sanitize.rs`, `scanner_builder.rs`. `run_sanitize` is split
+  into `load_run_resources` and `write_run_output` phases via `RunResources` and
+  `OutputPhase` structs.
+
+- **Removed hidden `--use-default` flag** — the flag was never documented and
+  existed only for internal use by the MCP server. The CLI's existing
+  "nothing specified → activate built-in defaults" behaviour is unchanged; no
+  caller needs to change anything. The `use_default` parameter has also been
+  removed from the MCP `sanitize` and `scan` tools for the same reason — omit
+  all pattern sources and defaults activate automatically.
+
+- **MCP agent instructions overhauled** — all 10 tool descriptions updated:
+  `sanitize` leads with "MODIFIES content — run scan first to preview"; `scan`
+  leads with "Read-only audit"; `test_pattern` WARNING moved to the first
+  sentence; `strip_config_values` clarifies when to use it vs `sanitize`; `init`
+  and `build_secrets` cross-reference each other; `list_apps`, `list_processors`,
+  and `list_templates` each explain when to call them; `namespace` and `seed`
+  descriptions include security guidance.
+
+### Fixed
+
+- **`atomic_write_private` for sensitive output files** — decrypted secrets
+  written by `sanitize decrypt` and discovered secrets written by
+  `save_discovered_secrets` now use a mode-0600 temp file (via
+  `atomic_write_private`) so plaintext secrets are never world-readable, even
+  briefly during the atomic rename window.
+
+- **In-memory secrets wrapped in `Zeroizing<Vec<u8>>`** — secrets file bytes
+  read into memory are now zeroed on drop, preventing plaintext secrets from
+  lingering in heap memory after use.
+
+- **`save_discovered_secrets` silent data loss fixed** — a stale YAML secrets
+  file that failed to parse previously caused the operation to silently succeed
+  with an empty pattern list (via `.unwrap_or_default()`). It now propagates the
+  parse error instead.
+
+- **MCP `buildSecretsJson` default kind was `"regex"` instead of `"literal"`**
+  — when `kind` was omitted from an inline `patterns` entry, the JSON secrets
+  file written to the temp dir used `kind: "regex"` while the Zod schema
+  advertised `"literal"` as the default. Now consistent: omitting `kind` gives
+  literal matching on both sides.
+
 ### Added
 
 - **Datadog app bundle** (`datadog`) — covers `datadog.yaml` (API key, app key,

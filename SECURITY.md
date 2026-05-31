@@ -1,6 +1,6 @@
 # Security Model
 
-> **rust-sanitize** v0.10.0
+> **rust-sanitize** v0.11.0
 
 This document describes the security properties, threat mitigations,
 and operational constraints of the sanitization engine.
