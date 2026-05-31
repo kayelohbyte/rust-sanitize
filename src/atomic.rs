@@ -56,6 +56,11 @@ impl AtomicFileWriter {
     /// Use this when writing files that contain sensitive material such as
     /// plaintext secrets, so that the data is never world-readable — even
     /// during the brief window between the initial `open` and the rename.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the temporary file cannot be created or its
+    /// permissions cannot be set.
     pub fn new_private(dest: impl AsRef<Path>) -> io::Result<Self> {
         Self::open(dest, true)
     }
@@ -177,6 +182,10 @@ pub fn atomic_write(dest: impl AsRef<Path>, data: &[u8]) -> io::Result<()> {
 /// Like [`atomic_write`] but creates the file with owner-only permissions
 /// (0600 on Unix).  Use for files containing plaintext secrets or other
 /// sensitive material.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be written or renamed into place.
 pub fn atomic_write_private(dest: impl AsRef<Path>, data: &[u8]) -> io::Result<()> {
     let mut writer = AtomicFileWriter::new_private(dest)?;
     writer.write_all(data)?;
