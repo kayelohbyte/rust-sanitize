@@ -65,7 +65,7 @@ impl AtomicFileWriter {
         Self::open(dest, true)
     }
 
-    fn open(dest: impl AsRef<Path>, private: bool) -> io::Result<Self> {
+    fn open(dest: impl AsRef<Path>, _private: bool) -> io::Result<Self> {
         let dest_path = dest.as_ref().to_path_buf();
         let dir = dest_path.parent().unwrap_or(Path::new("."));
         let base_name = dest_path
@@ -87,7 +87,7 @@ impl AtomicFileWriter {
         // Restrict permissions before any data is written so the file is
         // never world-readable, even briefly.
         #[cfg(unix)]
-        if private {
+        if _private {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
