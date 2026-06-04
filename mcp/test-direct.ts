@@ -1418,6 +1418,33 @@ await session.close();
     }
   }
 
+  // --- default port ---
+  await httpTest("--http without port argument defaults to 6277", async () => {
+    const proc = new Deno.Command(Deno.execPath(), {
+      args: ["run", "--allow-run", "--allow-env", "--allow-read", "--allow-write", "--allow-net",
+        MCP_SCRIPT, "--http"],
+      stdin: "null", stdout: "null", stderr: "piped",
+      env: { ...Deno.env.toObject(), SANITIZE_BIN, SANITIZE_LOG: "error", SANITIZE_MCP_HTTP_TOKEN: token },
+    }).spawn();
+    const stderr = await readStreamFor(proc.stderr, 4_000, "ready");
+    try { proc.kill("SIGTERM"); } catch { /* may already have failed to bind */ }
+    await proc.status.catch(() => {});
+    has(stderr, "127.0.0.1:6277");
+  });
+
+  // --- port validation ---
+  await httpTest("--http with invalid port exits non-zero", async () => {
+    for (const badPort of ["0", "99999", "abc"]) {
+      const result = await new Deno.Command(Deno.execPath(), {
+        args: ["run", "--allow-run", "--allow-env", "--allow-read", "--allow-write", "--allow-net",
+          MCP_SCRIPT, "--http", badPort],
+        stdin: "null", stdout: "null", stderr: "null",
+        env: { ...Deno.env.toObject(), SANITIZE_BIN, SANITIZE_LOG: "error", SANITIZE_MCP_HTTP_TOKEN: token },
+      }).output();
+      ok(result.code !== 0, `expected non-zero exit for port "${badPort}", got ${result.code}`);
+    }
+  });
+
   // --- onListen: startup message goes to stderr, not stdout ---
   await httpTest("startup message in stderr, nothing in stdout", async () => {
     const listenPort = await getFreePort();
@@ -1534,6 +1561,41 @@ await session.close();
     try { daemon?.kill("SIGTERM"); } catch { /* already exited via onsessionclosed */ }
     await daemon?.status.catch(() => {});
   }
+
+  // --- session lifecycle (each test owns its own daemon) ---
+
+  await httpTest("daemon exits with code 0 when session is closed (DELETE)", async () => {
+    const p = await getFreePort();
+    const d = await startHttpDaemon(p, token);
+    const hs = await startHttpMcpSession(`http://127.0.0.1:${p}`, token);
+    await hs.close(); // sends DELETE → onsessionclosed → Deno.exit(0)
+    const status = await d.status;
+    ok(status.code === 0, `expected exit code 0, got ${status.code}`);
+  });
+
+  await httpTest("new session accepted after daemon restart", async () => {
+    const p = await getFreePort();
+    // First session: connect, use, close
+    const d1 = await startHttpDaemon(p, token);
+    const hs1 = await startHttpMcpSession(`http://127.0.0.1:${p}`, token);
+    await hs1.close();
+    await d1.status; // wait for clean exit
+    // Second session: daemon restarted, must accept a fresh initialize
+    const d2 = await startHttpDaemon(p, token);
+    try {
+      const hs2 = await startHttpMcpSession(`http://127.0.0.1:${p}`, token);
+      const r = toolText(await hs2.send("tools/call", {
+        name: "sanitize",
+        arguments: { content: "reconnect@example.com" },
+      }));
+      not(r, "reconnect@example.com");
+      await hs2.close();
+      await d2.status.catch(() => {});
+    } finally {
+      try { d2.kill("SIGTERM"); } catch { /* already exited */ }
+      await d2.status.catch(() => {});
+    }
+  });
 }
 
 console.log(
