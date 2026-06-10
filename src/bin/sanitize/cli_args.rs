@@ -286,6 +286,22 @@ pub(crate) struct Cli {
     #[arg(long, value_name = "TEMPLATE", default_missing_value = "troubleshoot", num_args = 0..=1)]
     pub(crate) llm: Option<String>,
 
+    /// Send the --llm prompt to an OpenAI-compatible endpoint instead of printing to stdout.
+    /// Requires --llm. Env: SANITIZE_LLM_ENDPOINT.
+    /// Example: http://localhost:11434/v1  (Ollama)
+    #[arg(long, value_name = "URL", env = "SANITIZE_LLM_ENDPOINT", requires = "llm")]
+    pub(crate) llm_endpoint: Option<String>,
+
+    /// Model name for --llm-endpoint (e.g. phi4-mini, gpt-4o). Env: SANITIZE_LLM_MODEL.
+    #[arg(long, value_name = "MODEL", env = "SANITIZE_LLM_MODEL", requires = "llm_endpoint")]
+    pub(crate) llm_model: Option<String>,
+
+    /// API key for --llm-endpoint. Prefer SANITIZE_LLM_KEY env var for real keys;
+    /// passing the value as a flag exposes it in process listings (ps, /proc).
+    /// Local models (Ollama, LM Studio) accept any non-empty value.
+    #[arg(long, value_name = "KEY", env = "SANITIZE_LLM_KEY")]
+    pub(crate) llm_key: Option<String>,
+
     /// Load built-in patterns/profiles for an app (comma-separated). Run `sanitize apps` for names.
     #[arg(long, value_delimiter = ',', value_name = "APPS")]
     pub(crate) app: Vec<String>,
@@ -293,6 +309,12 @@ pub(crate) struct Cli {
     /// Allow a value unchanged. Supports exact, glob (`*`), or `regex:` prefix. Repeatable.
     #[arg(long = "allow", value_name = "PATTERN")]
     pub(crate) allow: Vec<String>,
+
+    /// Add one-off literal or regex patterns for this run only (comma-separated).
+    /// Prefix with `regex:` for a regex pattern; bare values are treated as literals.
+    /// Example: --quick "tok-abc123,regex:sk-[A-Za-z0-9]{40}"
+    #[arg(long, value_delimiter = ',', value_name = "PATTERN")]
+    pub(crate) quick: Vec<String>,
 }
 
 impl Default for Cli {
@@ -341,8 +363,12 @@ impl Default for Cli {
             strip_delimiter: "=".to_string(),
             strip_comment_prefix: "#".to_string(),
             llm: None,
+            llm_endpoint: None,
+            llm_model: None,
+            llm_key: None,
             app: vec![],
             allow: vec![],
+            quick: vec![],
             exclude_path: vec![],
             include_path: vec![],
             entropy_threshold: None,
@@ -421,12 +447,6 @@ EXAMPLES:\n  \
     )]
     AllowTest(AllowTestArgs),
 
-    /// Interactive guided setup for logs-focused secrets templates.
-    #[command(after_help = "\
-EXAMPLES:\n  \
-    sanitize guided")]
-    Guided,
-
     /// Generate a starter secrets-template YAML file for a given use case.
     ///
     /// Templates include commented-out examples and common patterns so
@@ -434,15 +454,17 @@ EXAMPLES:\n  \
     /// quickly before sending logs or configs to an LLM.
     #[command(after_help = "\
 PRESETS\n  \
-  generic    Common secrets: tokens, emails, IPs, hostnames (default)\n  \
-  web        Web-app logs: JWTs, sessions, emails, URLs\n  \
-  k8s        Kubernetes configs: service-accounts, tokens, namespaces\n  \
-  database   Database configs: passwords, connection strings, usernames\n  \
-  aws        AWS: access keys, ARNs, account IDs\n\n\
+  balanced    All well-known token formats; matches the runtime defaults (default)\n  \
+  aggressive  Balanced + entropy detection + broad token patterns\n  \
+  generic     Minimal template: tokens, emails, IPs, hostnames\n  \
+  web         Web-app logs: JWTs, sessions, emails, URLs\n  \
+  k8s         Kubernetes configs: service-accounts, tokens, namespaces\n  \
+  database    Database configs: passwords, connection strings, usernames\n  \
+  aws         AWS: access keys, ARNs, account IDs\n\n\
 EXAMPLES:\n  \
-  sanitize template                     # generic → secrets.template.yaml\n  \
-  sanitize template --preset web        # web-app template\n  \
-  sanitize template --preset k8s -o k8s-secrets.yaml")]
+  sanitize template                     # balanced → secrets.template.balanced.yaml\n  \
+  sanitize template aggressive          # aggressive preset\n  \
+  sanitize template k8s -o k8s.yaml    # k8s preset with custom output path")]
     Template(TemplateArgs),
 
     /// Install a git hook that scans (or sanitizes) staged files before each commit.
@@ -606,15 +628,13 @@ fn parse_format(s: &str) -> Result<SecretsFormat, String> {
 
 #[derive(Parser, Debug)]
 pub(crate) struct TemplateArgs {
-    /// Which preset to generate.
-    ///
-    /// Choices: generic, web, k8s, database, aws.
-    #[arg(long, short = 'p', default_value = "generic", value_name = "PRESET")]
+    /// Preset to generate. Choices: balanced (default), aggressive, generic, web, k8s, database, aws.
+    #[arg(value_name = "PRESET", default_value = "balanced")]
     pub(crate) preset: String,
 
     /// Output path for the generated YAML template.
     ///
-    /// Default: secrets.template.yaml
+    /// Default: secrets.template.<preset>.yaml
     #[arg(long, short = 'o', value_name = "FILE")]
     pub(crate) output: Option<PathBuf>,
 

@@ -594,4 +594,33 @@ mod tests {
             "--app 'kubernetes' -s 'secrets.yaml'"
         );
     }
+
+    // ── sanitize_config_dir / global path helpers ─────────────────────────────
+
+    #[test]
+    fn sanitize_config_dir_uses_xdg_config_home() {
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-test");
+        let dir = sanitize_config_dir();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert_eq!(dir, PathBuf::from("/tmp/xdg-test/sanitize"));
+    }
+
+    #[test]
+    fn sanitize_config_dir_falls_back_to_home() {
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", "/tmp/home-test");
+        let dir = sanitize_config_dir();
+        std::env::remove_var("HOME");
+        assert_eq!(dir, PathBuf::from("/tmp/home-test/.config/sanitize"));
+    }
+
+    #[test]
+    fn global_path_helpers_use_config_dir() {
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-test");
+        let secrets = global_default_secrets_path();
+        let settings = global_settings_path();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert_eq!(secrets, PathBuf::from("/tmp/xdg-test/sanitize/secrets.yaml"));
+        assert_eq!(settings, PathBuf::from("/tmp/xdg-test/sanitize/settings.yaml"));
+    }
 }

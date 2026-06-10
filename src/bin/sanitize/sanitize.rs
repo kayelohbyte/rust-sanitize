@@ -29,7 +29,7 @@ use crate::dispatch::{
     FileProcessor, LlmCollector,
 };
 use crate::entropy::{entropy_configs_from_entries, EntropyBuckets, EntropyConfig};
-use crate::guided::{build_guided_entries, GuidedOptions, GuidedPreset};
+use crate::scanner_builder::balanced_secret_entries;
 use crate::hooks::global_default_secrets_path;
 use crate::input::{
     cli_writes_to_stdout, derive_auto_report_path, plan_input_targets, resolve_thread_count,
@@ -302,6 +302,32 @@ fn load_run_resources(
         entropy_configs.extend(ls.entropy_configs.iter().cloned());
     }
 
+    if !cli.quick.is_empty() {
+        let quick_entries: Vec<SecretEntry> = cli.quick.iter().map(|p| {
+            let (kind, pattern) = if let Some(rx) = p.strip_prefix("regex:") {
+                ("regex", rx)
+            } else {
+                ("literal", p.as_str())
+            };
+            SecretEntry {
+                pattern: pattern.to_string(),
+                kind: kind.to_string(),
+                category: "auth_token".to_string(),
+                label: Some(format!("quick:{pattern}")),
+                values: vec![],
+                min_length: None,
+                max_length: None,
+                threshold: None,
+                charset: None,
+            }
+        }).collect();
+        let (patterns, errors) = entries_to_patterns(&quick_entries);
+        for (i, e) in &errors {
+            return Err((format!("invalid --quick pattern at position {i}: {e}"), 1));
+        }
+        base_patterns.extend(patterns);
+    }
+
     if let Some(threshold) = cli.entropy_threshold {
         if !entropy_configs
             .iter()
@@ -475,11 +501,20 @@ fn write_run_output(
                     .unwrap_or_default();
                 format_llm_prompt(template_name, &entries, Some(&report)).map_err(|e| (e, 1))?
             };
-            let stdout = io::stdout();
-            stdout
-                .lock()
-                .write_all(prompt.as_bytes())
-                .map_err(|e| (format!("failed to write LLM prompt: {e}"), 1))?;
+            if let Some(ref endpoint) = cli.llm_endpoint {
+                let model = cli.llm_model.as_deref().ok_or_else(|| {
+                    ("--llm-model is required with --llm-endpoint".to_string(), 1)
+                })?;
+                let key = cli.llm_key.as_deref().unwrap_or("local");
+                crate::llm_client::send_prompt(endpoint, model, key, &prompt)
+                    .map_err(|e| (e, 1))?;
+            } else {
+                let stdout = io::stdout();
+                stdout
+                    .lock()
+                    .write_all(prompt.as_bytes())
+                    .map_err(|e| (format!("failed to write LLM prompt: {e}"), 1))?;
+            }
         }
 
         if let Some(report_opt) = &cli.report {
@@ -696,14 +731,7 @@ pub(crate) fn run_sanitize(
                 threshold: None,
                 charset: None,
             };
-            let opts = GuidedOptions {
-                preset: GuidedPreset::Balanced,
-                domains: vec![],
-                providers: vec![],
-                exclude_noise_ids: false,
-                formats: vec![],
-            };
-            let mut entries = build_guided_entries(&opts);
+            let mut entries = balanced_secret_entries();
             entries.push(allow_entry);
             if let Ok(yaml) = serde_yaml_ng::to_string(&entries) {
                 let header = "# Global sanitize secrets — balanced detection patterns + allowlist.\n# Auto-loaded on every plain run. Edit freely; deleted values take effect immediately.\n\n";

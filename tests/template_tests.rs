@@ -1,8 +1,8 @@
 //! Integration tests for the `sanitize template` subcommand.
 //!
 //! Covers:
-//! - Default preset generates a YAML file with `secrets:` content
-//! - Named presets (web, k8s, database, aws) generate preset-specific files
+//! - Default preset (balanced) generates a YAML file with pattern entries
+//! - Named presets (balanced, aggressive, web, k8s, database, aws) generate preset-specific files
 //! - Refusing to overwrite an existing file without `--overwrite`
 //! - `--overwrite` replaces an existing file
 //! - The generated template is accepted by a sanitize run
@@ -35,23 +35,51 @@ fn stderr(o: &std::process::Output) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn template_default_creates_generic_yaml() {
+fn template_default_is_balanced() {
     let dir = tempdir().unwrap();
     let out_path = dir.path().join("secrets.yaml");
 
     let out = run_template(&["-o", out_path.to_str().unwrap()]);
 
     assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert!(
-        out_path.exists(),
-        "template output file should exist at {}",
-        out_path.display()
-    );
-
     let content = fs::read_to_string(&out_path).unwrap();
     assert!(
-        content.contains("- pattern:"),
-        "template should contain at least one '- pattern:' entry; got:\n{content}"
+        content.contains("aws_access_key_id") || content.contains("github_token"),
+        "default (balanced) template should contain well-known token labels; got:\n{content}"
+    );
+}
+
+#[test]
+fn template_preset_balanced_creates_file() {
+    let dir = tempdir().unwrap();
+    let out_path = dir.path().join("balanced.yaml");
+
+    let out = run_template(&["balanced", "-o", out_path.to_str().unwrap()]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let content = fs::read_to_string(&out_path).unwrap();
+    assert!(
+        content.contains("stripe_key") || content.contains("github_token"),
+        "balanced template should contain specific token labels; got:\n{content}"
+    );
+}
+
+#[test]
+fn template_preset_aggressive_includes_entropy() {
+    let dir = tempdir().unwrap();
+    let out_path = dir.path().join("aggressive.yaml");
+
+    let out = run_template(&["aggressive", "-o", out_path.to_str().unwrap()]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let content = fs::read_to_string(&out_path).unwrap();
+    assert!(
+        content.contains("entropy"),
+        "aggressive template should contain entropy detection; got:\n{content}"
+    );
+    assert!(
+        content.contains("bearer_token") || content.contains("Bearer"),
+        "aggressive template should contain bearer token pattern; got:\n{content}"
     );
 }
 
@@ -60,11 +88,9 @@ fn template_preset_web_creates_file() {
     let dir = tempdir().unwrap();
     let out_path = dir.path().join("web-secrets.yaml");
 
-    let out = run_template(&["--preset", "web", "-o", out_path.to_str().unwrap()]);
+    let out = run_template(&["web", "-o", out_path.to_str().unwrap()]);
 
     assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert!(out_path.exists(), "web template file should exist");
-
     let content = fs::read_to_string(&out_path).unwrap();
     let lower = content.to_lowercase();
     assert!(
@@ -78,11 +104,9 @@ fn template_preset_k8s_creates_file() {
     let dir = tempdir().unwrap();
     let out_path = dir.path().join("k8s-secrets.yaml");
 
-    let out = run_template(&["--preset", "k8s", "-o", out_path.to_str().unwrap()]);
+    let out = run_template(&["k8s", "-o", out_path.to_str().unwrap()]);
 
     assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert!(out_path.exists(), "k8s template file should exist");
-
     let content = fs::read_to_string(&out_path).unwrap();
     let lower = content.to_lowercase();
     assert!(
@@ -99,11 +123,9 @@ fn template_preset_database_creates_file() {
     let dir = tempdir().unwrap();
     let out_path = dir.path().join("db-secrets.yaml");
 
-    let out = run_template(&["--preset", "database", "-o", out_path.to_str().unwrap()]);
+    let out = run_template(&["database", "-o", out_path.to_str().unwrap()]);
 
     assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert!(out_path.exists(), "database template file should exist");
-
     let content = fs::read_to_string(&out_path).unwrap();
     let lower = content.to_lowercase();
     assert!(
@@ -117,11 +139,9 @@ fn template_preset_aws_creates_file() {
     let dir = tempdir().unwrap();
     let out_path = dir.path().join("aws-secrets.yaml");
 
-    let out = run_template(&["--preset", "aws", "-o", out_path.to_str().unwrap()]);
+    let out = run_template(&["aws", "-o", out_path.to_str().unwrap()]);
 
     assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert!(out_path.exists(), "aws template file should exist");
-
     let content = fs::read_to_string(&out_path).unwrap();
     let lower = content.to_lowercase();
     assert!(
@@ -135,12 +155,10 @@ fn template_fails_without_overwrite_when_file_exists() {
     let dir = tempdir().unwrap();
     let out_path = dir.path().join("secrets.yaml");
 
-    // First run: create the template.
     let out1 = run_template(&["-o", out_path.to_str().unwrap()]);
     assert!(out1.status.success(), "first run failed: {}", stderr(&out1));
     assert!(out_path.exists());
 
-    // Second run without --overwrite should be refused.
     let out2 = run_template(&["-o", out_path.to_str().unwrap()]);
     assert!(
         !out2.status.success(),
@@ -153,7 +171,6 @@ fn template_overwrite_flag_replaces_existing_file() {
     let dir = tempdir().unwrap();
     let out_path = dir.path().join("secrets.yaml");
 
-    // Write dummy content at the target path.
     fs::write(&out_path, b"dummy content that should be replaced\n").unwrap();
 
     let out = run_template(&["-o", out_path.to_str().unwrap(), "--overwrite"]);
@@ -162,8 +179,8 @@ fn template_overwrite_flag_replaces_existing_file() {
 
     let content = fs::read_to_string(&out_path).unwrap();
     assert!(
-        content.contains("- pattern:"),
-        "file should contain '- pattern:' after overwrite; got:\n{content}"
+        content.contains("- pattern:") || content.contains("kind: entropy"),
+        "file should contain pattern entries after overwrite; got:\n{content}"
     );
     assert!(
         !content.contains("dummy content"),
@@ -178,20 +195,15 @@ fn template_generated_file_is_valid_for_sanitize() {
     let input_path = dir.path().join("input.txt");
     let out_path = dir.path().join("out.txt");
 
-    // Generate a template with the default (generic) preset.
-    let tpl_out = run_template(&["--preset", "generic", "-o", template_path.to_str().unwrap()]);
+    let tpl_out = run_template(&["balanced", "-o", template_path.to_str().unwrap()]);
     assert!(
         tpl_out.status.success(),
         "template generation failed: {}",
         stderr(&tpl_out)
     );
-    assert!(template_path.exists());
 
-    // Create a simple input file.
     fs::write(&input_path, b"safe text with no secrets here\n").unwrap();
 
-    // The template generates a flat YAML sequence (bare `- pattern:` list) that
-    // sanitize can load directly — no transformation needed.
     let run_out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
         .args([
             input_path.to_str().unwrap(),

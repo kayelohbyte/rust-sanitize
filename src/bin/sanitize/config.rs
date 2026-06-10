@@ -511,4 +511,88 @@ mod tests {
         assert_eq!(cfg.secrets_file, Some(PathBuf::from("secrets.yaml")));
         assert_eq!(cfg_dir, dir.path());
     }
+
+    // ── load_settings ────────────────────────────────────────────────────────
+
+    #[test]
+    fn load_settings_skips_when_env_var_set() {
+        std::env::set_var("SANITIZE_NO_SETTINGS", "1");
+        let s = load_settings();
+        std::env::remove_var("SANITIZE_NO_SETTINGS");
+        assert!(s.app.is_empty());
+        assert!(s.allow.is_empty());
+    }
+
+    #[test]
+    fn load_settings_returns_default_when_file_missing() {
+        // Point XDG_CONFIG_HOME to an empty temp dir so no settings file exists.
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var("SANITIZE_NO_SETTINGS");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        let s = load_settings();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert!(s.app.is_empty());
+    }
+
+    #[test]
+    fn load_settings_parses_valid_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("sanitize");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("settings.yaml"),
+            "app:\n  - gitlab\nfail_on_match: true\n",
+        )
+        .unwrap();
+        std::env::remove_var("SANITIZE_NO_SETTINGS");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        let s = load_settings();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert_eq!(s.app, vec!["gitlab"]);
+        assert_eq!(s.fail_on_match, Some(true));
+    }
+
+    #[test]
+    fn load_settings_returns_default_on_malformed_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("sanitize");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("settings.yaml"), "this: is: not: valid: ][[[").unwrap();
+        std::env::remove_var("SANITIZE_NO_SETTINGS");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        let s = load_settings();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert!(s.app.is_empty());
+    }
+
+    // ── find_project_config ──────────────────────────────────────────────────
+
+    #[test]
+    fn find_project_config_returns_none_when_disabled() {
+        std::env::set_var("SANITIZE_NO_CONFIG", "1");
+        let result = find_project_config();
+        std::env::remove_var("SANITIZE_NO_CONFIG");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_project_config_uses_explicit_env_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom.toml");
+        fs::write(&path, "").unwrap();
+        std::env::remove_var("SANITIZE_NO_CONFIG");
+        std::env::set_var("SANITIZE_CONFIG", path.to_str().unwrap());
+        let result = find_project_config();
+        std::env::remove_var("SANITIZE_CONFIG");
+        assert_eq!(result, Some(path));
+    }
+
+    #[test]
+    fn find_project_config_returns_none_for_nonexistent_explicit_path() {
+        std::env::remove_var("SANITIZE_NO_CONFIG");
+        std::env::set_var("SANITIZE_CONFIG", "/nonexistent/path/custom.toml");
+        let result = find_project_config();
+        std::env::remove_var("SANITIZE_CONFIG");
+        assert!(result.is_none());
+    }
 }

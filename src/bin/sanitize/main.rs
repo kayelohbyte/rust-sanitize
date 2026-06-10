@@ -68,6 +68,7 @@ mod entropy;
 mod guided;
 mod hooks;
 mod input;
+mod llm_client;
 mod progress;
 mod run_header;
 mod sanitize;
@@ -120,7 +121,6 @@ fn run() -> Result<(), (String, i32)> {
         Some(SubCommand::Encrypt(args)) => return crypto::run_encrypt(args),
         Some(SubCommand::Decrypt(args)) => return crypto::run_decrypt(args),
         Some(SubCommand::Apps(args)) => return apps::run_apps(args),
-        Some(SubCommand::Guided) => return commands::run_guided(),
         Some(SubCommand::Template(args)) => return commands::run_template(args),
         Some(SubCommand::AllowTest(args)) => return commands::run_allow_test(args),
         Some(SubCommand::InstallHook(args)) => return hooks::run_install_hook(args),
@@ -147,10 +147,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use crate::cli_args::{Cli, HookMode, HookType, InstallHookArgs, SubCommand};
-    use crate::guided::{
-        build_guided_entries, build_guided_profiles, CloudProvider, GuidedFormat, GuidedOptions,
-        GuidedPreset,
-    };
     use crate::hooks::{
         build_hook_flags, build_hook_script, hook_script_pre_commit_scan, remove_hook, sh_quote,
         HOOK_MARKER,
@@ -162,7 +158,7 @@ mod tests {
     use crate::progress::{ProgressContext, ProgressMode, ProgressPolicy};
     use crate::scanner_builder::build_default_patterns;
     use clap::Parser;
-    use rust_sanitize::secrets::entries_to_patterns;
+
     use std::fs;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -441,13 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_guided_subcommand() {
-        let cli = Cli::try_parse_from(["sanitize", "guided"]).unwrap();
-        assert!(matches!(cli.command, Some(SubCommand::Guided)));
-        assert!(cli.input.is_empty());
-    }
-
-    #[test]
     fn cli_no_input_no_subcommand_is_ok_at_parse_time() {
         // Clap allows it (input is Vec); we validate manually in run().
         let cli = Cli::try_parse_from(["sanitize", "--dry-run"]).unwrap();
@@ -616,186 +605,6 @@ mod tests {
         assert!(outputs.contains(&"same-sanitized-1.txt".to_string()));
     }
 
-    #[test]
-    fn guided_entries_compile_balanced() {
-        let opts = GuidedOptions {
-            preset: GuidedPreset::Balanced,
-            domains: vec!["corp.internal".into()],
-            providers: vec![CloudProvider::Aws],
-            exclude_noise_ids: true,
-            formats: vec![GuidedFormat::YamlJson, GuidedFormat::Env],
-        };
-
-        let entries = build_guided_entries(&opts);
-        let (_patterns, warnings) = entries_to_patterns(&entries);
-        assert!(warnings.is_empty());
-    }
-
-    #[test]
-    fn guided_entries_include_gcp_custom_when_selected() {
-        let opts = GuidedOptions {
-            preset: GuidedPreset::Aggressive,
-            domains: vec![],
-            providers: vec![CloudProvider::Gcp],
-            exclude_noise_ids: false,
-            formats: vec![],
-        };
-
-        let entries = build_guided_entries(&opts);
-        assert!(entries
-            .iter()
-            .any(|e| e.category == "custom:gcp_service_account"));
-        assert!(entries.iter().any(|e| e.category == "custom:gcp_resource"));
-    }
-
-    #[test]
-    fn guided_profiles_use_known_processor_names() {
-        use rust_sanitize::processor::ProcessorRegistry;
-        let registry = ProcessorRegistry::with_builtins();
-
-        for preset in [
-            GuidedPreset::Balanced,
-            GuidedPreset::Aggressive,
-            GuidedPreset::WebApp,
-            GuidedPreset::Kubernetes,
-            GuidedPreset::Database,
-        ] {
-            let opts = GuidedOptions {
-                preset,
-                domains: vec![],
-                providers: vec![],
-                exclude_noise_ids: false,
-                formats: vec![
-                    GuidedFormat::YamlJson,
-                    GuidedFormat::JsonLines,
-                    GuidedFormat::Env,
-                    GuidedFormat::Toml,
-                    GuidedFormat::IniConf,
-                ],
-            };
-            let profiles = build_guided_profiles(&opts);
-            for p in &profiles {
-                assert!(
-                    registry.get(&p.processor).is_some(),
-                    "preset {:?}: unknown processor '{}'",
-                    preset,
-                    p.processor
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn guided_profiles_all_formats_produce_non_empty_field_rules() {
-        let opts = GuidedOptions {
-            preset: GuidedPreset::Balanced,
-            domains: vec![],
-            providers: vec![],
-            exclude_noise_ids: false,
-            formats: vec![
-                GuidedFormat::YamlJson,
-                GuidedFormat::JsonLines,
-                GuidedFormat::Env,
-                GuidedFormat::Toml,
-                GuidedFormat::IniConf,
-            ],
-        };
-        let profiles = build_guided_profiles(&opts);
-        // YamlJson produces 2 profiles (yaml + json), each other format 1 → 6 total.
-        assert_eq!(
-            profiles.len(),
-            6,
-            "expected 6 profiles (yaml, json, jsonl, env, toml, ini)"
-        );
-        for p in &profiles {
-            assert!(
-                !p.fields.is_empty(),
-                "profile '{}' has no field rules",
-                p.processor
-            );
-        }
-    }
-
-    #[test]
-    fn guided_profiles_k8s_adds_secret_data_fields() {
-        let opts = GuidedOptions {
-            preset: GuidedPreset::Kubernetes,
-            domains: vec![],
-            providers: vec![],
-            exclude_noise_ids: false,
-            formats: vec![GuidedFormat::YamlJson],
-        };
-        let profiles = build_guided_profiles(&opts);
-        let yaml_profile = profiles.iter().find(|p| p.processor == "yaml").unwrap();
-        let patterns: Vec<&str> = yaml_profile
-            .fields
-            .iter()
-            .map(|f| f.pattern.as_str())
-            .collect();
-        assert!(
-            patterns.contains(&"data.*"),
-            "k8s yaml profile missing data.*"
-        );
-        assert!(
-            patterns.contains(&"stringData.*"),
-            "k8s yaml profile missing stringData.*"
-        );
-    }
-
-    #[test]
-    fn guided_profiles_jsonl_has_skip_invalid_option() {
-        let opts = GuidedOptions {
-            preset: GuidedPreset::Balanced,
-            domains: vec![],
-            providers: vec![],
-            exclude_noise_ids: false,
-            formats: vec![GuidedFormat::JsonLines],
-        };
-        let profiles = build_guided_profiles(&opts);
-        let jsonl = profiles.iter().find(|p| p.processor == "jsonl").unwrap();
-        assert_eq!(
-            jsonl.options.get("skip_invalid").map(|s| s.as_str()),
-            Some("true"),
-            "jsonl profile should have skip_invalid=true for mixed log files"
-        );
-    }
-
-    #[test]
-    fn guided_entries_k8s_includes_container_id_short() {
-        let opts = GuidedOptions {
-            preset: GuidedPreset::Kubernetes,
-            domains: vec![],
-            providers: vec![],
-            exclude_noise_ids: false,
-            formats: vec![],
-        };
-        let entries = build_guided_entries(&opts);
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.label.as_deref() == Some("container_id_short")),
-            "k8s preset should include container_id_short"
-        );
-    }
-
-    #[test]
-    fn guided_entries_balanced_excludes_container_id_short() {
-        let opts = GuidedOptions {
-            preset: GuidedPreset::Balanced,
-            domains: vec![],
-            providers: vec![],
-            exclude_noise_ids: false,
-            formats: vec![],
-        };
-        let entries = build_guided_entries(&opts);
-        assert!(
-            !entries
-                .iter()
-                .any(|e| e.label.as_deref() == Some("container_id_short")),
-            "balanced preset should not include container_id_short"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // validate_args: additional cases
     // -----------------------------------------------------------------------
@@ -882,6 +691,63 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn validate_args_rejects_non_http_llm_endpoint() {
+        for bad in ["file:///etc/passwd", "ftp://host/v1", "javascript:alert(1)", "//host/v1"] {
+            let mut cli = real_file_cli();
+            cli.llm = Some("troubleshoot".into());
+            cli.llm_endpoint = Some(bad.into());
+            cli.llm_model = Some("test-model".into());
+            let err = validate_args(&cli).unwrap_err();
+            assert!(
+                err.contains("http://") || err.contains("https://"),
+                "expected scheme error for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_args_rejects_llm_endpoint_without_model() {
+        let mut cli = real_file_cli();
+        cli.llm = Some("troubleshoot".into());
+        cli.llm_endpoint = Some("http://localhost:11434/v1".into());
+        // llm_model intentionally left None
+        let err = validate_args(&cli).unwrap_err();
+        assert!(err.contains("llm-model"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_args_accepts_valid_llm_endpoint() {
+        for scheme in ["http://localhost:11434/v1", "https://api.openai.com/v1"] {
+            let mut cli = real_file_cli();
+            cli.llm = Some("troubleshoot".into());
+            cli.llm_endpoint = Some(scheme.into());
+            cli.llm_model = Some("phi4-mini".into());
+            assert!(
+                validate_args(&cli).is_ok(),
+                "valid endpoint {scheme:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_endpoint_scheme_rejects_non_http() {
+        for bad in ["file:///etc/passwd", "ftp://host", "javascript:x", "//host"] {
+            assert!(
+                crate::llm_client::validate_endpoint_scheme(bad).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_endpoint_scheme_accepts_http_and_https() {
+        assert!(crate::llm_client::validate_endpoint_scheme("http://localhost:11434/v1").is_ok());
+        assert!(
+            crate::llm_client::validate_endpoint_scheme("https://api.openai.com/v1").is_ok()
+        );
     }
 
     #[test]

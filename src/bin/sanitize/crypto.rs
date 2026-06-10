@@ -136,17 +136,6 @@ pub(crate) fn resolve_sanitize_password(cli: &Cli) -> Result<Zeroizing<String>, 
     resolve_password(cli.password, &cli.password_file, "secrets decryption")
 }
 
-pub(crate) fn prompt_confirm_password() -> Result<Zeroizing<String>, String> {
-    loop {
-        let pw1 = prompt_password("encryption")?;
-        let pw2 = prompt_password("encryption (confirm)")?;
-        if pw1 == pw2 {
-            return Ok(pw1);
-        }
-        eprintln!("Passwords did not match. Try again.");
-    }
-}
-
 pub(crate) fn run_encrypt(args: &EncryptArgs) -> Result<(), (String, i32)> {
     let validate = args.validate && !args._no_validate;
 

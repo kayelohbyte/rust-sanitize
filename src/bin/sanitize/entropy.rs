@@ -326,3 +326,364 @@ impl io::Seek for NullSeekWriter {
         Ok(self.pos)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_sanitize::{MappingStore, RandomGenerator};
+    use rust_sanitize::secrets::SecretEntry;
+    use std::sync::Arc;
+
+    fn test_store() -> Arc<MappingStore> {
+        Arc::new(MappingStore::new(Arc::new(RandomGenerator::default()), None))
+    }
+
+    fn make_entropy_entry(
+        label: Option<&str>,
+        min: Option<usize>,
+        max: Option<usize>,
+        threshold: Option<f64>,
+        charset: Option<&str>,
+    ) -> SecretEntry {
+        SecretEntry {
+            pattern: String::new(),
+            kind: "entropy".into(),
+            category: "auth_token".into(),
+            label: label.map(|s| s.into()),
+            values: vec![],
+            min_length: min,
+            max_length: max,
+            threshold,
+            charset: charset.map(|s| s.into()),
+        }
+    }
+
+    // ── EntropyCharset::from_str ─────────────────────────────────────────────
+
+    #[test]
+    fn charset_from_str_all_variants() {
+        assert_eq!(EntropyCharset::from_str("base64"), EntropyCharset::Base64);
+        assert_eq!(EntropyCharset::from_str("hex"), EntropyCharset::Hex);
+        assert_eq!(EntropyCharset::from_str("any"), EntropyCharset::Any);
+        assert_eq!(
+            EntropyCharset::from_str("alphanumeric"),
+            EntropyCharset::Alphanumeric
+        );
+        assert_eq!(
+            EntropyCharset::from_str("unknown"),
+            EntropyCharset::Alphanumeric,
+            "unrecognised values default to alphanumeric"
+        );
+    }
+
+    // ── EntropyCharset::describe ─────────────────────────────────────────────
+
+    #[test]
+    fn charset_describe_all_variants() {
+        assert_eq!(EntropyCharset::Alphanumeric.describe(), "alphanumeric");
+        assert_eq!(EntropyCharset::Base64.describe(), "base64");
+        assert_eq!(EntropyCharset::Hex.describe(), "hex");
+        assert_eq!(EntropyCharset::Any.describe(), "any printable");
+    }
+
+    // ── EntropyCharset::matches_all ──────────────────────────────────────────
+
+    #[test]
+    fn alphanumeric_accepts_alnum_rejects_special() {
+        assert!(EntropyCharset::Alphanumeric.matches_all(b"abc123XYZ"));
+        assert!(!EntropyCharset::Alphanumeric.matches_all(b"abc+def"));
+        assert!(!EntropyCharset::Alphanumeric.matches_all(b"abc/def"));
+    }
+
+    #[test]
+    fn base64_accepts_valid_chars_rejects_invalid() {
+        assert!(EntropyCharset::Base64.matches_all(b"abc+/=XYZ012"));
+        assert!(!EntropyCharset::Base64.matches_all(b"abc!"));
+        assert!(!EntropyCharset::Base64.matches_all(b"abc "));
+    }
+
+    #[test]
+    fn hex_accepts_hex_digits_rejects_others() {
+        assert!(EntropyCharset::Hex.matches_all(b"0123456789abcdefABCDEF"));
+        assert!(!EntropyCharset::Hex.matches_all(b"0xdeadbeefg"));
+        assert!(!EntropyCharset::Hex.matches_all(b"xyz"));
+    }
+
+    #[test]
+    fn any_accepts_printable_rejects_control_chars() {
+        assert!(EntropyCharset::Any.matches_all(b"hello!@#$%^&*()-+="));
+        assert!(!EntropyCharset::Any.matches_all(b"hello\x00world"));
+        assert!(!EntropyCharset::Any.matches_all(b"hello\x01world"));
+        assert!(!EntropyCharset::Any.matches_all(b"hello\x1bworld"));
+    }
+
+    #[test]
+    fn empty_slice_matches_all_charsets() {
+        assert!(EntropyCharset::Alphanumeric.matches_all(b""));
+        assert!(EntropyCharset::Base64.matches_all(b""));
+        assert!(EntropyCharset::Hex.matches_all(b""));
+        assert!(EntropyCharset::Any.matches_all(b""));
+    }
+
+    // ── EntropyBuckets::merge ────────────────────────────────────────────────
+
+    #[test]
+    fn buckets_merge_sums_counts_and_total() {
+        let mut a = EntropyBuckets {
+            counts: [1, 2, 3, 4, 5, 6],
+            total_candidates: 10,
+            label: "a".into(),
+            configured_threshold: 4.5,
+            min_length: 20,
+            max_length: 200,
+            charset_desc: "alphanumeric",
+        };
+        let b = EntropyBuckets {
+            counts: [10, 20, 30, 40, 50, 60],
+            total_candidates: 5,
+            label: "b".into(),
+            configured_threshold: 4.5,
+            min_length: 20,
+            max_length: 200,
+            charset_desc: "alphanumeric",
+        };
+        a.merge(&b);
+        assert_eq!(a.counts, [11, 22, 33, 44, 55, 66]);
+        assert_eq!(a.total_candidates, 15);
+    }
+
+    // ── entropy_histogram_bytes ──────────────────────────────────────────────
+
+    #[test]
+    fn histogram_empty_input_zero_candidates() {
+        let result = entropy_histogram_bytes(b"", &[EntropyConfig::default()]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].total_candidates, 0);
+        assert_eq!(result[0].counts, [0u64; 6]);
+    }
+
+    #[test]
+    fn histogram_empty_configs_returns_empty_vec() {
+        let result = entropy_histogram_bytes(b"AKIAIOSFODNN7EXAMPLE", &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn histogram_token_too_short_not_counted() {
+        let cfg = EntropyConfig {
+            min_length: 50,
+            ..EntropyConfig::default()
+        };
+        let result = entropy_histogram_bytes(b"AKIAIOSFODNN7EXAMPLE", &[cfg]);
+        assert_eq!(result[0].total_candidates, 0);
+    }
+
+    #[test]
+    fn histogram_high_entropy_token_bucketed() {
+        let cfg = EntropyConfig {
+            min_length: 20,
+            max_length: 200,
+            threshold: 4.5,
+            ..EntropyConfig::default()
+        };
+        let result = entropy_histogram_bytes(b"AKIAIOSFODNN7EXAMPLE", &[cfg]);
+        assert!(result[0].total_candidates >= 1, "token should be a candidate");
+        // 3.0-bit bucket should be set
+        assert!(result[0].counts[0] >= 1, "should have a count at >=3.0 bits");
+    }
+
+    #[test]
+    fn histogram_charset_filters_non_matching_tokens() {
+        let cfg = EntropyConfig {
+            min_length: 3,
+            max_length: 200,
+            charset: EntropyCharset::Hex,
+            ..EntropyConfig::default()
+        };
+        // "hello" contains non-hex chars, "deadbeef" is valid hex
+        let result = entropy_histogram_bytes(b"hello deadbeef", &[cfg]);
+        // "deadbeef" (8 chars, all hex) should be counted; "hello" should not
+        // min_length is 3 so deadbeef qualifies
+        assert_eq!(result[0].total_candidates, 1, "only hex token should be a candidate");
+    }
+
+    // ── entropy_configs_from_entries ─────────────────────────────────────────
+
+    #[test]
+    fn configs_from_entries_ignores_non_entropy_kinds() {
+        let entries = vec![SecretEntry {
+            pattern: "foo".into(),
+            kind: "regex".into(),
+            category: "auth_token".into(),
+            label: None,
+            values: vec![],
+            min_length: None,
+            max_length: None,
+            threshold: None,
+            charset: None,
+        }];
+        assert!(entropy_configs_from_entries(&entries).is_empty());
+    }
+
+    #[test]
+    fn configs_from_entries_extracts_all_fields() {
+        let entries = vec![make_entropy_entry(
+            Some("my_token"),
+            Some(16),
+            Some(64),
+            Some(4.0),
+            Some("hex"),
+        )];
+        let configs = entropy_configs_from_entries(&entries);
+        assert_eq!(configs.len(), 1);
+        let cfg = &configs[0];
+        assert_eq!(cfg.label, "my_token");
+        assert_eq!(cfg.min_length, 16);
+        assert_eq!(cfg.max_length, 64);
+        assert_eq!(cfg.threshold, 4.0);
+        assert_eq!(cfg.charset, EntropyCharset::Hex);
+    }
+
+    #[test]
+    fn configs_from_entries_applies_defaults() {
+        let entries = vec![make_entropy_entry(None, None, None, None, None)];
+        let configs = entropy_configs_from_entries(&entries);
+        assert_eq!(configs.len(), 1);
+        let cfg = &configs[0];
+        assert_eq!(cfg.min_length, 20);
+        assert_eq!(cfg.max_length, 200);
+        assert_eq!(cfg.threshold, 4.5);
+        assert_eq!(cfg.charset, EntropyCharset::Alphanumeric);
+        assert_eq!(cfg.label, "high_entropy_token");
+    }
+
+    // ── entropy_scan_bytes ───────────────────────────────────────────────────
+
+    #[test]
+    fn scan_bytes_empty_input_returns_empty() {
+        let (out, counts) = entropy_scan_bytes(b"", &[EntropyConfig::default()], &test_store());
+        assert!(out.is_empty());
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn scan_bytes_empty_configs_passthrough() {
+        let input = b"AKIAIOSFODNN7EXAMPLE";
+        let (out, counts) = entropy_scan_bytes(input, &[], &test_store());
+        assert_eq!(out, input);
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn scan_bytes_token_too_short_not_replaced() {
+        let cfg = EntropyConfig {
+            min_length: 100,
+            ..EntropyConfig::default()
+        };
+        let input = b"AKIAIOSFODNN7EXAMPLE";
+        let (out, counts) = entropy_scan_bytes(input, &[cfg], &test_store());
+        assert_eq!(out, input);
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn scan_bytes_replaces_high_entropy_token() {
+        let cfg = EntropyConfig {
+            min_length: 20,
+            max_length: 200,
+            threshold: 3.5,
+            ..EntropyConfig::default()
+        };
+        // 20-char mixed-case+digit token with decent Shannon entropy
+        let input = b"token=AKIAIOSFODNN7EXAMPLE end";
+        let (out, counts) = entropy_scan_bytes(input, &[cfg], &test_store());
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            !s.contains("AKIAIOSFODNN7EXAMPLE"),
+            "high-entropy token should be replaced; got: {s}"
+        );
+        assert_eq!(*counts.get("high_entropy_token").unwrap_or(&0), 1);
+    }
+
+    #[test]
+    fn scan_bytes_preserves_surrounding_text_and_delimiters() {
+        let cfg = EntropyConfig {
+            min_length: 100,
+            ..EntropyConfig::default()
+        };
+        let input = b"key=value foo bar\n";
+        let (out, _) = entropy_scan_bytes(input, &[cfg], &test_store());
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn scan_bytes_non_matching_charset_not_replaced() {
+        let cfg = EntropyConfig {
+            min_length: 20,
+            max_length: 200,
+            threshold: 3.5,
+            charset: EntropyCharset::Hex,
+        ..EntropyConfig::default()
+        };
+        // AKIAIOSFODNN7EXAMPLE contains non-hex chars (G, H, etc.)
+        let input = b"AKIAIOSFODNN7EXAMPLE";
+        let (out, counts) = entropy_scan_bytes(input, &[cfg], &test_store());
+        assert_eq!(out, input, "non-hex token should not be replaced by hex config");
+        assert!(counts.is_empty());
+    }
+
+    // ── NullSeekWriter ───────────────────────────────────────────────────────
+
+    #[test]
+    fn null_seek_writer_write_advances_position_and_length() {
+        use std::io::Write;
+        let mut w = NullSeekWriter { pos: 0, len: 0 };
+        let n = w.write(b"hello world").unwrap();
+        assert_eq!(n, 11);
+        assert_eq!(w.pos, 11);
+        assert_eq!(w.len, 11);
+        w.flush().unwrap();
+    }
+
+    #[test]
+    fn null_seek_writer_seek_from_start() {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut w = NullSeekWriter { pos: 0, len: 0 };
+        w.write_all(b"hello world").unwrap(); // pos=11, len=11
+        let pos = w.seek(SeekFrom::Start(3)).unwrap();
+        assert_eq!(pos, 3);
+        assert_eq!(w.pos, 3);
+        assert_eq!(w.len, 11, "len unchanged by backward seek");
+    }
+
+    #[test]
+    fn null_seek_writer_seek_from_current_positive_and_negative() {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut w = NullSeekWriter { pos: 0, len: 0 };
+        w.write_all(b"hello").unwrap(); // pos=5
+        let pos = w.seek(SeekFrom::Current(3)).unwrap();
+        assert_eq!(pos, 8);
+        let pos = w.seek(SeekFrom::Current(-4)).unwrap();
+        assert_eq!(pos, 4);
+    }
+
+    #[test]
+    fn null_seek_writer_seek_from_end() {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut w = NullSeekWriter { pos: 0, len: 0 };
+        w.write_all(b"hello world").unwrap(); // len=11
+        let pos = w.seek(SeekFrom::End(-2)).unwrap();
+        assert_eq!(pos, 9);
+        let pos = w.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(pos, 11);
+    }
+
+    #[test]
+    fn null_seek_writer_seek_beyond_end_extends_len() {
+        use std::io::{Seek, SeekFrom};
+        let mut w = NullSeekWriter { pos: 0, len: 5 };
+        let pos = w.seek(SeekFrom::Start(10)).unwrap();
+        assert_eq!(pos, 10);
+        assert_eq!(w.len, 10, "seeking past end should extend len");
+    }
+}

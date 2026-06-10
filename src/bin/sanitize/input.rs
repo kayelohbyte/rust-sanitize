@@ -818,6 +818,25 @@ pub(crate) fn validate_args(cli: &Cli) -> Result<(), String> {
         }
     }
 
+    for (i, p) in cli.quick.iter().enumerate() {
+        let bare = p.strip_prefix("regex:").unwrap_or(p.as_str());
+        if bare.is_empty() {
+            return Err(format!("--quick: pattern at position {i} is empty"));
+        }
+    }
+
+    if let Some(ref endpoint) = cli.llm_endpoint {
+        crate::llm_client::validate_endpoint_scheme(endpoint)?;
+    }
+
+    if cli.llm_endpoint.is_some() && cli.llm_model.is_none() {
+        return Err(
+            "--llm-endpoint requires --llm-model (or SANITIZE_LLM_MODEL).\n\
+             Example: --llm-model phi4-mini"
+                .into(),
+        );
+    }
+
     Ok(())
 }
 

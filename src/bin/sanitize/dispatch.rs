@@ -1752,4 +1752,68 @@ mod tests {
             "malformed YAML should return an error, not silently lose data"
         );
     }
+
+    // ── looks_binary ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn looks_binary_detects_null_byte() {
+        assert!(looks_binary(b"hello\x00world"));
+    }
+
+    #[test]
+    fn looks_binary_detects_high_control_char_ratio() {
+        // Build a buffer where >10% of bytes are non-text control chars.
+        let mut data = vec![0x01u8; 60]; // SOH — control char, not \n/\r/\t
+        data.extend_from_slice(&[b'a'; 40]);
+        assert!(looks_binary(&data), "60% control chars should look binary");
+    }
+
+    #[test]
+    fn looks_binary_passes_plain_text() {
+        let text = b"key = \"some value\"\nfoo = bar\npath = /tmp/file.txt\n";
+        assert!(!looks_binary(text));
+    }
+
+    #[test]
+    fn looks_binary_passes_text_with_tabs_and_cr() {
+        let text = b"col1\tcol2\r\nval1\tval2\r\n";
+        assert!(!looks_binary(text), "tabs and CR should not count as binary");
+    }
+
+    #[test]
+    fn looks_binary_samples_only_first_512_bytes() {
+        // Put NUL after position 512 — should not be detected.
+        let mut data = vec![b'a'; 600];
+        data[513] = 0x00;
+        assert!(
+            !looks_binary(&data),
+            "NUL after byte 512 should not trigger binary detection"
+        );
+    }
+
+    // ── merge_entropy_counts ─────────────────────────────────────────────────
+
+    #[test]
+    fn merge_entropy_counts_adds_to_stats() {
+        use rust_sanitize::ScanStats;
+        let mut stats = ScanStats::default();
+        let mut counts = HashMap::new();
+        counts.insert("high_entropy_token".to_string(), 3u64);
+        counts.insert("other_label".to_string(), 2u64);
+        merge_entropy_counts(&mut stats, counts);
+        assert_eq!(stats.matches_found, 5);
+        assert_eq!(stats.replacements_applied, 5);
+        assert_eq!(stats.pattern_counts["high_entropy_token"], 3);
+        assert_eq!(stats.pattern_counts["other_label"], 2);
+    }
+
+    #[test]
+    fn merge_entropy_counts_empty_map_is_noop() {
+        use rust_sanitize::ScanStats;
+        let mut stats = ScanStats::default();
+        merge_entropy_counts(&mut stats, HashMap::new());
+        assert_eq!(stats.matches_found, 0);
+        assert_eq!(stats.replacements_applied, 0);
+        assert!(stats.pattern_counts.is_empty());
+    }
 }
