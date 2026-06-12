@@ -63,32 +63,7 @@ pub(crate) fn has_stdin_input(cli: &Cli) -> bool {
     cli.input.is_empty() || cli.input.iter().any(|p| p.as_os_str() == "-")
 }
 
-/// Returns `true` when stdin is an OS-level pipe (FIFO).
-#[cfg(unix)]
-fn stdin_is_pipe() -> bool {
-    use nix::sys::stat::fstat;
-    use std::os::unix::io::AsRawFd;
-    fstat(io::stdin().as_raw_fd())
-        .map(|s| {
-            nix::sys::stat::SFlag::from_bits_truncate(s.st_mode)
-                .contains(nix::sys::stat::SFlag::S_IFIFO)
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn stdin_is_pipe() -> bool {
-    use std::os::windows::io::AsRawHandle;
-    extern "system" {
-        fn GetFileType(hFile: *mut std::ffi::c_void) -> u32;
-    }
-    const FILE_TYPE_PIPE: u32 = 3;
-    let handle = io::stdin().as_raw_handle();
-    // SAFETY: stdin handle is valid for the lifetime of the process.
-    unsafe { GetFileType(handle as *mut _) == FILE_TYPE_PIPE }
-}
-
-#[cfg(not(any(unix, windows)))]
+/// Returns `true` when stdin is not connected to a terminal (pipe, redirect, etc.).
 fn stdin_is_pipe() -> bool {
     !io::stdin().is_terminal()
 }

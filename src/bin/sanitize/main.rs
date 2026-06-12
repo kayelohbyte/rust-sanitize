@@ -58,6 +58,8 @@
 //! is no restore mode. Re-running with the `--deterministic` flag and the
 //! same secrets will produce identical replacements.
 
+#![forbid(unsafe_code)]
+
 mod apps;
 mod cli_args;
 mod commands;

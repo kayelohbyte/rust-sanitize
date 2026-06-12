@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Zero `unsafe` code across the entire codebase** — replaced the
+  platform-specific `stdin_is_pipe` implementations (Unix `fstat`/`S_IFIFO` and
+  a hand-rolled `GetFileType` FFI call on Windows) with `std::io::IsTerminal`,
+  which is safe and cross-platform. `#![forbid(unsafe_code)]` is now enforced on
+  both the library crate and the binary crate.
+
 ## [0.13.0] - 2026-06-12
 
 ### Added
