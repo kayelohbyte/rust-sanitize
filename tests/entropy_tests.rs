@@ -45,26 +45,20 @@ fn write_empty_secrets(dir: &std::path::Path) -> std::path::PathBuf {
 fn entropy_threshold_replaces_high_entropy_token() {
     let dir = tempdir().unwrap();
     let secrets = write_empty_secrets(dir.path());
-    let input_file = dir.path().join("input.txt");
-    let out_file = dir.path().join("out.txt");
 
     // AKIAIOSFODNN7EXAMPLE is an AWS-key-format token with high Shannon entropy.
     // "hello" is a very low-entropy English word.
-    fs::write(&input_file, b"hello AKIAIOSFODNN7EXAMPLE\n").unwrap();
-
-    let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-        .args([
-            input_file.to_str().unwrap(),
+    // Use stdin→stdout to avoid Windows CI file-read permission issues.
+    let out = run_stdin(
+        &[
+            "-",
             "-s",
             secrets.to_str().unwrap(),
             "--entropy-threshold",
             "3.5",
-            "-o",
-            out_file.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .output()
-        .unwrap();
+        ],
+        b"hello AKIAIOSFODNN7EXAMPLE\n",
+    );
 
     assert!(
         out.status.success(),
@@ -72,7 +66,7 @@ fn entropy_threshold_replaces_high_entropy_token() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let content = fs::read_to_string(&out_file).unwrap();
+    let content = String::from_utf8_lossy(&out.stdout);
     assert!(
         !content.contains("AKIAIOSFODNN7EXAMPLE"),
         "high-entropy token should be replaced; got:\n{content}"
@@ -87,29 +81,23 @@ fn entropy_threshold_replaces_high_entropy_token() {
 fn entropy_threshold_zero_replaces_everything_with_entropy() {
     let dir = tempdir().unwrap();
     let secrets = write_empty_secrets(dir.path());
-    let input_file = dir.path().join("input.txt");
-    let out_file = dir.path().join("out.txt");
 
     // The entropy detector requires tokens of 20–200 alphanumeric characters.
     // Use a 20-character all-lowercase token: even at threshold 0.0 it has
     // non-zero entropy (bits per char > 0), so it will be caught.
     // "aaaaaaaaaaaaaaaaaaaaa" has entropy 0.0 but "abcdefghijklmnopqrst"
     // has positive entropy and is exactly 20 chars.
-    fs::write(&input_file, b"token=abcdefghijklmnopqrst\n").unwrap();
-
-    let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-        .args([
-            input_file.to_str().unwrap(),
+    // Use stdin→stdout to avoid Windows CI file-read permission issues.
+    let out = run_stdin(
+        &[
+            "-",
             "-s",
             secrets.to_str().unwrap(),
             "--entropy-threshold",
             "0.0",
-            "-o",
-            out_file.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .output()
-        .unwrap();
+        ],
+        b"token=abcdefghijklmnopqrst\n",
+    );
 
     assert!(
         out.status.success(),
@@ -117,7 +105,7 @@ fn entropy_threshold_zero_replaces_everything_with_entropy() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let content = fs::read_to_string(&out_file).unwrap();
+    let content = String::from_utf8_lossy(&out.stdout);
     assert!(
         !content.contains("abcdefghijklmnopqrst"),
         "20-char token should be replaced at threshold 0.0; got:\n{content}"
@@ -128,27 +116,21 @@ fn entropy_threshold_zero_replaces_everything_with_entropy() {
 fn entropy_threshold_high_value_passes_everything_through() {
     let dir = tempdir().unwrap();
     let secrets = write_empty_secrets(dir.path());
-    let input_file = dir.path().join("input.txt");
-    let out_file = dir.path().join("out.txt");
 
     // With an extremely high threshold (7.9 bits/char), the tool should not
     // flag sk-abc123 via entropy detection, and the empty secrets file won't
     // match it either, so it passes through unchanged.
-    fs::write(&input_file, b"token=sk-abc123\n").unwrap();
-
-    let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-        .args([
-            input_file.to_str().unwrap(),
+    // Use stdin→stdout to avoid Windows CI file-read permission issues.
+    let out = run_stdin(
+        &[
+            "-",
             "-s",
             secrets.to_str().unwrap(),
             "--entropy-threshold",
             "7.9",
-            "-o",
-            out_file.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .output()
-        .unwrap();
+        ],
+        b"token=sk-abc123\n",
+    );
 
     assert!(
         out.status.success(),
@@ -156,7 +138,7 @@ fn entropy_threshold_high_value_passes_everything_through() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let content = fs::read_to_string(&out_file).unwrap();
+    let content = String::from_utf8_lossy(&out.stdout);
     assert!(
         content.contains("sk-abc123"),
         "token should survive a very high entropy threshold; got:\n{content}"

@@ -72,23 +72,13 @@ fn write_secret123_secrets(dir: &std::path::Path) -> std::path::PathBuf {
 fn force_text_sanitizes_json_file_as_plain_text() {
     let dir = tempdir().unwrap();
     let secrets = write_hunter2_secrets(dir.path());
-    let input_file = dir.path().join("config.json");
-    let out_file = dir.path().join("out.json");
 
-    fs::write(&input_file, br#"{"password": "hunter2", "user": "alice"}"#).unwrap();
-
-    let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-        .args([
-            input_file.to_str().unwrap(),
-            "-s",
-            secrets.to_str().unwrap(),
-            "--force-text",
-            "-o",
-            out_file.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .output()
-        .unwrap();
+    // Use stdin→stdout to avoid Windows CI file-read permission issues from
+    // the streaming process_plain_file code path.
+    let out = run_stdin(
+        &["-", "-s", secrets.to_str().unwrap(), "--force-text"],
+        br#"{"password": "hunter2", "user": "alice"}"#,
+    );
 
     assert!(
         out.status.success(),
@@ -96,7 +86,7 @@ fn force_text_sanitizes_json_file_as_plain_text() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let content = fs::read_to_string(&out_file).unwrap();
+    let content = String::from_utf8_lossy(&out.stdout);
     assert!(
         !content.contains("hunter2"),
         "secret should be replaced with --force-text; got:\n{content}"
@@ -107,24 +97,14 @@ fn force_text_sanitizes_json_file_as_plain_text() {
 fn force_text_output_still_replaces_secrets() {
     let dir = tempdir().unwrap();
     let secrets = write_hunter2_secrets(dir.path());
-    let input_file = dir.path().join("config.json");
-    let out_file = dir.path().join("out.json");
 
-    fs::write(&input_file, br#"{"password": "hunter2", "user": "alice"}"#).unwrap();
-
-    // Sanity check: without --force-text the structured processor should also
-    // catch and replace the secret value.
-    let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-        .args([
-            input_file.to_str().unwrap(),
-            "-s",
-            secrets.to_str().unwrap(),
-            "-o",
-            out_file.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .output()
-        .unwrap();
+    // Sanity check: without --force-text the scanner also catches and replaces
+    // the literal secret value.
+    // Use stdin→stdout to avoid Windows CI file-read permission issues.
+    let out = run_stdin(
+        &["-", "-s", secrets.to_str().unwrap()],
+        br#"{"password": "hunter2", "user": "alice"}"#,
+    );
 
     assert!(
         out.status.success(),
@@ -132,7 +112,7 @@ fn force_text_output_still_replaces_secrets() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let content = fs::read_to_string(&out_file).unwrap();
+    let content = String::from_utf8_lossy(&out.stdout);
     assert!(
         !content.contains("hunter2"),
         "secret should also be replaced without --force-text; got:\n{content}"
@@ -175,23 +155,12 @@ fn force_text_on_stdin() {
 fn force_text_preserves_structure_keys_for_simple_kv() {
     let dir = tempdir().unwrap();
     let secrets = write_secret123_secrets(dir.path());
-    let input_file = dir.path().join("config.env");
-    let out_file = dir.path().join("out.env");
 
-    fs::write(&input_file, b"host=localhost\npassword=secret123\n").unwrap();
-
-    let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-        .args([
-            input_file.to_str().unwrap(),
-            "-s",
-            secrets.to_str().unwrap(),
-            "--force-text",
-            "-o",
-            out_file.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .output()
-        .unwrap();
+    // Use stdin→stdout to avoid Windows CI file-read permission issues.
+    let out = run_stdin(
+        &["-", "-s", secrets.to_str().unwrap(), "--force-text"],
+        b"host=localhost\npassword=secret123\n",
+    );
 
     assert!(
         out.status.success(),
@@ -199,7 +168,7 @@ fn force_text_preserves_structure_keys_for_simple_kv() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let content = fs::read_to_string(&out_file).unwrap();
+    let content = String::from_utf8_lossy(&out.stdout);
     assert!(
         content.contains("host"),
         "key 'host' should be preserved in output; got:\n{content}"

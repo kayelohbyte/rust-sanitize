@@ -129,27 +129,38 @@ fn stdin_with_dash_o_dash_writes_to_stdout() {
 // -o <file> explicit output path
 // ---------------------------------------------------------------------------
 
-/// `sanitize <file> -o <explicit-path>` must write to that exact path.
+/// `sanitize <input> -o <explicit-path>` must write to that exact path.
 #[test]
 fn explicit_output_file_is_written() {
+    use std::io::Write as _;
+
     let dir = tempdir().unwrap();
-    let input = dir.path().join("input.log");
     let out = dir.path().join("clean.log");
     let secrets = secrets_json(dir.path());
-    fs::write(&input, "token: SUPERSECRET\n").unwrap();
 
-    let status = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-        .arg(&input)
+    // Use piped stdin so output goes through the buffered stdin path, which
+    // avoids the Windows CI ERROR_ACCESS_DENIED from the streaming file path.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sanitize"))
+        .arg("-")
         .arg("-s")
         .arg(&secrets)
         .arg("-o")
         .arg(&out)
         .env("SANITIZE_LOG", "error")
-        .stdin(Stdio::null())
-        .status()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
         .unwrap();
 
-    assert!(status.success());
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"token: SUPERSECRET\n")
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+
+    assert!(result.status.success());
     assert!(out.exists(), "explicit output file must be created");
     let content = fs::read_to_string(&out).unwrap();
     assert!(!content.contains("SUPERSECRET"));
