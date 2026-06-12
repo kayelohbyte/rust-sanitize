@@ -178,19 +178,20 @@ fn entropy_threshold_works_on_stdin() {
     );
 }
 
+// NOTE: input is piped via stdin to avoid the Windows CI ACCESS_DENIED race
+// on the AtomicFileWriter output.  The AWS-shaped token `AKIAIOSFODNN7EXAMPLE`
+// triggers Defender's credential-detection heuristic on the input file path,
+// which cascades to the output file lock.  See commit ad06f8f.
 #[test]
 fn entropy_report_counts_entropy_matches() {
     let dir = tempdir().unwrap();
     let secrets = write_empty_secrets(dir.path());
-    let input_file = dir.path().join("input.txt");
     let out_file = dir.path().join("out.txt");
     let report_file = dir.path().join("report.json");
 
-    fs::write(&input_file, b"AKIAIOSFODNN7EXAMPLE\n").unwrap();
-
-    let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-        .args([
-            input_file.to_str().unwrap(),
+    let out = run_stdin(
+        &[
+            "-",
             "-s",
             secrets.to_str().unwrap(),
             "--entropy-threshold",
@@ -199,10 +200,9 @@ fn entropy_report_counts_entropy_matches() {
             out_file.to_str().unwrap(),
             "--report",
             report_file.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .output()
-        .unwrap();
+        ],
+        b"AKIAIOSFODNN7EXAMPLE\n",
+    );
 
     assert!(
         out.status.success(),

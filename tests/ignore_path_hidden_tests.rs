@@ -19,7 +19,7 @@ use tempfile::tempdir;
 /// token used across these tests.
 const SECRETS_JSON: &[u8] = br#"[
   {
-    "pattern": "secret-token-abc123",
+    "pattern": "SUPERSECRET",
     "kind": "literal",
     "category": "custom:test",
     "label": "test_token"
@@ -44,8 +44,8 @@ fn ignore_path_excludes_matched_file() {
     // Two files with the same sensitive token.
     let keep = dir.path().join("keep.log");
     let skip = dir.path().join("skip.log");
-    fs::write(&keep, b"secret-token-abc123\n").unwrap();
-    fs::write(&skip, b"secret-token-abc123\n").unwrap();
+    fs::write(&keep, b"SUPERSECRET\n").unwrap();
+    fs::write(&skip, b"SUPERSECRET\n").unwrap();
 
     let out_dir = dir.path().join("outdir");
     fs::create_dir_all(&out_dir).unwrap();
@@ -82,7 +82,7 @@ fn ignore_path_excludes_matched_file() {
     );
     let keep_content = fs::read_to_string(&keep_out).unwrap();
     assert!(
-        !keep_content.contains("secret-token-abc123"),
+        !keep_content.contains("SUPERSECRET"),
         "token should be replaced in keep.log; got:\n{keep_content}"
     );
 
@@ -104,12 +104,12 @@ fn ignore_path_glob_excludes_subtree() {
     fs::create_dir_all(dir.path().join("fixtures")).unwrap();
     fs::write(
         dir.path().join("logs").join("app.log"),
-        b"secret-token-abc123\n",
+        b"SUPERSECRET\n",
     )
     .unwrap();
     fs::write(
         dir.path().join("fixtures").join("test.log"),
-        b"secret-token-abc123\n",
+        b"SUPERSECRET\n",
     )
     .unwrap();
 
@@ -146,7 +146,7 @@ fn ignore_path_glob_excludes_subtree() {
     assert!(app_out.exists(), "logs/app.log should be present in outdir");
     let app_content = fs::read_to_string(&app_out).unwrap();
     assert!(
-        !app_content.contains("secret-token-abc123"),
+        !app_content.contains("SUPERSECRET"),
         "token should be replaced in logs/app.log; got:\n{app_content}"
     );
 
@@ -165,7 +165,7 @@ fn hidden_flag_walks_dotfiles() {
 
     let hidden_file = dir.path().join(".hidden_config");
     let normal_file = dir.path().join("normal.log");
-    fs::write(&hidden_file, b"secret-token-abc123\n").unwrap();
+    fs::write(&hidden_file, b"SUPERSECRET\n").unwrap();
     fs::write(&normal_file, b"safe\n").unwrap();
 
     // --- Run WITHOUT --hidden ---
@@ -225,7 +225,7 @@ fn hidden_flag_walks_dotfiles() {
     );
     let hidden_content = fs::read_to_string(&hidden_out).unwrap();
     assert!(
-        !hidden_content.contains("secret-token-abc123"),
+        !hidden_content.contains("SUPERSECRET"),
         "token should be replaced in .hidden_config; got:\n{hidden_content}"
     );
 }
@@ -239,7 +239,7 @@ fn hidden_skipped_by_default() {
     let secrets = write_secrets(secrets_dir.path());
 
     // Only file in the input directory is a hidden file.
-    fs::write(input_dir.path().join(".env"), b"secret-token-abc123\n").unwrap();
+    fs::write(input_dir.path().join(".env"), b"SUPERSECRET\n").unwrap();
 
     let out_dir = input_dir.path().join("outdir");
     fs::create_dir_all(&out_dir).unwrap();

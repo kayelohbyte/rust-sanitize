@@ -13,7 +13,7 @@ fn secrets_file(dir: &std::path::Path) -> std::path::PathBuf {
     let p = dir.join("secrets.json");
     fs::write(
         &p,
-        r#"[{"pattern":"MYSECRET","kind":"literal","category":"custom:token","label":"token"}]"#,
+        r#"[{"pattern":"SUPERSECRET","kind":"literal","category":"custom:token","label":"token"}]"#,
     )
     .unwrap();
     p
@@ -52,7 +52,7 @@ fn llm_reference_mode_with_output_writes_file_and_lists_path() {
     let s = secrets_file(dir.path());
     let input = dir.path().join("in.log");
     let output = dir.path().join("out.log");
-    fs::write(&input, "value MYSECRET end\n").unwrap();
+    fs::write(&input, "value SUPERSECRET end\n").unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
         .args([
@@ -79,7 +79,7 @@ fn llm_reference_mode_with_output_writes_file_and_lists_path() {
     );
     let sanitized = fs::read_to_string(&output).unwrap();
     assert!(
-        !sanitized.contains("MYSECRET"),
+        !sanitized.contains("SUPERSECRET"),
         "output file must be sanitized"
     );
     // The prompt on stdout must reference the output path, not inline content.
@@ -267,12 +267,12 @@ fn llm_sanitizes_secrets_before_including_in_prompt() {
     let s = secrets_file(dir.path());
     let out = run_stdin(
         &["-", "-s", s.to_str().unwrap(), "--llm"],
-        b"prefix MYSECRET suffix\n",
+        b"prefix SUPERSECRET suffix\n",
     );
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !stdout.contains("MYSECRET"),
+        !stdout.contains("SUPERSECRET"),
         "raw secret must not appear in prompt"
     );
     assert!(
@@ -329,7 +329,7 @@ fn llm_file_input_uses_reference_mode() {
     let dir = tempdir().unwrap();
     let s = secrets_file(dir.path());
     let input = dir.path().join("data.log");
-    fs::write(&input, "line with MYSECRET here\n").unwrap();
+    fs::write(&input, "line with SUPERSECRET here\n").unwrap();
     let expected_out = dir.path().join("data-sanitized.log");
 
     let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
@@ -350,7 +350,7 @@ fn llm_file_input_uses_reference_mode() {
     );
     let sanitized = fs::read_to_string(&expected_out).unwrap();
     assert!(
-        !sanitized.contains("MYSECRET"),
+        !sanitized.contains("SUPERSECRET"),
         "output file must be sanitized"
     );
     // Prompt must reference the file path, not inline content.

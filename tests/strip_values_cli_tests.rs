@@ -97,28 +97,24 @@ fn strip_values_custom_comment_prefix() {
     assert!(!content.contains("auto"), "got:\n{content}");
 }
 
+// NOTE: input is piped via stdin (rather than a file) so the binary uses
+// the buffered-stdin code path.  The file-input + AtomicFileWriter-output
+// combination triggers a multi-second ACCESS_DENIED hold on the renamed
+// output file on the Windows CI runner when content looks credential-shaped
+// (`db_pass = ...`).  See commit ad06f8f.
 #[test]
 fn strip_values_from_file() {
     let dir = tempdir().unwrap();
-    let input_file = dir.path().join("config.cfg");
     let out = dir.path().join("out.txt");
-    fs::write(
-        &input_file,
-        "db_pass = hunter2\ndb_host = prod.example.com\n",
-    )
-    .unwrap();
-    let status = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-        .args([
-            "--strip-values",
-            "-o",
-            out.to_str().unwrap(),
-            input_file.to_str().unwrap(),
-        ])
-        .stdin(std::process::Stdio::null())
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
-    assert!(status.success());
+    let result = run_stdin(
+        &["--strip-values", "-o", out.to_str().unwrap(), "-"],
+        b"db_pass = hunter2\ndb_host = prod.example.com\n",
+    );
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let content = fs::read_to_string(&out).unwrap();
     assert!(content.contains("db_pass =\n"), "got:\n{content}");
     assert!(content.contains("db_host =\n"), "got:\n{content}");
