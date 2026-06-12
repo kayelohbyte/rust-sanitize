@@ -3,8 +3,15 @@
 //! Covers: entropy gate (pass / fail), explicit FieldRule takes precedence,
 //! kind:allow suppresses replacement, --no-field-signal disables heuristic,
 //! user-defined kind:field-name entries via secrets file.
+//!
+//! Input is piped via stdin (with `--format` to set the processor) instead
+//! of a file: the file-input + AtomicFileWriter-output combination triggers
+//! a multi-second ACCESS_DENIED hold on the renamed destination on the
+//! Windows CI runner (Defender hooks credential-shaped content).  See
+//! commit ad06f8f for the strip_values tests that use the same workaround.
 
 use std::fs;
+use std::io::Write;
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -25,10 +32,23 @@ fn write_json_profile(dir: &tempfile::TempDir, filename: &str) -> std::path::Pat
     write_file(dir.path(), filename, content)
 }
 
-fn sanitize_cmd() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sanitize"));
-    cmd.stdin(std::process::Stdio::null());
-    cmd
+/// Run the sanitize binary with `stdin_bytes` piped via stdin.
+fn run_with_stdin(args: &[&str], stdin_bytes: &[u8]) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sanitize"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("SANITIZE_LOG", "error")
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin_bytes)
+        .unwrap();
+    child.wait_with_output().unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -39,29 +59,28 @@ fn sanitize_cmd() -> Command {
 fn high_entropy_password_field_is_replaced() {
     let dir = tempdir().unwrap();
     let profile = write_json_profile(&dir, "profile.json");
-
-    // Value has high entropy (random-looking hex string, ~4.0 bits/char).
-    let input = write_file(
-        dir.path(),
-        "config.json",
-        r#"{"password":"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"}"#,
-    );
     let output = dir.path().join("config-sanitized.json");
 
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    // Value has high entropy (random-looking hex string, ~4.0 bits/char).
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "json",
             "--profile",
             profile.to_str().unwrap(),
             "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        br#"{"password":"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"}"#,
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(
+        result.status.success(),
+        "expected exit 0; stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let out = fs::read_to_string(&output).unwrap();
     assert!(
         !out.contains("a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"),
@@ -77,25 +96,24 @@ fn high_entropy_password_field_is_replaced() {
 fn low_entropy_password_field_is_not_replaced() {
     let dir = tempdir().unwrap();
     let profile = write_json_profile(&dir, "profile.json");
-
-    // "disabled" has entropy ~2.5 bits/char — below both thresholds.
-    let input = write_file(dir.path(), "config.json", r#"{"password":"disabled"}"#);
     let output = dir.path().join("config-sanitized.json");
 
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    // "disabled" has entropy ~2.5 bits/char — below both thresholds.
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "json",
             "--profile",
             profile.to_str().unwrap(),
             "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        br#"{"password":"disabled"}"#,
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(result.status.success(), "expected exit 0");
     let out = fs::read_to_string(&output).unwrap();
     assert!(
         out.contains("\"disabled\""),
@@ -111,25 +129,24 @@ fn low_entropy_password_field_is_not_replaced() {
 fn enum_token_type_is_not_replaced() {
     let dir = tempdir().unwrap();
     let profile = write_json_profile(&dir, "profile.json");
-
-    // "Bearer" entropy ≈ 2.4 — below the medium threshold (3.5).
-    let input = write_file(dir.path(), "config.json", r#"{"token_type":"Bearer"}"#);
     let output = dir.path().join("config-sanitized.json");
 
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    // "Bearer" entropy ≈ 2.4 — below the medium threshold (3.5).
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "json",
             "--profile",
             profile.to_str().unwrap(),
             "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        br#"{"token_type":"Bearer"}"#,
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(result.status.success(), "expected exit 0");
     let out = fs::read_to_string(&output).unwrap();
     assert!(
         out.contains("\"Bearer\""),
@@ -152,28 +169,23 @@ fn explicit_field_rule_takes_precedence() {
         "fields": [{"pattern": "password", "category": "custom:explicit_rule"}]
     }]"#;
     let profile = write_file(dir.path(), "profile.json", profile_content);
-
-    let input = write_file(
-        dir.path(),
-        "config.json",
-        r#"{"password":"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"}"#,
-    );
     let output = dir.path().join("config-sanitized.json");
 
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "json",
             "--profile",
             profile.to_str().unwrap(),
             "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        br#"{"password":"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"}"#,
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(result.status.success(), "expected exit 0");
     let out = fs::read_to_string(&output).unwrap();
     // Value should be replaced (by the explicit rule, not the signal — same outcome).
     assert!(
@@ -190,30 +202,25 @@ fn explicit_field_rule_takes_precedence() {
 fn no_field_signal_disables_heuristic() {
     let dir = tempdir().unwrap();
     let profile = write_json_profile(&dir, "profile.json");
-
-    // High-entropy value on a "secret" key — would normally be flagged.
-    let input = write_file(
-        dir.path(),
-        "config.json",
-        r#"{"secret":"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"}"#,
-    );
     let output = dir.path().join("config-sanitized.json");
 
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    // High-entropy value on a "secret" key — would normally be flagged.
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "json",
             "--profile",
             profile.to_str().unwrap(),
             "--no-structured-handoff",
             "--no-field-signal",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        br#"{"secret":"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"}"#,
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(result.status.success(), "expected exit 0");
     let out = fs::read_to_string(&output).unwrap();
     assert!(
         out.contains("a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"),
@@ -239,17 +246,13 @@ fn user_defined_field_name_signal() {
         "threshold": 3.0
     }]"#;
     let secrets = write_file(dir.path(), "secrets.json", secrets_content);
-
-    let input = write_file(
-        dir.path(),
-        "config.json",
-        r#"{"db_pass":"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"}"#,
-    );
     let output = dir.path().join("config-sanitized.json");
 
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "json",
             "--profile",
             profile.to_str().unwrap(),
             "--secrets-file",
@@ -257,12 +260,11 @@ fn user_defined_field_name_signal() {
             "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        br#"{"db_pass":"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"}"#,
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(result.status.success(), "expected exit 0");
     let out = fs::read_to_string(&output).unwrap();
     assert!(
         !out.contains("a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"),
@@ -278,30 +280,25 @@ fn user_defined_field_name_signal() {
 fn compound_field_name_password_hash_is_replaced() {
     let dir = tempdir().unwrap();
     let profile = write_json_profile(&dir, "profile.json");
+    let output = dir.path().join("config-sanitized.json");
 
     // "password_hash" contains "password" — should trigger the strong signal
     // now that patterns are unanchored substring matches.
-    let input = write_file(
-        dir.path(),
-        "config.json",
-        r#"{"password_hash":"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"}"#,
-    );
-    let output = dir.path().join("config-sanitized.json");
-
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "json",
             "--profile",
             profile.to_str().unwrap(),
             "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        br#"{"password_hash":"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"}"#,
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(result.status.success(), "expected exit 0");
     let out = fs::read_to_string(&output).unwrap();
     assert!(
         !out.contains("a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"),
@@ -313,28 +310,23 @@ fn compound_field_name_password_hash_is_replaced() {
 fn compound_field_name_db_password_is_replaced() {
     let dir = tempdir().unwrap();
     let profile = write_json_profile(&dir, "profile.json");
-
-    let input = write_file(
-        dir.path(),
-        "config.json",
-        r#"{"db_password":"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"}"#,
-    );
     let output = dir.path().join("config-sanitized.json");
 
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "json",
             "--profile",
             profile.to_str().unwrap(),
             "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        br#"{"db_password":"a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"}"#,
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(result.status.success(), "expected exit 0");
     let out = fs::read_to_string(&output).unwrap();
     assert!(
         !out.contains("a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"),
@@ -346,30 +338,25 @@ fn compound_field_name_db_password_is_replaced() {
 fn compound_field_access_token_is_replaced() {
     let dir = tempdir().unwrap();
     let profile = write_json_profile(&dir, "profile.json");
+    let output = dir.path().join("config-sanitized.json");
 
     // "access_token" contains "token" (medium signal, threshold 3.5).
     // The value has entropy well above 3.5.
-    let input = write_file(
-        dir.path(),
-        "config.json",
-        r#"{"access_token":"sk-a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1XYZ9"}"#,
-    );
-    let output = dir.path().join("config-sanitized.json");
-
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "json",
             "--profile",
             profile.to_str().unwrap(),
             "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        br#"{"access_token":"sk-a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1XYZ9"}"#,
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(result.status.success(), "expected exit 0");
     let out = fs::read_to_string(&output).unwrap();
     assert!(
         !out.contains("sk-a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1XYZ9"),
@@ -390,29 +377,24 @@ fn write_kv_profile(dir: &tempfile::TempDir, filename: &str) -> std::path::PathB
 fn kv_field_signal_replaces_high_entropy_env_var() {
     let dir = tempdir().unwrap();
     let profile = write_kv_profile(&dir, "profile.json");
-
-    // DB_PASSWORD contains "password" — strong signal, threshold 3.0.
-    let input = write_file(
-        dir.path(),
-        "config.env",
-        "DB_PASSWORD=a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1\n",
-    );
     let output = dir.path().join("config-sanitized.env");
 
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    // DB_PASSWORD contains "password" — strong signal, threshold 3.0.
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "env",
             "--profile",
             profile.to_str().unwrap(),
             "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        b"DB_PASSWORD=a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1\n",
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(result.status.success(), "expected exit 0");
     let out = fs::read_to_string(&output).unwrap();
     assert!(
         !out.contains("a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1"),
@@ -428,26 +410,25 @@ fn kv_field_signal_replaces_high_entropy_env_var() {
 fn kv_field_signal_low_entropy_not_replaced() {
     let dir = tempdir().unwrap();
     let profile = write_kv_profile(&dir, "profile.json");
+    let output = dir.path().join("config-sanitized.env");
 
     // TOKEN_TYPE contains "token" — medium signal — but "Bearer" has
     // entropy ~1.9, well below the 3.5 threshold.
-    let input = write_file(dir.path(), "config.env", "TOKEN_TYPE=Bearer\n");
-    let output = dir.path().join("config-sanitized.env");
-
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "env",
             "--profile",
             profile.to_str().unwrap(),
             "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        b"TOKEN_TYPE=Bearer\n",
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(result.status.success(), "expected exit 0");
     let out = fs::read_to_string(&output).unwrap();
     assert!(
         out.contains("Bearer"),
@@ -459,29 +440,24 @@ fn kv_field_signal_low_entropy_not_replaced() {
 fn kv_api_key_replaced_in_quoted_value() {
     let dir = tempdir().unwrap();
     let profile = write_kv_profile(&dir, "profile.json");
-
-    // API_KEY contains "api_key" (medium signal). Value is high-entropy.
-    let input = write_file(
-        dir.path(),
-        "config.env",
-        "API_KEY=\"sk-a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1XYZ9\"\n",
-    );
     let output = dir.path().join("config-sanitized.env");
 
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    // API_KEY contains "api_key" (medium signal). Value is high-entropy.
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "env",
             "--profile",
             profile.to_str().unwrap(),
             "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        b"API_KEY=\"sk-a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1XYZ9\"\n",
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(result.status.success(), "expected exit 0");
     let out = fs::read_to_string(&output).unwrap();
     assert!(
         !out.contains("sk-a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1XYZ9"),
@@ -501,29 +477,24 @@ fn kv_api_key_replaced_in_quoted_value() {
 fn api_key_high_entropy_is_replaced() {
     let dir = tempdir().unwrap();
     let profile = write_json_profile(&dir, "profile.json");
-
-    // Value has entropy well above 3.5 — should fire the medium-signal group.
-    let input = write_file(
-        dir.path(),
-        "config.json",
-        r#"{"api_key":"sk-a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1XYZ9"}"#,
-    );
     let output = dir.path().join("config-sanitized.json");
 
-    let status = sanitize_cmd()
-        .args([
-            input.to_str().unwrap(),
+    // Value has entropy well above 3.5 — should fire the medium-signal group.
+    let result = run_with_stdin(
+        &[
+            "-",
+            "--format",
+            "json",
             "--profile",
             profile.to_str().unwrap(),
             "--no-structured-handoff",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .env("SANITIZE_LOG", "error")
-        .status()
-        .unwrap();
+        ],
+        br#"{"api_key":"sk-a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1XYZ9"}"#,
+    );
 
-    assert!(status.success(), "expected exit 0");
+    assert!(result.status.success(), "expected exit 0");
     let out = fs::read_to_string(&output).unwrap();
     assert!(
         !out.contains("sk-a3f8c2d1e9b7f4a2c8d3e1b9f7a4c2d1XYZ9"),
