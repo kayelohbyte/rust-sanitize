@@ -395,10 +395,16 @@ fn html_patterns_section(s: &crate::report::ReportSummary) -> String {
     }
     let mut sorted: Vec<(&String, &u64)> = s.pattern_counts.iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-    let rows: String = sorted
-        .iter()
-        .map(|(pat, count)| format!("<tr><td>{}</td><td>{}</td></tr>\n", html_escape(pat), count))
-        .collect();
+    let rows: String = sorted.iter().fold(String::new(), |mut s, (pat, count)| {
+        use std::fmt::Write;
+        let _ = writeln!(
+            s,
+            "<tr><td>{}</td><td>{}</td></tr>",
+            html_escape(pat),
+            count
+        );
+        s
+    });
     format!(
         r#"<div class="section">
 <h2>Patterns detected</h2>
@@ -419,15 +425,17 @@ fn html_file_row(f: &FileReport, has_locations: bool) -> String {
         pairs
             .iter()
             .filter(|(_, &c)| c > 0)
-            .map(|(pat, count)| {
-                format!(
+            .fold(String::new(), |mut s, (pat, count)| {
+                use std::fmt::Write;
+                let _ = write!(
+                    s,
                     r#"<span class="badge {}">{}: {}</span>"#,
                     sarif_badge_class(pat),
                     html_escape(pat),
                     count,
-                )
+                );
+                s
             })
-            .collect()
     };
     let match_class = if f.matches > 0 {
         "count-positive"

@@ -75,11 +75,8 @@ fn serve(stream: TcpStream, expected_token: &str, ok_response: &[u8]) {
             let prefix = "authorization: bearer ".len();
             bearer_ok = line[prefix..].trim() == expected_token;
         }
-        if lower.starts_with("content-length: ") {
-            content_length = lower["content-length: ".len()..]
-                .trim()
-                .parse()
-                .unwrap_or(0);
+        if let Some(rest) = lower.strip_prefix("content-length: ") {
+            content_length = rest.trim().parse().unwrap_or(0);
         }
     }
 

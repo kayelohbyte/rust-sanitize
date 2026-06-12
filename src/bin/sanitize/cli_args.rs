@@ -646,7 +646,7 @@ pub(crate) struct TemplateArgs {
 
     /// Output path for the generated YAML template.
     ///
-    /// Default: secrets.template.<preset>.yaml
+    /// Default: `secrets.template.<preset>.yaml`
     #[arg(long, short = 'o', value_name = "FILE")]
     pub(crate) output: Option<PathBuf>,
 

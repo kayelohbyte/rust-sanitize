@@ -356,7 +356,7 @@ fn two_pass_profile_seeds_plain_text_scan() {
     let replacement = config_out
         .lines()
         .find(|l| l.contains("password:"))
-        .and_then(|l| l.splitn(2, ':').nth(1))
+        .and_then(|l| l.split_once(':').map(|x| x.1))
         .map(str::trim)
         .expect("config output must have a password: line");
 

@@ -63,7 +63,24 @@ pub(crate) fn has_stdin_input(cli: &Cli) -> bool {
     cli.input.is_empty() || cli.input.iter().any(|p| p.as_os_str() == "-")
 }
 
-/// Returns `true` when stdin is not connected to a terminal (pipe, redirect, etc.).
+/// Returns `true` when stdin is an OS-level pipe (FIFO).
+///
+/// On Unix we check `S_IFIFO` via fstat so that redirected regular files and
+/// /dev/null are not mistaken for pipes. On other platforms we fall back to
+/// `!is_terminal()`, which is a safe but slightly broader approximation.
+#[cfg(unix)]
+fn stdin_is_pipe() -> bool {
+    use nix::sys::stat::fstat;
+    use std::os::unix::io::AsRawFd;
+    fstat(io::stdin().as_raw_fd())
+        .map(|s| {
+            nix::sys::stat::SFlag::from_bits_truncate(s.st_mode)
+                .contains(nix::sys::stat::SFlag::S_IFIFO)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
 fn stdin_is_pipe() -> bool {
     !io::stdin().is_terminal()
 }
