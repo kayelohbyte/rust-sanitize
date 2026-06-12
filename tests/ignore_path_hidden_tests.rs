@@ -102,11 +102,7 @@ fn ignore_path_glob_excludes_subtree() {
     // Create a two-level tree: logs/app.log and fixtures/test.log.
     fs::create_dir_all(dir.path().join("logs")).unwrap();
     fs::create_dir_all(dir.path().join("fixtures")).unwrap();
-    fs::write(
-        dir.path().join("logs").join("app.log"),
-        b"SUPERSECRET\n",
-    )
-    .unwrap();
+    fs::write(dir.path().join("logs").join("app.log"), b"SUPERSECRET\n").unwrap();
     fs::write(
         dir.path().join("fixtures").join("test.log"),
         b"SUPERSECRET\n",
