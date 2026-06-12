@@ -189,9 +189,9 @@ impl ProgressReporter {
 
     fn should_emit_scan(&mut self, units: u64, min_delta: u64) -> bool {
         let now = Instant::now();
-        let elapsed_ready = self.last_emit.is_none_or(|last_emit| {
-            now.duration_since(last_emit) >= self.interval
-        });
+        let elapsed_ready = self
+            .last_emit
+            .is_none_or(|last_emit| now.duration_since(last_emit) >= self.interval);
         let delta_ready = units >= self.last_scan_units.saturating_add(min_delta);
 
         if elapsed_ready || delta_ready {
@@ -205,9 +205,9 @@ impl ProgressReporter {
 
     fn should_emit_archive(&mut self, units: u64, min_delta: u64) -> bool {
         let now = Instant::now();
-        let elapsed_ready = self.last_emit.is_none_or(|last_emit| {
-            now.duration_since(last_emit) >= self.interval
-        });
+        let elapsed_ready = self
+            .last_emit
+            .is_none_or(|last_emit| now.duration_since(last_emit) >= self.interval);
         let delta_ready = units >= self.last_archive_units.saturating_add(min_delta);
 
         if elapsed_ready || delta_ready {
