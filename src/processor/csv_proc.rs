@@ -58,7 +58,7 @@ impl Processor for CsvProcessor {
         let has_header = profile
             .options
             .get("has_header")
-            .map_or(true, |v| v != "false");
+            .is_none_or(|v| v != "false");
 
         let mut reader = csv::ReaderBuilder::new()
             .delimiter(delimiter)

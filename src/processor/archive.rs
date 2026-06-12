@@ -597,7 +597,7 @@ impl ArchiveProcessor {
         // Try structured processing first, but only if the entry is
         // within the size cap and --force-text is not set.
         // Oversized entries fall through to the streaming scanner (M-3 fix).
-        let within_size_cap = entry_size_hint.map_or(true, |sz| sz <= STRUCTURED_ENTRY_SIZE); // unknown size → allow (conservative)
+        let within_size_cap = entry_size_hint.is_none_or(|sz| sz <= STRUCTURED_ENTRY_SIZE); // unknown size → allow (conservative)
 
         if !self.force_text && within_size_cap {
             if let Some(profile) = self.find_profile(filename) {

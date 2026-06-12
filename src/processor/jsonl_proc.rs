@@ -61,7 +61,7 @@ impl JsonLinesProcessor {
         let compact = profile
             .options
             .get("compact")
-            .map_or(true, |v| v != "false");
+            .is_none_or(|v| v != "false");
 
         for (line_no, line_result) in reader.lines().enumerate() {
             let raw_line = line_result?;
