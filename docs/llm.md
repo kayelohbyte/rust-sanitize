@@ -94,6 +94,48 @@ let prompt = format_llm_prompt("/path/to/my-template.txt", &entries, None).unwra
 The file's raw content is used verbatim — no `{preamble}` substitution is
 applied. Include your own context instructions for the LLM.
 
+## Sending the Prompt to an LLM Endpoint
+
+By default `--llm` writes the formatted prompt to stdout. Pass `--llm-endpoint`
+to stream it to any OpenAI-compatible API instead.
+
+| Flag | Env var | Description |
+|------|---------|-------------|
+| `--llm-endpoint <URL>` | `SANITIZE_LLM_ENDPOINT` | Base URL of the OpenAI-compatible endpoint (e.g. `http://localhost:11434/v1` for Ollama). Requires `--llm`. |
+| `--llm-model <MODEL>` | `SANITIZE_LLM_MODEL` | Model name sent in the request body (e.g. `phi4-mini`, `gpt-4o`). Required by most endpoints. |
+| `--llm-key <KEY>` | `SANITIZE_LLM_KEY` | Bearer token / API key. Use the env var — passing on the CLI exposes it in `ps` output. Local models accept any non-empty value. |
+
+The client enforces: HTTPS/HTTP scheme only (no `file://`, `data://`, etc.),
+10 MiB SSE stream cap, ESC byte stripping from decoded content, and a separate
+connect timeout distinct from the read timeout.
+
+```bash
+# Local Ollama model:
+export SANITIZE_LLM_ENDPOINT=http://localhost:11434/v1
+export SANITIZE_LLM_MODEL=phi4-mini
+export SANITIZE_LLM_KEY=ollama    # any non-empty value
+sanitize server.log -s patterns.yaml --llm troubleshoot
+
+# LM Studio (default port 1234):
+sanitize config.yaml -s patterns.yaml --llm review-config \
+  --llm-endpoint http://localhost:1234/v1 \
+  --llm-model lmstudio-community/Meta-Llama-3-8B-Instruct-GGUF \
+  --llm-key lm-studio
+
+# OpenAI (key from environment):
+export SANITIZE_LLM_KEY=sk-proj-...
+sanitize nginx.conf --app nginx --llm review-security \
+  --llm-endpoint https://api.openai.com/v1 \
+  --llm-model gpt-4o
+
+# Combine with --extract-context to include notable log events:
+sanitize server.log -s patterns.yaml \
+  --report report.json --extract-context \
+  --llm troubleshoot \
+  --llm-endpoint http://localhost:11434/v1 \
+  --llm-model phi4-mini --llm-key x
+```
+
 ## API Reference
 
 | Symbol | Description |

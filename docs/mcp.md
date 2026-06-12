@@ -554,7 +554,7 @@ require("avante").setup({
 | `SANITIZE_MCP_TIMEOUT_MS` | `60000` (60 s) | Subprocess timeout — kills the CLI and returns an error if exceeded. |
 | `SANITIZE_MCP_THREADS` | _(unset = CLI default = logical CPUs)_ | Worker thread cap for every invocation — useful on shared hosts. |
 | `SANITIZE_MCP_MAX_ARCHIVE_DEPTH` | `5` | Default max archive nesting depth (matches CLI default). |
-| `SANITIZE_SECRETS_DIR` | _(unset)_ | Root directory for per-namespace secrets. Each subdirectory is a namespace and may contain `secrets.yaml[.enc]`, `profile.yaml`, and an optional `.password` file (`0600`/`0400` permissions enforced). |
+| `SANITIZE_SECRETS_DIR` | _(unset)_ | Root directory for per-namespace secrets. Each subdirectory is a namespace and may contain `secrets.yaml[.enc]`, `profile.yaml`, `settings.yaml` (behavior defaults), and an optional `.password` file (`0600`/`0400` permissions enforced). |
 
 ---
 
@@ -982,7 +982,7 @@ Omit `preset` to create a file with only the entries you specify. Returns the wr
 { "tool": "init", "output_path": "patterns.yaml", "preset": "web" }
 ```
 
-Available presets: `generic` (default), `web`, `k8s`, `database`, `aws`. Pass `overwrite: true` to replace an existing file. Once created, pass the path via `secrets_file` on subsequent `sanitize` or `scan` calls.
+Available presets: `balanced` (default — mirrors the built-in runtime detection set), `aggressive` (balanced + entropy/bearer patterns), `generic`, `web`, `k8s`, `database`, `aws`. Pass `overwrite: true` to replace an existing file. Once created, pass the path via `secrets_file` on subsequent `sanitize` or `scan` calls.
 
 ---
 
@@ -993,15 +993,69 @@ Set `SANITIZE_SECRETS_DIR` to a directory and create one subdirectory per custom
 ```
 /var/sanitize/secrets/
   acme-corp/
-    secrets.yaml        # or secrets.yaml.enc
-    profile.yaml        # optional structured-field profile
+    secrets.yaml        # or secrets.yaml.enc — required
+    profile.yaml        # optional: structured field-level rules
+    settings.yaml       # optional: per-namespace behavior defaults
     .password           # required if encrypted; must be chmod 0600
   widgets-inc/
     secrets.yaml.enc
+    settings.yaml
     .password
 ```
 
-Pass `namespace` in `sanitize` or `scan` tool calls. The server loads only that namespace's secrets, profile, and password — keeping pattern sets isolated across tenants.
+Pass `namespace` in `sanitize` or `scan` tool calls. The server loads only that namespace's secrets, profile, password, and behavior defaults — keeping pattern sets and configuration isolated across tenants.
+
+### Per-Namespace `settings.yaml`
+
+A `settings.yaml` file in the namespace directory sets default behavior flags for every tool call that uses that namespace. All the same fields as the global `~/.config/sanitize/settings.yaml` are accepted. Per-call tool parameters always override namespace defaults.
+
+```yaml
+# /var/sanitize/secrets/acme-corp/settings.yaml
+
+# Pre-allow values that are safe for this customer.
+allow:
+  - "*.acme-internal"
+  - "10.0.0.*"
+
+# Always fail when matches are found (useful for audit namespaces).
+fail_on_match: true
+
+# Entropy detection tuned for this customer's log format.
+entropy_threshold: 4.2
+
+# Restrict archive depth for this tenant.
+max_archive_depth: 3
+
+# Load an extra app bundle for every call in this namespace.
+app:
+  - kubernetes
+```
+
+Fields honored from namespace `settings.yaml`:
+
+| Field | Type | CLI equivalent |
+|-------|------|----------------|
+| `app` | `string[]` | `--app` (merged with per-call `app`) |
+| `allow` | `string[]` | `--allow` (merged with per-call `allow`) |
+| `exclude_path` | `string[]` | `--exclude-path` |
+| `include_path` | `string[]` | `--include-path` |
+| `context_keywords` | `string[]` | `--context-keywords` |
+| `fail_on_match` | `bool` | `--fail-on-match` |
+| `strict` | `bool` | `--strict` |
+| `no_field_signal` | `bool` | `--no-field-signal` |
+| `force_text` | `bool` | `--force-text` |
+| `include_binary` | `bool` | `--include-binary` |
+| `hidden` | `bool` | `--hidden` |
+| `context_keywords_replace` | `bool` | `--context-keywords-replace` |
+| `context_case_sensitive` | `bool` | `--context-case-sensitive` |
+| `extract_context` | `bool` | `--extract-context` |
+| `threads` | `integer` | `--threads` |
+| `entropy_threshold` | `float` | `--entropy-threshold` |
+| `max_archive_depth` | `integer` | `--max-archive-depth` |
+| `context_lines` | `integer` | `--context-lines` |
+| `max_context_matches` | `integer` | `--max-context-matches` |
+
+Invalid YAML or unrecognized fields are silently ignored — the namespace still loads with its secrets and profile.
 
 ```json
 {

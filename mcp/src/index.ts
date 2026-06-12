@@ -1190,7 +1190,7 @@ async function toolBuildSecrets(params: {
     let content: string;
 
     if (params.preset) {
-      const args = ["template", "--preset", params.preset, "--output", params.output_path];
+      const args = ["template", params.preset, "--output", params.output_path];
       if (params.overwrite) args.push("--overwrite");
       const result = await runSanitize(args, null);
       if (result.exitCode !== 0) {
@@ -1737,9 +1737,9 @@ server.tool(
       .string()
       .describe("Relative path where the secrets YAML file should be written (e.g. 'secrets.yaml' or 'config/secrets.yaml')."),
     preset: z
-      .enum(["generic", "web", "k8s", "database", "aws"])
+      .enum(["balanced", "aggressive", "generic", "web", "k8s", "database", "aws"])
       .optional()
-      .describe("Pattern preset to use. One of: generic (default, common tokens/emails/IPs), web (JWTs/sessions/emails), k8s (service accounts/tokens), database (passwords/connection strings), aws (access keys/ARNs)."),
+      .describe("Pattern preset to use. balanced (default — mirrors the built-in runtime detection set, fully editable), aggressive (balanced + entropy/bearer/container-ID patterns), generic (minimal), web (JWTs/sessions/emails), k8s (service accounts/tokens), database (passwords/connection strings), aws (access keys/ARNs)."),
     overwrite: z
       .boolean()
       .optional()
@@ -1747,14 +1747,14 @@ server.tool(
   },
   async (params: {
     output_path: string;
-    preset?: "generic" | "web" | "k8s" | "database" | "aws";
+    preset?: "balanced" | "aggressive" | "generic" | "web" | "k8s" | "database" | "aws";
     overwrite?: boolean;
   }) => {
     try {
       validatePath(params.output_path, "output_path");
       validateFilesPath(params.output_path);
       const args = ["template", "--output", params.output_path];
-      if (params.preset) args.push("--preset", params.preset);
+      if (params.preset) args.push(params.preset);
       if (params.overwrite) args.push("--overwrite");
       if (activeCalls >= MAX_CONCURRENT) {
         throw new Error(`Too many concurrent requests (max ${MAX_CONCURRENT}). Retry after current calls complete.`);
@@ -1856,9 +1856,9 @@ server.tool(
       .optional()
       .describe("Specific patterns to include. Can be combined with a preset — custom entries are appended after the preset patterns."),
     preset: z
-      .enum(["generic", "web", "k8s", "database", "aws"])
+      .enum(["balanced", "aggressive", "generic", "web", "k8s", "database", "aws"])
       .optional()
-      .describe("Start from this built-in template. Omit to create a file with only the entries you specify."),
+      .describe("Start from this built-in template. balanced = runtime defaults (recommended starting point); aggressive = balanced + entropy/bearer patterns. Omit to create a file with only the entries you specify."),
     overwrite: z
       .boolean()
       .optional()
@@ -1867,7 +1867,7 @@ server.tool(
   async (params: {
     output_path: string;
     entries?: BuildSecretsEntry[];
-    preset?: "generic" | "web" | "k8s" | "database" | "aws";
+    preset?: "balanced" | "aggressive" | "generic" | "web" | "k8s" | "database" | "aws";
     overwrite?: boolean;
   }) => {
     try {

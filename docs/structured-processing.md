@@ -422,6 +422,58 @@ Replaces values in specified columns by header name. Preserves the delimiter and
       category: ipv4
 ```
 
+### INI (`"ini"`)
+
+Handles INI / CFG files: `[section]` headers, `key = value` and `key: value`
+syntax, `#` and `;` comments, and inline comments. Comments and blank lines are
+preserved verbatim. Inline comments are stripped from values before replacement
+so sensitive content hidden after a `;` is caught.
+
+Field patterns use dot-path notation: `section.key`, bare `key` (matches any
+section), or `*` (all values in all sections).
+
+```yaml
+- processor: ini
+  extensions: [".ini", ".cfg", ".conf"]
+  fields:
+    # Specific section + key:
+    - pattern: "database.password"
+      category: "custom:password"
+    # Key in any section:
+    - pattern: "api_key"
+      category: auth_token
+    # Every value in the [credentials] section:
+    - pattern: "credentials.*"
+      category: auth_token
+    # Every value in every section:
+    - pattern: "*"
+      category: generic
+```
+
+Example input / output with the profile above:
+
+```ini
+[database]
+host     = db.corp.internal    ; primary replica
+password = s3cretpw            ; NEVER commit this
+
+[credentials]
+api_key = AKIA1234567890ABCDEF
+token   = ghp_AbCdEfGhIjKlMnOp
+```
+
+After sanitization (keys and comments preserved, values replaced):
+
+```ini
+[database]
+host     = db.corp.internal    ; primary replica
+password = __SANITIZED_a1b2__  ; NEVER commit this
+
+[credentials]
+api_key = __SANITIZED_c3d4__
+token   = __SANITIZED_e5f6__
+```
+
 ---
 
 ## Deterministic Mode + Profile: Saving Discovered Values

@@ -12,213 +12,17 @@ sanitize test-pattern [OPTIONS] [VALUE]...
 sanitize init-hook [OPTIONS]
 sanitize show-config
 sanitize install-hook [OPTIONS]
-sanitize guided
 sanitize apps
 sanitize apps add <NAME> [OPTIONS]
 sanitize apps remove <NAME> [OPTIONS]
 sanitize apps dir
 sanitize allow-test --allow <PATTERN>... [VALUE]...
-sanitize template [OPTIONS]
+sanitize template [PRESET]
 sanitize encrypt [OPTIONS] <INPUT> <OUTPUT>
 sanitize decrypt [OPTIONS] <INPUT> <OUTPUT>
 ```
 
 The default mode (no subcommand) sanitizes one or more files and archives. Multiple `INPUT` paths may be given in a single invocation and may mix plain files, structured files, and archives freely. When `INPUT` is omitted, data is read from stdin; use `-` to include stdin alongside file paths. Use `encrypt` / `decrypt` subcommands to manage encrypted secrets files.
-
-### `sanitize guided`
-
-Interactive wizard for generating a logs-focused starter secrets template and optional structured profile.
-
-```
-sanitize guided
-```
-
-What it does:
-
-- Prompts for a **workspace type** (Generic, Web app, Kubernetes, Database, AWS) to seed type-specific patterns.
-- Prompts for **replacement strictness** (`Balanced` vs `Aggressive`) to control breadth of token matching.
-- Asks for up to 3 company domains to seed domain-specific host/email patterns.
-- Asks for cloud providers (AWS, Azure, GCP) and adds provider-specific entries.
-- Asks which **structured file formats** to include (YAML/JSON, JSON Lines, `.env`, TOML, INI/conf) and generates a matching profile file.
-- Prompts for noisy-ID handling (`trace_id`/`span_id`-like high-entropy noise toggle).
-- Generates and validates a plaintext YAML secrets file (default: `secrets.guided.yaml`).
-- Generates a profile file alongside it (default: `<stem>.profile.yaml`) when formats are selected.
-- Optionally encrypts the secrets file and removes the plaintext copy.
-- Optionally runs sanitization immediately using the generated files.
-
-#### Guided Flow (Step by Step)
-
-1. Checks for a TTY (non-interactive shells are rejected with an error).
-2. Asks for **workspace type** (select 1–5):
-   - `1) Generic` — tokens, emails, IPs, hostnames, UUIDs (default).
-   - `2) Web app` — JWTs, session cookies, emails, URLs.
-   - `3) Kubernetes` — service accounts, tokens, namespaces.
-   - `4) Database` — passwords, connection strings, usernames.
-   - `5) AWS` — like Generic but uses the Aggressive strictness preset.
-3. Asks for **replacement strictness** (select 1–2; default: Aggressive):
-   - `1) Balanced` — replace clearly sensitive values only.
-   - `2) Aggressive` — also replace high-entropy tokens (recommended for LLM sharing).
-4. Prompts for company domains (comma-separated, up to 3).
-5. Prompts for cloud provider scope (AWS, Azure, GCP, none).
-6. Prompts for **structured file formats** to include in the generated profile:
-   - `1) YAML / JSON` — k8s manifests, docker-compose, app configs.
-   - `2) JSON Lines` — NDJSON structured logs (`.jsonl`, `.ndjson`).
-   - `3) .env files` — twelve-factor app secrets, CI variables.
-   - `4) TOML` — Rust, Hugo, and other TOML configs.
-   - `5) INI / conf` — system services, databases, legacy apps.
-   - `6) All of the above` (default).
-   - `7) None` — secrets file only, no profile.
-7. Prompts for noisy-ID handling (`trace_id`/`span_id`-like high-entropy noise toggle).
-8. Prompts for output secrets file path (default: `secrets.guided.yaml`); forces `.yaml` extension.
-9. Generates secrets entries and validates all regexes by compiling them before writing.
-10. Writes plaintext YAML secrets file.
-11. If formats were selected, prompts for profile file path (default: `<secrets-stem>.profile.yaml`) and writes it.
-12. Optionally encrypts the secrets file; removes plaintext after successful encryption.
-13. Optionally runs sanitization immediately:
-    - Prompts for input path (or `-` for stdin).
-    - Prompts for optional output path.
-    - Prompts for dry-run choice.
-    - Prompts for deterministic mode choice.
-
-#### What Guided Picks Out to Sanitize
-
-The guided template writes regex rules with these categories and targets.
-
-Always included (all workspace types and strictness levels):
-
-- `email`: email addresses.
-- `ipv4`: IPv4 addresses.
-- `ipv6`: IPv6 addresses.
-- `mac_address`: MAC addresses with `:` or `-` separators.
-- `uuid`: RFC-like UUIDs.
-- `jwt`: JWT-like `header.payload.signature` tokens.
-- `url`: `http://` and `https://` URLs.
-- `auth_token`: PEM/private-key headers, generic `secret_key`/`api_key` key-value patterns, GitHub PAT patterns, GCP API key prefix.
-- `custom:password`: password key-value pattern.
-- `file_path`: `/home/<user>` and `/Users/<user>` paths.
-- `container_id`: Docker image digests (`sha256:<64-hex>`).
-
-Aggressive-strictness additions (also included for Web app, Kubernetes, and Database workspace types):
-
-- `auth_token`: bearer/authorization token context regex.
-- `custom:high_entropy_token`: broad long-token pattern (`[A-Za-z0-9_-]{20,}`), unless noisy-ID exclusion is enabled.
-
-Aggressive-strictness-only additions (not included at Balanced strictness):
-
-- `hostname`: broad DNS-style FQDN regex. Intentionally excluded from Balanced because it matches many non-secret dotted identifiers in application logs.
-- `container_id`: short 12-hex container ID pattern.
-
-Web app workspace additions:
-
-- `auth_token`: session ID/token key-value regex.
-- `auth_token`: OAuth access/refresh token key-value regex.
-
-Kubernetes workspace additions:
-
-- `auth_token`: generic token key-value regex.
-- `custom:k8s_namespace`: Kubernetes namespace regex.
-- `container_id`: full 64-char SHA256 image digest and short 12-char container ID.
-
-Database workspace additions:
-
-- `url`: database connection string regex (postgres, mysql, mongodb, redis, amqp, jdbc).
-- `name`: username key-value regex.
-
-Domain-derived additions (for each provided domain):
-
-- `email`: domain-specific email regex (`...@<domain>`).
-- `hostname`: domain-specific host regex (`*.<domain>` style).
-
-Cloud-provider additions:
-
-- AWS selected:
-  - `aws_arn`: ARN-like values.
-  - `auth_token`: AWS access key ID shape (`AKIA`/`ASIA` + 16 chars).
-  - `container_id`: EC2 instance ID shape (`i-<8-17 hex chars>`).
-- Azure selected:
-  - `azure_resource_id`: subscription/resourceGroups/provider path shapes.
-- GCP selected:
-  - `custom:gcp_service_account`: service-account email shape.
-  - `custom:gcp_resource`: `projects/<id>/...` resource-path shape.
-
-Intentionally excluded by default (logs-first design):
-
-- `ssn`, `phone`, `credit_card`.
-
-#### Strictness Levels
-
-**`Balanced`** — replace clearly sensitive values only.
-
-- Focuses on high-confidence, low-false-positive patterns.
-- Excludes broad hostname regex and short container-ID patterns.
-- Excludes `bearer`/`authorization` token context regex and broad high-entropy token pattern.
-- Suitable for logs containing many non-secret high-entropy identifiers (trace IDs, synthetic IDs).
-
-**`Aggressive`** — replace high-entropy tokens too (recommended for LLM sharing).
-
-- Adds the broad hostname regex, short container-ID patterns, and high-entropy token pattern.
-- Higher false-positive risk for long identifiers that are not secrets.
-- If noisy-ID exclusion is enabled, the high-entropy token entry is removed.
-- Recommended when over-redaction on a first pass is acceptable.
-
-#### Replacement Behavior for Guided Rules
-
-- All replacements are one-way and length-preserving.
-- Category controls output shape (for example `email` preserves domain; `uuid` preserves dash layout; `url` preserves URL structure).
-- `custom:*` categories use the custom formatter (`__SANITIZED_<hex>__` style adjusted to input length).
-
-#### Example Generated YAML (Guided)
-
-Example (Generic workspace, Aggressive strictness, `example.com` domain, GCP selected):
-
-```yaml
-- pattern: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
-  kind: regex
-  category: email
-  label: email
-
-- pattern: \b(?:\d{1,3}\.){3}\d{1,3}\b
-  kind: regex
-  category: ipv4
-  label: ipv4
-
-- pattern: \beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b
-  kind: regex
-  category: jwt
-  label: jwt
-
-- pattern: (?i)(?:bearer|authorization)[\s:]+[A-Za-z0-9._~+/=-]{16,}\b
-  kind: regex
-  category: auth_token
-  label: bearer_token
-
-- pattern: '[A-Za-z0-9._%+-]+@example\.com'
-  kind: regex
-  category: email
-  label: email_example_com
-
-- pattern: \b(?:[A-Za-z0-9-]+\.)*example\.com\b
-  kind: regex
-  category: hostname
-  label: host_example_com
-
-- pattern: \b[a-z0-9-]+@[a-z0-9-]+\.iam\.gserviceaccount\.com\b
-  kind: regex
-  category: custom:gcp_service_account
-  label: gcp_service_account
-
-- pattern: \bprojects/[a-z][a-z0-9-]{4,30}/[A-Za-z0-9/_-]+\b
-  kind: regex
-  category: custom:gcp_resource
-  label: gcp_resource
-```
-
-Notes:
-
-- Guided mode is intended for application/system logs and excludes common consumer-PII categories by default.
-- In non-interactive environments, guided mode exits with an error because it requires a TTY.
-- GCP patterns currently use `custom:gcp_*` categories (no built-in GCP formatter yet).
-- The generated profile file contains no secrets and is safe to commit to version control.
 
 ### `sanitize apps`
 
@@ -520,7 +324,7 @@ sanitize test-pattern -s patterns.yaml --json 'value1' 'value2'
 
 ### `sanitize show-config`
 
-Print the effective configuration that will apply on the next `sanitize` run: the global secrets and settings files, the project-level `.sanitize.toml` (if any), and which values are active versus using their defaults.
+Print the effective configuration that will apply on the next `sanitize` run: the global secrets and settings files, the project-level `.sanitize.yaml` (if any), and which values are active versus using their defaults.
 
 ```
 sanitize show-config
@@ -536,7 +340,7 @@ SANITIZE_NO_CONFIG=1   sanitize show-config   # see without project config
 
 #### Startup config summary
 
-When running in interactive mode (`--progress auto` on a TTY or `--progress on`), `sanitize` automatically prints a brief configuration summary to stderr showing which secrets file, profile, and apps are active. Settings that came from `settings.yaml` or `.sanitize.toml` rather than the CLI are annotated with `[config]`. This output is silent in pipe and script contexts.
+When running in interactive mode (`--progress auto` on a TTY or `--progress on`), `sanitize` automatically prints a brief configuration summary to stderr showing which secrets file, profile, and apps are active. Settings that came from `settings.yaml` or `.sanitize.yaml` rather than the CLI are annotated with `[config]`. This output is silent in pipe and script contexts.
 
 Example:
 
@@ -659,60 +463,60 @@ Created by `sanitize init-hook`. Provides persistent defaults for CLI flags — 
 
 Set `SANITIZE_NO_SETTINGS=1` to skip loading the settings file entirely — useful in CI where you want fully explicit, reproducible behaviour.
 
-#### Project config (`.sanitize.toml`)
+#### Project config (`.sanitize.yaml`)
 
-Place a `.sanitize.toml` file in any directory (typically the root of a repository or a customer data directory). `sanitize` searches for it by walking up from the current working directory. Project config is applied **after** `settings.yaml` but **before** CLI flags, so it overrides global defaults while explicit flags still win.
+Place a `.sanitize.yaml` file in any directory (typically the root of a repository). `sanitize` searches for it by walking up from the current working directory. Project config is applied **after** `settings.yaml` but **before** CLI flags, so it overrides global defaults while explicit flags still win.
 
-```toml
-# .sanitize.toml  — project-level config, committed to the repository
+The project config uses the same YAML schema as `settings.yaml` — all behavior fields are valid in both files. Fields that make most sense at project level include `secrets_file`, `profile`, `app`, `allow`, and `exclude_path`.
 
-# Extra app bundles to load (merged with --app / settings app).
-app = ["gitlab", "kubernetes"]
+```yaml
+# .sanitize.yaml  — project-level config, committed to the repository
 
-# Additional allow-list values (merged with --allow / settings allow).
-allow = ["localhost", "*.internal"]
+# Extra app bundles to load (merged with --app / settings.yaml app).
+app:
+  - gitlab
+  - kubernetes
+
+# Additional allow-list values (merged with --allow / settings.yaml allow).
+allow:
+  - localhost
+  - "*.internal"
 
 # Secrets file path, relative to this file.
 # Overrides the global default (~/.config/sanitize/secrets.yaml) but is
 # itself overridden by --secrets-file on the CLI.
-secrets_file = "patterns.yaml"
+secrets_file: patterns.yaml
 
 # Set to true when the secrets_file above is AES-GCM encrypted.
-# encrypted_secrets = false
+# encrypted_secrets: false
 
 # Profile YAML for field-level rules, relative to this file.
-# profile = "sanitize.profile.yaml"
+# profile: sanitize.profile.yaml
 
 # Exit 2 when any match is found (--fail-on-match).
-# fail_on_match = false
+# fail_on_match: false
 
 # Abort on first error instead of skipping (--strict).
-# strict = false
-
-# Suppress the structured-to-scanner value handoff (--no-structured-handoff).
-# no_structured_handoff = false
+# strict: false
 
 # Path-level exclusions — matched relative to this file's location.
 # Patterns without a `/` also match the bare filename anywhere in the tree.
 # A trailing `/` prunes the entire subtree (no files inside are scanned).
-# exclude = [
-#   "tests/fixtures/",   # fake credentials used in unit tests
-#   "vendor/",           # checked-in dependencies
-#   "**/*.generated.*",  # generated source files
-#   "docs/examples/",    # documentation with intentional example tokens
-#   "README.md",         # top-level readme often contains example snippets
-# ]
+# exclude_path:
+#   - "tests/fixtures/"   # fake credentials used in unit tests
+#   - "vendor/"           # checked-in dependencies
+#   - "**/*.generated.*"  # generated source files
 ```
 
 **Apply order (lowest to highest precedence):**
 1. Built-in defaults
 2. `settings.yaml` in the sanitize config directory (global, per-machine)
-3. `.sanitize.toml` (per-project, committed to the repo)
+3. `.sanitize.yaml` (per-project, committed to the repo)
 4. CLI flags (always win)
 
-**Multi-customer use:** create a `.sanitize.toml` in each customer directory pointing to that customer's `secrets_file`. Running `sanitize ./customer-a/` picks up `customer-a/.sanitize.toml` automatically.
+**Multi-customer use:** create a `.sanitize.yaml` in each customer directory pointing to that customer's `secrets_file`. Running `sanitize ./customer-a/` picks up `customer-a/.sanitize.yaml` automatically.
 
-Override the file path directly with `SANITIZE_CONFIG=/path/to/file.toml`.  
+Override the file path directly with `SANITIZE_CONFIG=/path/to/file.yaml`.  
 Set `SANITIZE_NO_CONFIG=1` to disable project config entirely (useful in CI or when composing flags from multiple repos).
 
 The installed script responds to `SANITIZE_SKIP=1 git commit ...` for a one-time override without using `--no-verify` (which would bypass all hooks). The hook detects husky (`.husky/` directory) and writes to the appropriate location. For lefthook and the pre-commit framework it prints instructions for manual integration.
@@ -772,16 +576,17 @@ JSON output shape:
 
 ### `sanitize template`
 
-Generate a starter secrets-template YAML file for a given use case.
+Generate a starter secrets-template YAML file for a given use case. The preset
+argument is positional (not a flag).
 
 ```
-sanitize template [OPTIONS]
+sanitize template [PRESET] [-o FILE] [--overwrite]
 ```
 
 | Flag / Argument | Description |
 |-----------------|-------------|
-| `--preset <PRESET>` | Which template to generate. Choices: `generic` (default), `web`, `k8s`, `database`, `aws`. |
-| `-o, --output <FILE>` | Output path (default: `secrets.template.yaml`). |
+| `[PRESET]` | Which template to generate. Default: `balanced`. |
+| `-o, --output <FILE>` | Output path. Default: `secrets.template.<preset>.yaml`. |
 | `--overwrite` | Overwrite the output file if it already exists. |
 | `-h, --help` | Print help. |
 
@@ -789,7 +594,9 @@ sanitize template [OPTIONS]
 
 | Preset | Contents |
 |--------|----------|
-| `generic` | Common secrets: tokens, emails, IPs, hostnames — a good starting point for most log types. |
+| `balanced` | **(Default)** Mirrors the built-in runtime detection set exactly — the same patterns loaded when no `--secrets-file` is given. The template is fully commented and editable. Use as a baseline for any log type. |
+| `aggressive` | Extends `balanced` with high-entropy token detection, bearer/authorization context patterns, and short container IDs. Higher false-positive risk; recommended when over-redaction is acceptable (e.g. before sharing with an LLM). |
+| `generic` | Minimal starter: tokens, emails, IPs, hostnames. |
 | `web` | Web-app logs: JWTs, session IDs, OAuth tokens, emails, URLs. |
 | `k8s` | Kubernetes configs: service-account tokens, namespaces, container IDs. |
 | `database` | Database configs: passwords, connection strings (postgres/mysql/mongo/redis), usernames. |
@@ -798,17 +605,17 @@ sanitize template [OPTIONS]
 Templates contain commented-out examples and inline guidance so you can uncomment and adapt the entries you need.
 
 ```bash
-# Generic template → secrets.template.yaml (default):
+# Balanced template (default) → secrets.template.balanced.yaml:
 sanitize template
 
-# Web-app template → secrets.template.yaml:
-sanitize template --preset web
+# Aggressive template for LLM sharing:
+sanitize template aggressive
 
-# Kubernetes template to a custom path:
-sanitize template --preset k8s -o k8s-secrets.yaml
+# Balanced to a custom path, overwrite if present:
+sanitize template balanced -o my-secrets.yaml --overwrite
 
-# AWS template, overwrite if already exists:
-sanitize template --preset aws --overwrite
+# Kubernetes preset:
+sanitize template k8s -o k8s-secrets.yaml
 ```
 
 ### Default Mode — Sanitize
@@ -836,6 +643,7 @@ When neither `-s`/`--secrets-file` nor `--app` is provided, the built-in pattern
 | `--profile <FILE>` | | Path to a file-type profile (JSON or YAML). Enables structured field-level sanitization for matched files. **Requires `--secrets-file`** — without one, discovered field values have nowhere to go and Phase 2 runs blind, producing incomplete sanitization. The secrets file may be empty on the first run; discovered literals are appended to it automatically (see `--no-structured-handoff`) so subsequent runs catch those values everywhere. See [Structured Processing](structured-processing.md). |
 | `--app <APPS>` | | Load built-in secrets patterns and structured field profiles for one or more applications. Comma-separated app names (e.g. `--app gitlab` or `--app gitlab,nginx`). Additive with `--secrets-file` and `--profile`. Run `sanitize apps` to list available app names. |
 | `--allow <PATTERN>` | | Allow a specific value through unchanged (repeatable). Matched values are not replaced and not recorded in the mapping store — they will pass through in every file processed in the same run. Supports exact strings and `*` glob patterns. Matching is **case-insensitive** by default (patterns and values are lowercased before comparison). Examples: `--allow localhost`, `--allow "*.internal"`, `--allow "192.168.1.*"`. Allowlist entries can also be placed in the secrets file as `kind: allow` entries. |
+| `--quick <PATTERN>` | | Add one-off literal or regex patterns for the current run without touching any secrets file. Comma-separated; prefix individual values with `regex:` to enable regex matching (bare values are treated as literals). Repeatable — `--quick a --quick b` accumulates. Example: `--quick "tok-abc123,regex:sk-[A-Za-z0-9]{40}"`. Replacements use the `auth_token` shape regardless of value type. |
 | `--only <PATTERN>` | | Keep only archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--only` flags accumulate. Combined with `--exclude`: `--only` narrows first, then `--exclude` removes. Only affects archive inputs; ignored for plain files. |
 | `--exclude <PATTERN>` | | Remove archive entries whose full path matches `PATTERN`. Must follow the archive path it applies to. Multiple `--exclude` flags accumulate. |
 | `--log-format <FMT>` | | Log output format: `human` (default) or `json`. |
@@ -851,13 +659,16 @@ When neither `-s`/`--secrets-file` nor `--app` is provided, the built-in pattern
 | `--findings [PATH]` | | Write per-file findings as NDJSON to PATH (or stdout when PATH is omitted or `-`). Each line is a JSON object: one `{"type":"file",...}` per processed file with match count and per-pattern breakdown, followed by `{"type":"summary",...}`. In default sanitize mode, use `--output` to redirect sanitized content so stdout is free for findings. |
 | `--entropy-threshold <THRESHOLD>` | | Enable Shannon entropy detection for high-entropy tokens not caught by pattern matching. `THRESHOLD` is bits per character (e.g. `4.5`). Tokens of 20–200 alphanumeric characters whose entropy meets or exceeds this value are treated as secrets. Off by default. Supplement with `kind: entropy` entries in the secrets file for finer control. In `--dry-run` / `sanitize scan` mode, prints an entropy calibration histogram to stderr (counts only — no token values) so you can tune the threshold before committing to a full run. See "Entropy Calibration Histogram" below. |
 | `--hidden` | | When an input is a directory, also walk hidden files and directories (names starting with `.`). VCS metadata directories (`.git`, `.hg`, `.svn`, `.bzr`) are always skipped regardless of this flag. |
-| `--exclude-path <GLOB>` | | Exclude paths matching these glob patterns from directory walks (repeatable). Patterns are matched against the path relative to the input root (or against the filename alone when no `/` is present in the pattern). A trailing `/` excludes the entire subtree. Merged with `exclude` entries in `.sanitize.toml`; CLI patterns are applied in addition to, not instead of, project config patterns. Example: `--exclude-path "tests/fixtures/"`. |
+| `--exclude-path <GLOB>` | | Exclude paths matching these glob patterns from directory walks (repeatable). Patterns are matched against the path relative to the input root (or against the filename alone when no `/` is present in the pattern). A trailing `/` excludes the entire subtree. Merged with `exclude` entries in `.sanitize.yaml`; CLI patterns are applied in addition to, not instead of, project config patterns. Example: `--exclude-path "tests/fixtures/"`. |
 | `--include-path <GLOB>` | | Only process files matching these glob patterns during directory walks (repeatable). Patterns use the same rules as `--exclude-path`: matched against the relative path first, then the bare filename when no `/` is present. A trailing `/` includes the entire subtree. When both `--include-path` and `--exclude-path` match a file, exclusion wins. Has no effect on explicitly named file arguments or archive entries. Example: `--include-path "**/*.log" --include-path "**/*.conf"`. |
 | `--force-text` | | Bypass all structured processors (JSON, YAML, XML, TOML, etc.) and run only the streaming scanner on every file. Use when you want a guarantee that every byte is pattern-scanned regardless of file type. |
 | `--strip-values` | | Strip all values from structured output, emitting only keys and structure. Useful for generating a profile template from a real config file without exposing any values. Bypasses the sanitization pipeline — no secrets file is required. |
 | `--strip-delimiter <DELIM>` | | Delimiter string used to split key/value lines when `--strip-values` is set. Default: `=`. Use `--strip-delimiter :` for YAML-style or nginx-style config files. Requires `--strip-values`. |
 | `--strip-comment-prefix <PREFIX>` | | Line prefix that marks a comment when `--strip-values` is set. Comment lines are preserved verbatim. Default: `#`. Use `--strip-comment-prefix //` for C-style or nginx-style comment lines. Requires `--strip-values`. |
-| `--llm [TEMPLATE]` | | Format the sanitized output as an LLM-ready prompt written to stdout. `TEMPLATE` selects the instruction set: `troubleshoot` (default — incident triage: root cause, event sequence, remediation), `review-config` (configuration review: misconfigurations and best practices), `review-security` (security posture: auth, network exposure, TLS, CVEs, hardcoded secrets), or a path to a custom template file. All built-in templates include a preamble explaining the sanitization model and instructing the LLM to ask clarifying questions rather than guessing at redacted values. Template text uses [caveman compression](https://github.com/wilpel/caveman-compression) to minimise instruction tokens (~45% reduction vs. natural prose) while preserving all semantic content. Combine with `--extract-context` to include notable log events. **Two modes:** without `--output` (inline mode) sanitized content is embedded directly in `<content>` blocks; with `--output` (reference mode) sanitized files are written to disk and the prompt lists their absolute paths — useful for large file sets or agentic LLMs that can read files with their own tools. The prompt is always written to stdout; `--report` still writes its JSON file normally. |
+| `--llm [TEMPLATE]` | | Format the sanitized output as an LLM-ready prompt. Without `--llm-endpoint` the prompt is written to stdout; with `--llm-endpoint` it is sent to the API and the response is streamed to stdout. `TEMPLATE` selects the instruction set: `troubleshoot` (default — incident triage: root cause, event sequence, remediation), `review-config` (configuration review: misconfigurations and best practices), `review-security` (security posture: auth, network exposure, TLS, CVEs, hardcoded secrets), or a path to a custom template file. All built-in templates include a preamble explaining the sanitization model and instructing the LLM to ask clarifying questions rather than guessing at redacted values. Template text uses [caveman compression](https://github.com/wilpel/caveman-compression) to minimise instruction tokens (~45% reduction vs. natural prose) while preserving all semantic content. Combine with `--extract-context` to include notable log events. **Two modes:** without `--output` (inline mode) sanitized content is embedded directly in `<content>` blocks; with `--output` (reference mode) sanitized files are written to disk and the prompt lists their absolute paths — useful for large file sets or agentic LLMs that can read files with their own tools. The prompt is always written to stdout; `--report` still writes its JSON file normally. |
+| `--llm-endpoint <URL>` | | Send the `--llm` prompt to an OpenAI-compatible HTTP endpoint instead of printing to stdout. Requires `--llm`. The response is streamed to stdout. Local model example: `http://localhost:11434/v1` (Ollama). Cloud example: `https://api.openai.com/v1`. Set via `SANITIZE_LLM_ENDPOINT`. |
+| `--llm-model <MODEL>` | | Model name to pass to `--llm-endpoint` (e.g. `phi4-mini`, `gpt-4o`, `llama3`). Required when the endpoint does not infer a model from the path. Set via `SANITIZE_LLM_MODEL`. Requires `--llm-endpoint`. |
+| `--llm-key <KEY>` | | API key for `--llm-endpoint`. Prefer the `SANITIZE_LLM_KEY` environment variable — passing the value on the command line exposes it in process listings. Local models (Ollama, LM Studio) accept any non-empty value. |
 | `-h, --help` | `-h` | Print help. |
 | `-V, --version` | `-V` | Print version. |
 
@@ -1269,6 +1080,22 @@ sanitize logs/ -s patterns.yaml --llm review-security --output /tmp/sanitized/
 
 # Combine LLM output with context extraction for notable events:
 sanitize server.log -s patterns.yaml --report /tmp/report.json --extract-context --llm troubleshoot
+
+# Send prompt directly to a local Ollama model and stream the response:
+sanitize server.log -s patterns.yaml --llm troubleshoot \
+  --llm-endpoint http://localhost:11434/v1 \
+  --llm-model phi4-mini \
+  --llm-key any-value
+
+# Send to OpenAI (key from environment variable — preferred):
+export SANITIZE_LLM_KEY=sk-...
+sanitize server.log -s patterns.yaml --llm review-security \
+  --llm-endpoint https://api.openai.com/v1 \
+  --llm-model gpt-4o
+
+# Use --quick for one-off patterns without a secrets file:
+sanitize deploy.log --quick "tok-abc123,regex:sk-[A-Za-z0-9]{40}"
+sanitize app.log --quick "regex:AKIA[A-Z0-9]{16}" --quick "my-literal-secret"
 
 # Shannon entropy detection for unrecognized high-entropy tokens:
 sanitize server.log -s patterns.yaml --entropy-threshold 4.5
