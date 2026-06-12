@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 /// the temporary file is removed (best-effort cleanup).
 pub struct AtomicFileWriter {
     /// Buffered writer around the temporary file.
-    writer: BufWriter<File>,
+    /// `None` after `finish()` has consumed the writer (file closed before rename).
+    writer: Option<BufWriter<File>>,
     /// Path to the temporary file.
     tmp_path: PathBuf,
     /// Final destination path.
@@ -94,7 +95,7 @@ impl AtomicFileWriter {
         }
 
         Ok(Self {
-            writer: BufWriter::new(file),
+            writer: Some(BufWriter::new(file)),
             tmp_path,
             dest_path,
             finished: false,
@@ -109,11 +110,18 @@ impl AtomicFileWriter {
     /// Returns an I/O error if flush, sync, or rename fails.  On
     /// error, the temporary file is cleaned up on a best-effort basis.
     pub fn finish(mut self) -> io::Result<()> {
-        // Flush the BufWriter.
-        self.writer.flush()?;
-
-        // Fsync the underlying file.
-        self.writer.get_ref().sync_all()?;
+        // Unwrap the BufWriter, flushing any remaining buffer, then sync and
+        // explicitly close the file handle BEFORE the rename.  On Windows,
+        // keeping an open write handle across a rename can prevent subsequent
+        // readers from opening the destination path.
+        let mut writer = self
+            .writer
+            .take()
+            .expect("AtomicFileWriter::finish called after writer already consumed");
+        writer.flush()?;
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        drop(file);
 
         // Atomic rename.
         if let Err(e) = fs::rename(&self.tmp_path, &self.dest_path) {
@@ -142,25 +150,37 @@ impl AtomicFileWriter {
 
 impl Write for AtomicFileWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.writer.write(buf)
+        self.writer
+            .as_mut()
+            .expect("write after AtomicFileWriter::finish")
+            .write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        self.writer
+            .as_mut()
+            .expect("flush after AtomicFileWriter::finish")
+            .flush()
     }
 }
 
 impl io::Seek for AtomicFileWriter {
     fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
-        self.writer.flush()?;
-        self.writer.get_mut().seek(pos)
+        let writer = self
+            .writer
+            .as_mut()
+            .expect("seek after AtomicFileWriter::finish");
+        writer.flush()?;
+        writer.get_mut().seek(pos)
     }
 }
 
 impl Drop for AtomicFileWriter {
     fn drop(&mut self) {
         if !self.finished {
-            // Best-effort cleanup: remove the temporary file.
+            // Close the file handle before removing the temp file so that
+            // on Windows the remove_file call is not blocked by an open handle.
+            drop(self.writer.take());
             let _ = fs::remove_file(&self.tmp_path);
         }
     }

@@ -253,6 +253,8 @@ fn allow_flag_passes_value_through_unchanged() {
             output_path.to_str().unwrap(),
         ])
         .env("SANITIZE_LOG", "error")
+        .env("SANITIZE_NO_SETTINGS", "1")
+        .current_dir(dir.path())
         .output()
         .unwrap();
 
