@@ -2,8 +2,31 @@
 //! `-o <file>` / `-o <dir>` explicit paths.
 
 use std::fs;
+use std::io::ErrorKind;
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+/// Read a file with brief retry on `PermissionDenied`.
+///
+/// On Windows CI, real-time AV (Defender) can hold a transient lock on a
+/// file immediately after `AtomicFileWriter::finish` renames it into place,
+/// causing the test-side reopen to fail with `ERROR_ACCESS_DENIED` (os 5).
+/// Retry for up to ~500ms with short backoffs.
+fn read_to_string_retry(path: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match fs::read_to_string(path) {
+            Ok(s) => return s,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("read {}: {e}", path.display()),
+        }
+    }
+}
 
 fn secrets_json(dir: &std::path::Path) -> std::path::PathBuf {
     let p = dir.join("secrets.json");
@@ -162,7 +185,7 @@ fn explicit_output_file_is_written() {
 
     assert!(result.status.success());
     assert!(out.exists(), "explicit output file must be created");
-    let content = fs::read_to_string(&out).unwrap();
+    let content = read_to_string_retry(&out);
     assert!(!content.contains("SUPERSECRET"));
 }
 
@@ -199,6 +222,6 @@ fn output_dir_receives_all_sanitized_files() {
     let b_out = out_dir.join("b-sanitized.log");
     assert!(a_out.exists());
     assert!(b_out.exists());
-    assert!(!fs::read_to_string(&a_out).unwrap().contains("SUPERSECRET"));
-    assert!(!fs::read_to_string(&b_out).unwrap().contains("SUPERSECRET"));
+    assert!(!read_to_string_retry(&a_out).contains("SUPERSECRET"));
+    assert!(!read_to_string_retry(&b_out).contains("SUPERSECRET"));
 }

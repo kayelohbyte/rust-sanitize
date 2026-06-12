@@ -2,14 +2,36 @@
 //! `--context-keywords-replace`, and `--strip-values`.
 
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
+use std::path::Path;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 fn empty_secrets(dir: &std::path::Path) -> std::path::PathBuf {
     let p = dir.join("secrets.json");
     fs::write(&p, "[]").unwrap();
     p
+}
+
+/// Read a file with brief retry on `PermissionDenied`.
+///
+/// On Windows CI, real-time AV (Defender) can hold a transient lock on a
+/// file immediately after `AtomicFileWriter::finish` renames it into place,
+/// causing the test-side reopen to fail with `ERROR_ACCESS_DENIED` (os 5).
+/// Retry for up to ~500ms with short backoffs.
+fn read_to_string_retry(path: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match fs::read_to_string(path) {
+            Ok(s) => return s,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("read {}: {e}", path.display()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +265,7 @@ fn strip_values_removes_values_from_file() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let content = fs::read_to_string(&output_path).unwrap();
+    let content = read_to_string_retry(&output_path);
     assert!(content.contains("host"), "key should be preserved");
     assert!(content.contains("port"), "key should be preserved");
     assert!(content.contains("password"), "key should be preserved");
@@ -271,7 +293,7 @@ fn strip_values_preserves_comments_and_blank_lines_in_file() {
         .unwrap();
 
     assert!(out.status.success());
-    let content = fs::read_to_string(&output_path).unwrap();
+    let content = read_to_string_retry(&output_path);
     assert!(
         content.contains("# database settings"),
         "comment should be preserved"

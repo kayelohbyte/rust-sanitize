@@ -1,9 +1,31 @@
 //! Integration tests for CLI progress behavior in redirected (non-TTY) runs.
 
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
+use std::path::Path;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+/// Read a file with brief retry on `PermissionDenied`.
+///
+/// On Windows CI, real-time AV (Defender) can hold a transient lock on a
+/// file immediately after `AtomicFileWriter::finish` renames it into place,
+/// causing the test-side reopen to fail with `ERROR_ACCESS_DENIED` (os 5).
+/// Retry for up to ~500ms with short backoffs.
+fn read_to_string_retry(path: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match fs::read_to_string(path) {
+            Ok(s) => return s,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("read {}: {e}", path.display()),
+        }
+    }
+}
 
 fn write_test_inputs() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     let dir = tempdir().unwrap();
@@ -50,7 +72,7 @@ fn forced_progress_uses_stderr_and_keeps_stdout_payload_clean() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let file_output = fs::read_to_string(&output_path).unwrap();
+    let file_output = read_to_string_retry(&output_path);
 
     // File input now defaults to a per-file output path.
     assert!(stdout.trim().is_empty());
@@ -86,7 +108,7 @@ fn auto_progress_is_silent_in_non_tty_mode() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let file_output = fs::read_to_string(&output_path).unwrap();
+    let file_output = read_to_string_retry(&output_path);
 
     assert!(stdout.trim().is_empty());
     assert!(!file_output.contains("SUPERSECRET"));
