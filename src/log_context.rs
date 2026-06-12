@@ -379,25 +379,25 @@ pub fn extract_context_reader<R: io::BufRead>(
                     truncated = true;
                 }
             } else if let Some(idx) = hit_idx {
-                    let before: Vec<String> = before_buf.iter().cloned().collect();
-                    if cap == 0 {
-                        matches.push(LogContextMatch {
-                            line_number,
-                            keyword: config.keywords[idx].clone(),
-                            line: line.to_owned(),
-                            before,
-                            after: Vec::new(),
-                        });
-                    } else {
-                        pending.push(Pending {
-                            line_number,
-                            keyword: config.keywords[idx].clone(),
-                            line: line.to_owned(),
-                            before,
-                            after: Vec::new(),
-                            remaining: cap,
-                        });
-                    }
+                let before: Vec<String> = before_buf.iter().cloned().collect();
+                if cap == 0 {
+                    matches.push(LogContextMatch {
+                        line_number,
+                        keyword: config.keywords[idx].clone(),
+                        line: line.to_owned(),
+                        before,
+                        after: Vec::new(),
+                    });
+                } else {
+                    pending.push(Pending {
+                        line_number,
+                        keyword: config.keywords[idx].clone(),
+                        line: line.to_owned(),
+                        before,
+                        after: Vec::new(),
+                        remaining: cap,
+                    });
+                }
             }
         }
 

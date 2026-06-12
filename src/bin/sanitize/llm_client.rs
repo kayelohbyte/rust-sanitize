@@ -99,7 +99,10 @@ pub(crate) fn send_prompt(
         .map_err(|e| match e {
             ureq::Error::Status(code, resp) => {
                 let mut buf = Vec::new();
-                let _ = resp.into_reader().take(MAX_ERROR_BODY_BYTES).read_to_end(&mut buf);
+                let _ = resp
+                    .into_reader()
+                    .take(MAX_ERROR_BODY_BYTES)
+                    .read_to_end(&mut buf);
                 let body = String::from_utf8_lossy(&buf);
                 format!("LLM endpoint returned HTTP {code}: {body}")
             }
@@ -167,8 +170,14 @@ mod tests {
         let mut out = Vec::new();
         process_sse_stream(Cursor::new(input.as_bytes()), &mut out, MAX_STREAM_BYTES).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(!s.contains('\x1b'), "ESC bytes must be stripped; got: {s:?}");
-        assert!(s.contains("[31mred[0m"), "non-ESC chars must be preserved; got: {s:?}");
+        assert!(
+            !s.contains('\x1b'),
+            "ESC bytes must be stripped; got: {s:?}"
+        );
+        assert!(
+            s.contains("[31mred[0m"),
+            "non-ESC chars must be preserved; got: {s:?}"
+        );
     }
 
     #[test]
@@ -202,9 +211,10 @@ mod tests {
         let filler = format!("non-data-line: {}\n", "x".repeat(90));
         let input = filler.repeat(7);
         let mut out = Vec::new();
-        let err =
-            process_sse_stream(Cursor::new(input.as_bytes()), &mut out, limit).unwrap_err();
-        assert!(err.contains("exceeded"), "error must mention exceeded; got: {err}");
+        let err = process_sse_stream(Cursor::new(input.as_bytes()), &mut out, limit).unwrap_err();
+        assert!(
+            err.contains("exceeded"),
+            "error must mention exceeded; got: {err}"
+        );
     }
-
 }

@@ -157,14 +157,17 @@ pub use processor::{
     DEFAULT_FIELD_SIGNAL_THRESHOLD,
 };
 pub use report::{FileReport, ReportBuilder, ReportMetadata, SanitizeReport};
-pub use scanner::{MatchLocation, ScanConfig, ScanPattern, ScanProgress, ScanStats, SecretsLoadResult, StreamScanner};
+pub use scanner::{
+    MatchLocation, ScanConfig, ScanPattern, ScanProgress, ScanStats, SecretsLoadResult,
+    StreamScanner,
+};
 pub use secrets::{
     decrypt_secrets, encrypt_secrets, load_secrets_auto, looks_encrypted, SecretEntry,
     SecretsFormat,
 };
 pub use store::{MappingStore, StoreSnapshot};
 pub use strategy::{
-    CategoryAwareStrategy, EntropyMode, FakeIp, HmacHash, PreserveLength, RandomString,
-    RandomUuid, Strategy, StrategyGenerator,
+    CategoryAwareStrategy, EntropyMode, FakeIp, HmacHash, PreserveLength, RandomString, RandomUuid,
+    Strategy, StrategyGenerator,
 };
 pub use strip_values::strip_values_from_text;

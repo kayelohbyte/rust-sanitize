@@ -173,7 +173,11 @@ impl SanitizeReport {
             .iter()
             .map(|f| html_file_row(f, has_locations))
             .collect();
-        let first_line_header = if has_locations { "<th>First match</th>" } else { "" };
+        let first_line_header = if has_locations {
+            "<th>First match</th>"
+        } else {
+            ""
+        };
 
         format!(
             r#"<!DOCTYPE html>
@@ -425,16 +429,27 @@ fn html_file_row(f: &FileReport, has_locations: bool) -> String {
             })
             .collect()
     };
-    let match_class = if f.matches > 0 { "count-positive" } else { "count-zero" };
+    let match_class = if f.matches > 0 {
+        "count-positive"
+    } else {
+        "count-zero"
+    };
     let first_line_cell = if has_locations {
-        match f.match_locations.as_ref().and_then(|ml| ml.locations.first()) {
+        match f
+            .match_locations
+            .as_ref()
+            .and_then(|ml| ml.locations.first())
+        {
             Some(loc) => {
                 let truncated = if f.match_locations.as_ref().is_some_and(|ml| ml.truncated) {
                     r#"<span title="more matches not shown">…</span>"#
                 } else {
                     ""
                 };
-                format!("<td class=\"count-positive\">L{}{}</td>", loc.line, truncated)
+                format!(
+                    "<td class=\"count-positive\">L{}{}</td>",
+                    loc.line, truncated
+                )
             }
             None => "<td class=\"count-zero\">—</td>".to_owned(),
         }

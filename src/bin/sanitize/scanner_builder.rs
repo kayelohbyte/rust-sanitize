@@ -8,7 +8,6 @@ use rust_sanitize::{
     ScanConfig, ScanPattern, StreamScanner, DEFAULT_FIELD_SIGNAL_THRESHOLD,
 };
 
-
 /// Build an `Arc<MappingStore>` with the chosen generator mode.
 pub(crate) fn build_store(
     deterministic: bool,
@@ -104,32 +103,108 @@ pub(crate) fn balanced_secret_entries() -> Vec<SecretEntry> {
         }
     }
     vec![
-        e(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "email", "email"),
+        e(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            "email",
+            "email",
+        ),
         e(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "ipv4", "ipv4"),
-        e(r"\b(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}\b", "ipv6", "ipv6_full"),
-        e(r"\b(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{0,4}\b|\b::(?:[0-9A-Fa-f]{1,4}:){0,5}[0-9A-Fa-f]{1,4}\b", "ipv6", "ipv6_compressed"),
-        e(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b", "uuid", "uuid"),
-        e(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b", "jwt", "jwt"),
+        e(
+            r"\b(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}\b",
+            "ipv6",
+            "ipv6_full",
+        ),
+        e(
+            r"\b(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{0,4}\b|\b::(?:[0-9A-Fa-f]{1,4}:){0,5}[0-9A-Fa-f]{1,4}\b",
+            "ipv6",
+            "ipv6_compressed",
+        ),
+        e(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b",
+            "uuid",
+            "uuid",
+        ),
+        e(
+            r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+            "jwt",
+            "jwt",
+        ),
         e(r#"https?://[^\s"'<>;]+"#, "url", "url"),
-        e(r#"[a-z][a-z0-9+.-]+://[^:@\s]{1,128}:[^@\s]{1,128}@[^\s"'<>]+"#, "url", "credential_url"),
-        e(r"-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----", "auth_token", "private_key_header"),
-        e(r#"(?i)(?:api_key|api_secret|access_token|client_secret|private_key|secret_key|auth_key|signing_key|jwt_secret|jwt_key)[\s:="']+[A-Za-z0-9._~+/=-]{16,}"#, "auth_token", "secret_kv"),
-        e(r#"(?i)(?:password|passwd|pwd)[\s:="']+[^\s"']{6,}"#, "custom:password", "password_kv"),
-        e(r"/(?:home|Users)/[A-Za-z0-9_.-]+", "file_path", "user_home_path"),
+        e(
+            r#"[a-z][a-z0-9+.-]+://[^:@\s]{1,128}:[^@\s]{1,128}@[^\s"'<>]+"#,
+            "url",
+            "credential_url",
+        ),
+        e(
+            r"-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----",
+            "auth_token",
+            "private_key_header",
+        ),
+        e(
+            r#"(?i)(?:api_key|api_secret|access_token|client_secret|private_key|secret_key|auth_key|signing_key|jwt_secret|jwt_key)[\s:="']+[A-Za-z0-9._~+/=-]{16,}"#,
+            "auth_token",
+            "secret_kv",
+        ),
+        e(
+            r#"(?i)(?:password|passwd|pwd)[\s:="']+[^\s"']{6,}"#,
+            "custom:password",
+            "password_kv",
+        ),
+        e(
+            r"/(?:home|Users)/[A-Za-z0-9_.-]+",
+            "file_path",
+            "user_home_path",
+        ),
         e(r"\bsha256:[a-f0-9]{64}\b", "container_id", "image_digest"),
-        e(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b", "mac_address", "mac_address"),
-        e(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}\b", "auth_token", "github_token"),
-        e(r"\bgithub_pat_[A-Za-z0-9_]{82}\b", "auth_token", "github_pat_fine_grained"),
+        e(
+            r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b",
+            "mac_address",
+            "mac_address",
+        ),
+        e(
+            r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}\b",
+            "auth_token",
+            "github_token",
+        ),
+        e(
+            r"\bgithub_pat_[A-Za-z0-9_]{82}\b",
+            "auth_token",
+            "github_pat_fine_grained",
+        ),
         e(r"\bAIza[A-Za-z0-9_-]{35}\b", "auth_token", "gcp_api_key"),
-        e(r"\b(?:AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}\b", "auth_token", "aws_access_key_id"),
-        e(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{40,}\b", "auth_token", "openai_api_key"),
-        e(r"\bsk-ant-[A-Za-z0-9_-]{93,}\b", "auth_token", "anthropic_api_key"),
-        e(r"\bxox[bpars]-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*\b", "auth_token", "slack_token"),
+        e(
+            r"\b(?:AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}\b",
+            "auth_token",
+            "aws_access_key_id",
+        ),
+        e(
+            r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{40,}\b",
+            "auth_token",
+            "openai_api_key",
+        ),
+        e(
+            r"\bsk-ant-[A-Za-z0-9_-]{93,}\b",
+            "auth_token",
+            "anthropic_api_key",
+        ),
+        e(
+            r"\bxox[bpars]-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*\b",
+            "auth_token",
+            "slack_token",
+        ),
         e(r"\bnpm_[A-Za-z0-9]{36}\b", "auth_token", "npm_token"),
         e(r"\bhf_[A-Za-z0-9]{34}\b", "auth_token", "huggingface_token"),
-        e(r"\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{24,}\b", "auth_token", "stripe_key"),
+        e(
+            r"\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{24,}\b",
+            "auth_token",
+            "stripe_key",
+        ),
         e(r"\bglpat-[A-Za-z0-9_-]{20}\b", "auth_token", "gitlab_token"),
-        e(r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b", "auth_token", "sendgrid_api_key"),
+        e(
+            r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b",
+            "auth_token",
+            "sendgrid_api_key",
+        ),
         e(r"\bAC[a-f0-9]{32}\b", "auth_token", "twilio_account_sid"),
     ]
 }

@@ -23,14 +23,12 @@ use crate::cli_args::{
     Cli, ReportFormat, DEFAULT_MAX_STRUCTURED_FILE_SIZE, DEFAULT_PROGRESS_INTERVAL_MS,
 };
 use crate::config::{find_project_config, load_project_config, load_settings, SanitizeConfig};
-use rust_sanitize::{DEFAULT_ARCHIVE_DEPTH, DEFAULT_CONTEXT_LINES, DEFAULT_MAX_MATCHES};
 use crate::crypto::resolve_sanitize_password;
 use crate::dispatch::{
     abs_label, load_profiles, print_entropy_histogram, save_discovered_secrets, write_output,
     FileProcessor, LlmCollector,
 };
 use crate::entropy::{entropy_configs_from_entries, EntropyBuckets, EntropyConfig};
-use crate::scanner_builder::balanced_secret_entries;
 use crate::hooks::global_default_secrets_path;
 use crate::input::{
     cli_writes_to_stdout, derive_auto_report_path, plan_input_targets, resolve_thread_count,
@@ -38,10 +36,12 @@ use crate::input::{
 };
 use crate::progress::{ProgressContext, ProgressPolicy, ProgressReporter, SharedProgressReporter};
 use crate::run_header::{print_run_header, CliConfigSnapshot};
+use crate::scanner_builder::balanced_secret_entries;
 use crate::scanner_builder::{
     build_augmented_scanner, build_default_patterns, build_scan_config, build_store,
     builtin_field_name_signals, common_allow_patterns, field_signals_from_entries,
 };
+use rust_sanitize::{DEFAULT_ARCHIVE_DEPTH, DEFAULT_CONTEXT_LINES, DEFAULT_MAX_MATCHES};
 
 /// Apply a `bool` setting from a config layer: skip if the flag is already set by a higher-priority source.
 macro_rules! apply_bool_flag {
@@ -112,7 +112,12 @@ fn apply_settings_layer(cli: &mut Cli, s: SanitizeConfig) {
     // Concrete fields: only applied when the CLI still holds the compile-time default.
     apply_concrete_field!(cli, s, chunk_size, 1_048_576_usize);
     apply_concrete_field!(cli, s, max_mappings, 10_000_000_usize);
-    apply_concrete_field!(cli, s, max_structured_size, DEFAULT_MAX_STRUCTURED_FILE_SIZE);
+    apply_concrete_field!(
+        cli,
+        s,
+        max_structured_size,
+        DEFAULT_MAX_STRUCTURED_FILE_SIZE
+    );
     apply_concrete_field!(cli, s, max_archive_depth, DEFAULT_ARCHIVE_DEPTH);
     apply_concrete_field!(cli, s, context_lines, DEFAULT_CONTEXT_LINES);
     apply_concrete_field!(cli, s, max_context_matches, DEFAULT_MAX_MATCHES);
@@ -160,7 +165,12 @@ fn apply_project_config_layer(cli: &mut Cli, pc: SanitizeConfig, config_dir: &st
     // Concrete fields
     apply_concrete_field!(cli, pc, chunk_size, 1_048_576_usize);
     apply_concrete_field!(cli, pc, max_mappings, 10_000_000_usize);
-    apply_concrete_field!(cli, pc, max_structured_size, DEFAULT_MAX_STRUCTURED_FILE_SIZE);
+    apply_concrete_field!(
+        cli,
+        pc,
+        max_structured_size,
+        DEFAULT_MAX_STRUCTURED_FILE_SIZE
+    );
     apply_concrete_field!(cli, pc, max_archive_depth, DEFAULT_ARCHIVE_DEPTH);
     apply_concrete_field!(cli, pc, context_lines, DEFAULT_CONTEXT_LINES);
     apply_concrete_field!(cli, pc, max_context_matches, DEFAULT_MAX_MATCHES);
@@ -361,31 +371,38 @@ fn load_run_resources(
     }
 
     if !cli.quick.is_empty() {
-        let quick_entries: Vec<SecretEntry> = cli.quick.iter().map(|p| {
-            let (kind, pattern) = if let Some(rx) = p.strip_prefix("regex:") {
-                ("regex", rx)
-            } else {
-                ("literal", p.as_str())
-            };
-            SecretEntry {
-                pattern: pattern.to_string(),
-                kind: kind.to_string(),
-                category: "auth_token".to_string(),
-                label: Some(format!("quick:{p}")),
-                values: vec![],
-                min_length: None,
-                max_length: None,
-                threshold: None,
-                charset: None,
-            }
-        }).collect();
+        let quick_entries: Vec<SecretEntry> = cli
+            .quick
+            .iter()
+            .map(|p| {
+                let (kind, pattern) = if let Some(rx) = p.strip_prefix("regex:") {
+                    ("regex", rx)
+                } else {
+                    ("literal", p.as_str())
+                };
+                SecretEntry {
+                    pattern: pattern.to_string(),
+                    kind: kind.to_string(),
+                    category: "auth_token".to_string(),
+                    label: Some(format!("quick:{p}")),
+                    values: vec![],
+                    min_length: None,
+                    max_length: None,
+                    threshold: None,
+                    charset: None,
+                }
+            })
+            .collect();
         let (patterns, errors) = entries_to_patterns(&quick_entries);
         if !errors.is_empty() {
             let msgs: Vec<String> = errors
                 .iter()
                 .map(|(i, e)| format!("position {i}: {e}"))
                 .collect();
-            return Err((format!("invalid --quick pattern(s): {}", msgs.join("; ")), 1));
+            return Err((
+                format!("invalid --quick pattern(s): {}", msgs.join("; ")),
+                1,
+            ));
         }
         base_patterns.extend(patterns);
     }
@@ -421,8 +438,7 @@ fn load_run_resources(
         if all_allow_patterns.is_empty() {
             None
         } else {
-            let al_result =
-                rust_sanitize::allowlist::AllowlistMatcher::new(all_allow_patterns);
+            let al_result = rust_sanitize::allowlist::AllowlistMatcher::new(all_allow_patterns);
             for w in &al_result.warnings {
                 warn!(warning = %w, "allowlist pattern warning");
             }

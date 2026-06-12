@@ -910,9 +910,16 @@ mod tests {
             EntropyMode::Random,
         ));
         let store = crate::store::MappingStore::new(gen, None);
-        let r1 = store.get_or_insert(&Category::Email, "alice@corp.com").unwrap();
-        let r2 = store.get_or_insert(&Category::Email, "alice@corp.com").unwrap();
-        assert_eq!(r1, r2, "store cache must return same replacement within run");
+        let r1 = store
+            .get_or_insert(&Category::Email, "alice@corp.com")
+            .unwrap();
+        let r2 = store
+            .get_or_insert(&Category::Email, "alice@corp.com")
+            .unwrap();
+        assert_eq!(
+            r1, r2,
+            "store cache must return same replacement within run"
+        );
         assert!(r1.contains('@'), "replacement must be email-shaped");
         assert_eq!(r1.len(), "alice@corp.com".len(), "length must be preserved");
     }

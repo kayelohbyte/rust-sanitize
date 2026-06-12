@@ -56,11 +56,7 @@ fn merge_entropy_counts(stats: &mut ScanStats, label_counts: HashMap<String, u64
 /// Run entropy scanning on `bytes` in-place, merging label counts into `stats`.
 /// Returns the (potentially modified) bytes; does nothing when entropy configs
 /// is empty, which is the common case.
-fn apply_entropy_inplace(
-    bytes: Vec<u8>,
-    stats: &mut ScanStats,
-    fp: FileProcessor<'_>,
-) -> Vec<u8> {
+fn apply_entropy_inplace(bytes: Vec<u8>, stats: &mut ScanStats, fp: FileProcessor<'_>) -> Vec<u8> {
     if fp.entropy_configs.is_empty() {
         return bytes;
     }
@@ -88,7 +84,11 @@ fn finalize_buffered_scan(
     let had_matches = stats.matches_found > 0;
 
     if let Some(rb) = fp.report_builder {
-        rb.record_file(FileReport::from_scan_stats(label.to_string(), stats, method));
+        rb.record_file(FileReport::from_scan_stats(
+            label.to_string(),
+            stats,
+            method,
+        ));
     }
 
     if cli.dry_run {
@@ -609,8 +609,13 @@ impl<'a> FileProcessor<'a> {
                 let (mut output_bytes, mut stats) = scanner_fallback(fp.scanner, &input_bytes)?;
                 output_bytes = apply_entropy_inplace(output_bytes, &mut stats, fp);
                 had_matches = finalize_buffered_scan(
-                    &output_bytes, &stats, "<stdin>", "scanner",
-                    output_path, cli, fp,
+                    &output_bytes,
+                    &stats,
+                    "<stdin>",
+                    "scanner",
+                    output_path,
+                    cli,
+                    fp,
                 )?;
                 Ok(had_matches)
             });
@@ -1196,8 +1201,13 @@ impl<'a> FileProcessor<'a> {
 
             let label = input.display().to_string();
             finalize_buffered_scan(
-                &output_bytes, &stats, &label, method.as_str(),
-                output_path, cli, fp,
+                &output_bytes,
+                &stats,
+                &label,
+                method.as_str(),
+                output_path,
+                cli,
+                fp,
             )
         })
     }
@@ -1292,11 +1302,20 @@ impl<'a> FileProcessor<'a> {
                     }
                     if let Some(rb) = fp.report_builder {
                         rb.record_file(
-                            FileReport::from_scan_stats(input.display().to_string(), &stats, method)
-                                .with_match_locations(locs, locs_truncated),
+                            FileReport::from_scan_stats(
+                                input.display().to_string(),
+                                &stats,
+                                method,
+                            )
+                            .with_match_locations(locs, locs_truncated),
                         );
                     }
-                    maybe_extract_context(&buf, &input.display().to_string(), cli, fp.report_builder);
+                    maybe_extract_context(
+                        &buf,
+                        &input.display().to_string(),
+                        cli,
+                        fp.report_builder,
+                    );
                     if llm_opt.is_some() {
                         maybe_collect_for_llm(&buf, &abs_label(input), llm_opt.as_ref());
                     } else {
@@ -1746,7 +1765,10 @@ mod tests {
     #[test]
     fn looks_binary_passes_text_with_tabs_and_cr() {
         let text = b"col1\tcol2\r\nval1\tval2\r\n";
-        assert!(!looks_binary(text), "tabs and CR should not count as binary");
+        assert!(
+            !looks_binary(text),
+            "tabs and CR should not count as binary"
+        );
     }
 
     #[test]

@@ -1062,7 +1062,11 @@ impl StreamScanner {
             crate::secrets::load_encrypted_secrets(encrypted_bytes, password, format)?;
         patterns.extend(extra_patterns);
         let scanner = Self::new(patterns, store, config)?;
-        Ok(SecretsLoadResult { scanner, warnings, allow_patterns })
+        Ok(SecretsLoadResult {
+            scanner,
+            warnings,
+            allow_patterns,
+        })
     }
 
     /// Create a scanner from a plaintext secrets file.
@@ -1091,7 +1095,11 @@ impl StreamScanner {
             crate::secrets::load_plaintext_secrets(plaintext, format)?;
         patterns.extend(extra_patterns);
         let scanner = Self::new(patterns, store, config)?;
-        Ok(SecretsLoadResult { scanner, warnings, allow_patterns })
+        Ok(SecretsLoadResult {
+            scanner,
+            warnings,
+            allow_patterns,
+        })
     }
 
     // ---- Internal helpers ----

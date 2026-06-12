@@ -517,7 +517,10 @@ mod tests {
     #[test]
     fn regex_invalid_pattern_produces_warning_and_is_skipped() {
         let result = AllowlistMatcher::new(vec!["regex:[invalid".into()]);
-        assert!(!result.warnings.is_empty(), "invalid regex must produce a warning");
+        assert!(
+            !result.warnings.is_empty(),
+            "invalid regex must produce a warning"
+        );
         assert!(result.warnings[0].contains("failed to compile"));
         // Pattern is skipped — nothing is allowed.
         assert!(!result.matcher.is_allowed("anything"));

@@ -482,7 +482,9 @@ fn plaintext_secrets_detects_matches_for_fail_on_match() {
 
     // Input without secrets.
     let store2 = make_hmac_store();
-    let SecretsLoadResult { scanner: scanner2, .. } = StreamScanner::from_plaintext_secrets(
+    let SecretsLoadResult {
+        scanner: scanner2, ..
+    } = StreamScanner::from_plaintext_secrets(
         sample_json().as_bytes(),
         Some(SecretsFormat::Json),
         store2,
@@ -616,7 +618,9 @@ fn file_backed_plaintext_secrets() {
     // Load directly — no encryption step.
     let data = fs::read(&secrets_path).unwrap();
     let store = make_hmac_store();
-    let SecretsLoadResult { scanner, warnings, .. } = StreamScanner::from_plaintext_secrets(
+    let SecretsLoadResult {
+        scanner, warnings, ..
+    } = StreamScanner::from_plaintext_secrets(
         &data,
         Some(SecretsFormat::Json),
         store,
@@ -706,7 +710,11 @@ fn plaintext_load_allow_entries_populate_allow_patterns() {
 - pattern: 'catch-me'\n  kind: literal\n  category: auth_token\n";
 
     let store = make_hmac_store();
-    let SecretsLoadResult { warnings, allow_patterns, .. } = StreamScanner::from_plaintext_secrets(
+    let SecretsLoadResult {
+        warnings,
+        allow_patterns,
+        ..
+    } = StreamScanner::from_plaintext_secrets(
         secrets_yaml,
         Some(SecretsFormat::Yaml),
         store,
@@ -715,7 +723,10 @@ fn plaintext_load_allow_entries_populate_allow_patterns() {
     )
     .unwrap();
 
-    assert!(warnings.is_empty(), "no warnings expected; got: {warnings:?}");
+    assert!(
+        warnings.is_empty(),
+        "no warnings expected; got: {warnings:?}"
+    );
     assert!(
         allow_patterns.contains(&"safe-value".to_string()),
         "allow_patterns must include single-pattern allow entry; got: {allow_patterns:?}"

@@ -53,13 +53,25 @@ fn quick_literal_is_redacted() {
     let secrets = empty_secrets(dir.path());
 
     let out = run_stdin(
-        &["-", "-s", secrets.to_str().unwrap(), "--quick", "supersecret"],
+        &[
+            "-",
+            "-s",
+            secrets.to_str().unwrap(),
+            "--quick",
+            "supersecret",
+        ],
         b"value: supersecret end",
     );
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let s = stdout(&out);
-    assert!(!s.contains("supersecret"), "literal should be redacted; got: {s}");
-    assert!(s.contains("value:"), "surrounding text should survive; got: {s}");
+    assert!(
+        !s.contains("supersecret"),
+        "literal should be redacted; got: {s}"
+    );
+    assert!(
+        s.contains("value:"),
+        "surrounding text should survive; got: {s}"
+    );
 }
 
 #[test]
@@ -68,13 +80,25 @@ fn quick_comma_separated_both_redacted() {
     let secrets = empty_secrets(dir.path());
 
     let out = run_stdin(
-        &["-", "-s", secrets.to_str().unwrap(), "--quick", "tok-aaa,tok-bbb"],
+        &[
+            "-",
+            "-s",
+            secrets.to_str().unwrap(),
+            "--quick",
+            "tok-aaa,tok-bbb",
+        ],
         b"first=tok-aaa second=tok-bbb",
     );
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let s = stdout(&out);
-    assert!(!s.contains("tok-aaa"), "first literal should be redacted; got: {s}");
-    assert!(!s.contains("tok-bbb"), "second literal should be redacted; got: {s}");
+    assert!(
+        !s.contains("tok-aaa"),
+        "first literal should be redacted; got: {s}"
+    );
+    assert!(
+        !s.contains("tok-bbb"),
+        "second literal should be redacted; got: {s}"
+    );
 }
 
 #[test]
@@ -85,16 +109,25 @@ fn quick_repeated_flags_accumulate() {
     let out = run_stdin(
         &[
             "-",
-            "-s", secrets.to_str().unwrap(),
-            "--quick", "alpha-secret",
-            "--quick", "beta-secret",
+            "-s",
+            secrets.to_str().unwrap(),
+            "--quick",
+            "alpha-secret",
+            "--quick",
+            "beta-secret",
         ],
         b"a=alpha-secret b=beta-secret",
     );
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let s = stdout(&out);
-    assert!(!s.contains("alpha-secret"), "first repeated flag value should be redacted; got: {s}");
-    assert!(!s.contains("beta-secret"), "second repeated flag value should be redacted; got: {s}");
+    assert!(
+        !s.contains("alpha-secret"),
+        "first repeated flag value should be redacted; got: {s}"
+    );
+    assert!(
+        !s.contains("beta-secret"),
+        "second repeated flag value should be redacted; got: {s}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -109,15 +142,23 @@ fn quick_regex_prefix_matches_by_pattern() {
     let out = run_stdin(
         &[
             "-",
-            "-s", secrets.to_str().unwrap(),
-            "--quick", r"regex:tok-[A-Za-z0-9]{8}",
+            "-s",
+            secrets.to_str().unwrap(),
+            "--quick",
+            r"regex:tok-[A-Za-z0-9]{8}",
         ],
         b"token tok-AbCd1234 safe",
     );
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let s = stdout(&out);
-    assert!(!s.contains("tok-AbCd1234"), "regex match should be redacted; got: {s}");
-    assert!(s.contains("safe"), "non-matching text should survive; got: {s}");
+    assert!(
+        !s.contains("tok-AbCd1234"),
+        "regex match should be redacted; got: {s}"
+    );
+    assert!(
+        s.contains("safe"),
+        "non-matching text should survive; got: {s}"
+    );
 }
 
 #[test]
@@ -128,8 +169,10 @@ fn quick_regex_does_not_match_different_value() {
     let out = run_stdin(
         &[
             "-",
-            "-s", secrets.to_str().unwrap(),
-            "--quick", r"regex:tok-[A-Za-z0-9]{8}",
+            "-s",
+            secrets.to_str().unwrap(),
+            "--quick",
+            r"regex:tok-[A-Za-z0-9]{8}",
         ],
         b"tok-short",
     );
@@ -137,7 +180,10 @@ fn quick_regex_does_not_match_different_value() {
     let s = stdout(&out);
     // "tok-short" is only 9 chars but regex requires exactly 8 alnum after "tok-"
     // "short" = 5 chars, so it won't match the 8-char pattern
-    assert!(s.contains("tok-short"), "non-matching value should pass through; got: {s}");
+    assert!(
+        s.contains("tok-short"),
+        "non-matching value should pass through; got: {s}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -156,13 +202,25 @@ fn quick_is_additive_with_secrets_file() {
     .unwrap();
 
     let out = run_stdin(
-        &["-", "-s", secrets.to_str().unwrap(), "--quick", "quick-secret"],
+        &[
+            "-",
+            "-s",
+            secrets.to_str().unwrap(),
+            "--quick",
+            "quick-secret",
+        ],
         b"a=file-secret b=quick-secret",
     );
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let s = stdout(&out);
-    assert!(!s.contains("file-secret"), "secrets-file pattern should still fire; got: {s}");
-    assert!(!s.contains("quick-secret"), "--quick pattern should fire too; got: {s}");
+    assert!(
+        !s.contains("file-secret"),
+        "secrets-file pattern should still fire; got: {s}"
+    );
+    assert!(
+        !s.contains("quick-secret"),
+        "--quick pattern should fire too; got: {s}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +237,10 @@ fn quick_works_without_secrets_file() {
     );
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let s = stdout(&out);
-    assert!(!s.contains("my-one-off-value"), "--quick literal should be redacted without a secrets file; got: {s}");
+    assert!(
+        !s.contains("my-one-off-value"),
+        "--quick literal should be redacted without a secrets file; got: {s}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +255,13 @@ fn quick_empty_pattern_is_rejected() {
     fs::write(&input, b"hello").unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-        .args([input.to_str().unwrap(), "-s", secrets.to_str().unwrap(), "--quick", ""])
+        .args([
+            input.to_str().unwrap(),
+            "-s",
+            secrets.to_str().unwrap(),
+            "--quick",
+            "",
+        ])
         .env("SANITIZE_LOG", "error")
         .env("SANITIZE_NO_SETTINGS", "1")
         .output()
@@ -216,7 +283,13 @@ fn quick_empty_regex_prefix_is_rejected() {
     fs::write(&input, b"hello").unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-        .args([input.to_str().unwrap(), "-s", secrets.to_str().unwrap(), "--quick", "regex:"])
+        .args([
+            input.to_str().unwrap(),
+            "-s",
+            secrets.to_str().unwrap(),
+            "--quick",
+            "regex:",
+        ])
         .env("SANITIZE_LOG", "error")
         .env("SANITIZE_NO_SETTINGS", "1")
         .output()
@@ -244,16 +317,22 @@ fn quick_multiple_invalid_patterns_all_reported() {
     let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
         .args([
             input.to_str().unwrap(),
-            "-s", secrets.to_str().unwrap(),
-            "--quick", "regex:(unclosed-first",
-            "--quick", "regex:(unclosed-second",
+            "-s",
+            secrets.to_str().unwrap(),
+            "--quick",
+            "regex:(unclosed-first",
+            "--quick",
+            "regex:(unclosed-second",
         ])
         .env("SANITIZE_LOG", "error")
         .env("SANITIZE_NO_SETTINGS", "1")
         .output()
         .unwrap();
 
-    assert!(!out.status.success(), "multiple invalid patterns should fail");
+    assert!(
+        !out.status.success(),
+        "multiple invalid patterns should fail"
+    );
     let err = stderr(&out);
     assert!(
         err.contains("position 0") && err.contains("position 1"),
@@ -274,10 +353,13 @@ fn quick_regex_label_preserved_in_report() {
     let out = run_stdin(
         &[
             "-",
-            "-s", secrets.to_str().unwrap(),
+            "-s",
+            secrets.to_str().unwrap(),
             "--dry-run",
-            "--quick", "regex:SK-[A-Z]{8}",
-            "--report", report_path.to_str().unwrap(),
+            "--quick",
+            "regex:SK-[A-Z]{8}",
+            "--report",
+            report_path.to_str().unwrap(),
         ],
         b"token SK-ABCDEFGH end",
     );
@@ -302,7 +384,14 @@ fn quick_deterministic_produces_stable_replacement() {
     // Run twice with the same seed — the replacement for "mysecret" must be identical.
     let run = |n: u8| {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sanitize"))
-            .args(["-", "-s", secrets.to_str().unwrap(), "--quick", "mysecret", "--deterministic"])
+            .args([
+                "-",
+                "-s",
+                secrets.to_str().unwrap(),
+                "--quick",
+                "mysecret",
+                "--deterministic",
+            ])
             .env("SANITIZE_LOG", "error")
             .env("SANITIZE_NO_SETTINGS", "1")
             .env("SANITIZE_PASSWORD", format!("testpass{n}"))
@@ -311,7 +400,12 @@ fn quick_deterministic_produces_stable_replacement() {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.as_mut().unwrap().write_all(b"value: mysecret end").unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"value: mysecret end")
+            .unwrap();
         child.wait_with_output().unwrap()
     };
 
@@ -322,14 +416,23 @@ fn quick_deterministic_produces_stable_replacement() {
 
     let s1 = stdout(&out1);
     let s2 = stdout(&out2);
-    assert!(!s1.contains("mysecret"), "literal should be redacted; got: {s1}");
-    assert_eq!(s1, s2, "same seed must produce identical output on repeated runs");
+    assert!(
+        !s1.contains("mysecret"),
+        "literal should be redacted; got: {s1}"
+    );
+    assert_eq!(
+        s1, s2,
+        "same seed must produce identical output on repeated runs"
+    );
 
     // Different seed must produce a different replacement.
     let out3 = run(1);
     assert!(out3.status.success(), "stderr: {}", stderr(&out3));
     let s3 = stdout(&out3);
-    assert!(!s3.contains("mysecret"), "literal should be redacted with different seed; got: {s3}");
+    assert!(
+        !s3.contains("mysecret"),
+        "literal should be redacted with different seed; got: {s3}"
+    );
     assert_ne!(s1, s3, "different seed must produce different replacement");
 }
 
@@ -343,7 +446,13 @@ fn quick_non_matching_literal_leaves_text_unchanged() {
     let secrets = empty_secrets(dir.path());
 
     let out = run_stdin(
-        &["-", "-s", secrets.to_str().unwrap(), "--quick", "not-in-input"],
+        &[
+            "-",
+            "-s",
+            secrets.to_str().unwrap(),
+            "--quick",
+            "not-in-input",
+        ],
         b"hello world",
     );
     assert!(out.status.success(), "stderr: {}", stderr(&out));

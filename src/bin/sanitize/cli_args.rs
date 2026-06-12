@@ -289,11 +289,21 @@ pub(crate) struct Cli {
     /// Send the --llm prompt to an OpenAI-compatible endpoint instead of printing to stdout.
     /// Requires --llm. Env: SANITIZE_LLM_ENDPOINT.
     /// Example: http://localhost:11434/v1  (Ollama)
-    #[arg(long, value_name = "URL", env = "SANITIZE_LLM_ENDPOINT", requires = "llm")]
+    #[arg(
+        long,
+        value_name = "URL",
+        env = "SANITIZE_LLM_ENDPOINT",
+        requires = "llm"
+    )]
     pub(crate) llm_endpoint: Option<String>,
 
     /// Model name for --llm-endpoint (e.g. phi4-mini, gpt-4o). Env: SANITIZE_LLM_MODEL.
-    #[arg(long, value_name = "MODEL", env = "SANITIZE_LLM_MODEL", requires = "llm_endpoint")]
+    #[arg(
+        long,
+        value_name = "MODEL",
+        env = "SANITIZE_LLM_MODEL",
+        requires = "llm_endpoint"
+    )]
     pub(crate) llm_model: Option<String>,
 
     /// API key for --llm-endpoint. Prefer SANITIZE_LLM_KEY env var for real keys;

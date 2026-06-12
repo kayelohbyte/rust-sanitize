@@ -796,8 +796,14 @@ fn toml_replaces_targeted_values_preserves_structure() {
 
     // Targeted values replaced.
     assert!(!text.contains("s3cret!"), "db password must be replaced");
-    assert!(!text.contains("admin@corp.com"), "smtp user must be replaced");
-    assert!(!text.contains("smtp-pass"), "smtp password must be replaced");
+    assert!(
+        !text.contains("admin@corp.com"),
+        "smtp user must be replaced"
+    );
+    assert!(
+        !text.contains("smtp-pass"),
+        "smtp password must be replaced"
+    );
 
     // Untargeted values preserved.
     assert!(text.contains("db-prod.corp.com"), "host must be preserved");
@@ -819,7 +825,10 @@ fn toml_via_registry_dispatch() {
     assert!(result.is_some(), "registry must dispatch to TOML processor");
     let text = String::from_utf8(result.unwrap()).unwrap();
     assert!(!text.contains("sk-secret-123"));
-    assert!(text.contains("internal.corp.com"), "untargeted field preserved");
+    assert!(
+        text.contains("internal.corp.com"),
+        "untargeted field preserved"
+    );
 }
 
 #[test]
@@ -831,7 +840,10 @@ fn toml_replacement_is_deterministic() {
     let store2 = make_store();
     let out1 = TomlProcessor.process(content, &profile, &store1).unwrap();
     let out2 = TomlProcessor.process(content, &profile, &store2).unwrap();
-    assert_eq!(out1, out2, "identical seed + input must produce identical output");
+    assert_eq!(
+        out1, out2,
+        "identical seed + input must produce identical output"
+    );
 }
 
 // ===========================================================================
@@ -846,22 +858,28 @@ fn env_replaces_targeted_values_preserves_keys_and_structure() {
         b"# App config\nDATABASE_URL=postgres://user:s3cret@prod-db/app\nAPI_KEY=sk-abc123\nDEBUG=false\n";
     let profile = FileTypeProfile::new(
         "env",
-        vec![
-            FieldRule::new("DATABASE_URL"),
-            FieldRule::new("API_KEY"),
-        ],
+        vec![FieldRule::new("DATABASE_URL"), FieldRule::new("API_KEY")],
     );
     let output = proc.process(content, &profile, &store).unwrap();
     let text = String::from_utf8(output).unwrap();
 
     // Secrets replaced.
-    assert!(!text.contains("s3cret"), "DATABASE_URL value must be replaced");
-    assert!(!text.contains("sk-abc123"), "API_KEY value must be replaced");
+    assert!(
+        !text.contains("s3cret"),
+        "DATABASE_URL value must be replaced"
+    );
+    assert!(
+        !text.contains("sk-abc123"),
+        "API_KEY value must be replaced"
+    );
 
     // Keys and unrelated values preserved.
     assert!(text.contains("DATABASE_URL="), "key must be preserved");
     assert!(text.contains("API_KEY="), "key must be preserved");
-    assert!(text.contains("DEBUG=false"), "untargeted line must be unchanged");
+    assert!(
+        text.contains("DEBUG=false"),
+        "untargeted line must be unchanged"
+    );
     assert!(text.contains("# App config"), "comment must be preserved");
 }
 
@@ -876,7 +894,10 @@ fn env_via_registry_dispatch() {
     assert!(result.is_some(), "registry must dispatch to ENV processor");
     let text = String::from_utf8(result.unwrap()).unwrap();
     assert!(!text.contains("hunter2"));
-    assert!(text.contains("PUBLIC_HOST=example.com"), "untargeted line preserved");
+    assert!(
+        text.contains("PUBLIC_HOST=example.com"),
+        "untargeted line preserved"
+    );
 }
 
 #[test]
@@ -913,12 +934,21 @@ fn ini_replaces_targeted_values_preserves_sections_and_keys() {
     // Targeted values replaced.
     assert!(!text.contains("hunter2"), "db password must be replaced");
     assert!(!text.contains("ops@corp.com"), "smtp user must be replaced");
-    assert!(!text.contains("mail-secret"), "smtp password must be replaced");
+    assert!(
+        !text.contains("mail-secret"),
+        "smtp password must be replaced"
+    );
 
     // Structure preserved.
-    assert!(text.contains("[database]"), "section header must be preserved");
+    assert!(
+        text.contains("[database]"),
+        "section header must be preserved"
+    );
     assert!(text.contains("[smtp]"), "section header must be preserved");
-    assert!(text.contains("host = db.corp.com"), "untargeted value preserved");
+    assert!(
+        text.contains("host = db.corp.com"),
+        "untargeted value preserved"
+    );
     assert!(text.contains("port = 5432"), "untargeted value preserved");
 }
 
@@ -933,7 +963,10 @@ fn ini_via_registry_dispatch() {
     assert!(result.is_some(), "registry must dispatch to INI processor");
     let text = String::from_utf8(result.unwrap()).unwrap();
     assert!(!text.contains("topsecret"));
-    assert!(text.contains("region = us-east-1"), "untargeted value preserved");
+    assert!(
+        text.contains("region = us-east-1"),
+        "untargeted value preserved"
+    );
 }
 
 #[test]
@@ -943,7 +976,10 @@ fn ini_comments_and_blank_lines_unchanged() {
     let profile = FileTypeProfile::new("ini", vec![FieldRule::new("section.key")]);
     let output = IniProcessor.process(content, &profile, &store).unwrap();
     let text = String::from_utf8(output).unwrap();
-    assert!(text.contains("; Global config"), "semicolon comment preserved");
+    assert!(
+        text.contains("; Global config"),
+        "semicolon comment preserved"
+    );
     assert!(text.contains("# Another comment"), "hash comment preserved");
     assert!(!text.contains("value"), "targeted value replaced");
 }
@@ -952,14 +988,17 @@ fn ini_comments_and_blank_lines_unchanged() {
 fn ini_colon_delimiter_value_replaced() {
     let store = make_store();
     let content = b"[database]\nhost: db.corp.com\npassword: hunter2\nport: 5432\n";
-    let profile = FileTypeProfile::new(
-        "ini",
-        vec![FieldRule::new("database.password")],
-    );
+    let profile = FileTypeProfile::new("ini", vec![FieldRule::new("database.password")]);
     let output = IniProcessor.process(content, &profile, &store).unwrap();
     let text = String::from_utf8(output).unwrap();
-    assert!(!text.contains("hunter2"), "colon-delimited password must be replaced");
-    assert!(text.contains("host: db.corp.com"), "untargeted colon-value preserved");
+    assert!(
+        !text.contains("hunter2"),
+        "colon-delimited password must be replaced"
+    );
+    assert!(
+        text.contains("host: db.corp.com"),
+        "untargeted colon-value preserved"
+    );
     assert!(text.contains("port: 5432"), "untargeted port preserved");
     assert!(text.contains("[database]"), "section header preserved");
 }
@@ -968,14 +1007,17 @@ fn ini_colon_delimiter_value_replaced() {
 fn ini_global_key_before_section_replaced() {
     let store = make_store();
     let content = b"api_key = globaltoken\ndebug = false\n\n[section]\nother = value\n";
-    let profile = FileTypeProfile::new(
-        "ini",
-        vec![FieldRule::new("api_key")],
-    );
+    let profile = FileTypeProfile::new("ini", vec![FieldRule::new("api_key")]);
     let output = IniProcessor.process(content, &profile, &store).unwrap();
     let text = String::from_utf8(output).unwrap();
-    assert!(!text.contains("globaltoken"), "global key value must be replaced");
-    assert!(text.contains("debug = false"), "untargeted global key preserved");
+    assert!(
+        !text.contains("globaltoken"),
+        "global key value must be replaced"
+    );
+    assert!(
+        text.contains("debug = false"),
+        "untargeted global key preserved"
+    );
     assert!(text.contains("[section]"), "section header preserved");
     assert!(text.contains("other = value"), "section value preserved");
 }

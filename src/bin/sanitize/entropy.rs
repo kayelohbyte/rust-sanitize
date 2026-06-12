@@ -330,12 +330,15 @@ impl io::Seek for NullSeekWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_sanitize::{MappingStore, RandomGenerator};
     use rust_sanitize::secrets::SecretEntry;
+    use rust_sanitize::{MappingStore, RandomGenerator};
     use std::sync::Arc;
 
     fn test_store() -> Arc<MappingStore> {
-        Arc::new(MappingStore::new(Arc::new(RandomGenerator::default()), None))
+        Arc::new(MappingStore::new(
+            Arc::new(RandomGenerator::default()),
+            None,
+        ))
     }
 
     fn make_entropy_entry(
@@ -487,9 +490,15 @@ mod tests {
             ..EntropyConfig::default()
         };
         let result = entropy_histogram_bytes(b"AKIAIOSFODNN7EXAMPLE", &[cfg]);
-        assert!(result[0].total_candidates >= 1, "token should be a candidate");
+        assert!(
+            result[0].total_candidates >= 1,
+            "token should be a candidate"
+        );
         // 3.0-bit bucket should be set
-        assert!(result[0].counts[0] >= 1, "should have a count at >=3.0 bits");
+        assert!(
+            result[0].counts[0] >= 1,
+            "should have a count at >=3.0 bits"
+        );
     }
 
     #[test]
@@ -504,7 +513,10 @@ mod tests {
         let result = entropy_histogram_bytes(b"hello deadbeef", &[cfg]);
         // "deadbeef" (8 chars, all hex) should be counted; "hello" should not
         // min_length is 3 so deadbeef qualifies
-        assert_eq!(result[0].total_candidates, 1, "only hex token should be a candidate");
+        assert_eq!(
+            result[0].total_candidates, 1,
+            "only hex token should be a candidate"
+        );
     }
 
     // ── entropy_configs_from_entries ─────────────────────────────────────────
@@ -623,12 +635,15 @@ mod tests {
             max_length: 200,
             threshold: 3.5,
             charset: EntropyCharset::Hex,
-        ..EntropyConfig::default()
+            ..EntropyConfig::default()
         };
         // AKIAIOSFODNN7EXAMPLE contains non-hex chars (G, H, etc.)
         let input = b"AKIAIOSFODNN7EXAMPLE";
         let (out, counts) = entropy_scan_bytes(input, &[cfg], &test_store());
-        assert_eq!(out, input, "non-hex token should not be replaced by hex config");
+        assert_eq!(
+            out, input,
+            "non-hex token should not be replaced by hex config"
+        );
         assert!(counts.is_empty());
     }
 

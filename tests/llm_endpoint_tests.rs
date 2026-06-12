@@ -36,7 +36,10 @@ impl MockServer {
             }
         });
 
-        MockServer { port, token: token.to_string() }
+        MockServer {
+            port,
+            token: token.to_string(),
+        }
     }
 
     fn endpoint(&self) -> String {
@@ -233,7 +236,10 @@ fn endpoint_wrong_token_exits_nonzero() {
         b"log data\n",
     );
 
-    assert!(!out.status.success(), "wrong token must cause non-zero exit");
+    assert!(
+        !out.status.success(),
+        "wrong token must cause non-zero exit"
+    );
     assert!(
         stderr(&out).contains("401"),
         "error must mention HTTP 401; got:\n{}",
@@ -247,7 +253,11 @@ fn endpoint_http_error_exits_nonzero() {
     let secrets = empty_secrets(dir.path());
     let server = MockServer::start(
         TOKEN,
-        http_error(500, "Internal Server Error", r#"{"error":"backend unavailable"}"#),
+        http_error(
+            500,
+            "Internal Server Error",
+            r#"{"error":"backend unavailable"}"#,
+        ),
     );
 
     let out = run(

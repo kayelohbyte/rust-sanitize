@@ -515,19 +515,20 @@ fn scanner_with_category_aware_strategy() {
     ));
     let store = Arc::new(MappingStore::new(gen, None));
 
-    let pattern = ScanPattern::from_literal(
-        "alice@corp.com",
-        Category::Email,
-        "test_email",
-    ).unwrap();
-    let scanner = StreamScanner::new(vec![pattern], Arc::clone(&store), ScanConfig::new(128, 32)).unwrap();
+    let pattern =
+        ScanPattern::from_literal("alice@corp.com", Category::Email, "test_email").unwrap();
+    let scanner =
+        StreamScanner::new(vec![pattern], Arc::clone(&store), ScanConfig::new(128, 32)).unwrap();
 
     let input = b"Contact alice@corp.com for help.";
     let (output, stats) = scanner.scan_bytes(input).unwrap();
     let out_str = String::from_utf8(output).unwrap();
 
     assert_eq!(stats.replacements_applied, 1, "email must be replaced once");
-    assert!(!out_str.contains("alice@corp.com"), "original must not appear in output");
+    assert!(
+        !out_str.contains("alice@corp.com"),
+        "original must not appear in output"
+    );
     assert!(out_str.contains('@'), "replacement must be email-shaped");
     assert_eq!(out_str.len(), input.len(), "byte length must be preserved");
 }
@@ -622,10 +623,7 @@ fn capacity_exceeded_during_scan_returns_error() {
     let input = b"a@one.com b@two.com c@three.com";
     let result = scanner.scan_bytes(input);
 
-    assert!(
-        result.is_err(),
-        "expected CapacityExceeded error, got Ok"
-    );
+    assert!(result.is_err(), "expected CapacityExceeded error, got Ok");
     assert!(
         matches!(result.unwrap_err(), SanitizeError::CapacityExceeded { .. }),
         "error must be CapacityExceeded"

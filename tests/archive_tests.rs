@@ -1333,7 +1333,8 @@ fn zip_slip_entry_path_sanitized_in_output() {
     let input = make_zip(traversal_entries);
 
     let mut writer = Cursor::new(Vec::new());
-    proc.process_zip(Cursor::new(&input[..]), &mut writer).unwrap();
+    proc.process_zip(Cursor::new(&input[..]), &mut writer)
+        .unwrap();
     let entries = read_zip(&writer.into_inner());
 
     // No output entry path may contain `..` or start with `/`.
@@ -1349,8 +1350,10 @@ fn zip_slip_entry_path_sanitized_in_output() {
     }
 
     // Content must still be sanitized.
-    let by_name: std::collections::HashMap<&str, &str> =
-        entries.iter().map(|(n, c)| (n.as_str(), c.as_str())).collect();
+    let by_name: std::collections::HashMap<&str, &str> = entries
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.as_str()))
+        .collect();
 
     // `../../etc/passwd` → sanitized to `etc/passwd`
     assert!(

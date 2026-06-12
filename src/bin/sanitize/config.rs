@@ -415,8 +415,14 @@ fn show_config_fields(cfg: &SanitizeConfig, config_dir: Option<&Path>) {
     list("context_keywords:", &cfg.context_keywords);
     opt("context_keywords_replace:", cfg.context_keywords_replace);
     opt("max_context_matches:", cfg.max_context_matches);
-    opt("log_format:", cfg.log_format.as_deref().map(|s| s.to_string()));
-    opt("log_level:", cfg.log_level.as_deref().map(|s| s.to_string()));
+    opt(
+        "log_format:",
+        cfg.log_format.as_deref().map(|s| s.to_string()),
+    );
+    opt(
+        "log_level:",
+        cfg.log_level.as_deref().map(|s| s.to_string()),
+    );
     opt("no_progress:", cfg.no_progress);
     opt("quiet:", cfg.quiet);
 }
@@ -674,7 +680,11 @@ quiet: true
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("sanitize");
         fs::create_dir_all(&config_dir).unwrap();
-        fs::write(config_dir.join("settings.yaml"), "this: is: not: valid: ][[[").unwrap();
+        fs::write(
+            config_dir.join("settings.yaml"),
+            "this: is: not: valid: ][[[",
+        )
+        .unwrap();
         std::env::remove_var("SANITIZE_NO_SETTINGS");
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
         let s = load_settings();

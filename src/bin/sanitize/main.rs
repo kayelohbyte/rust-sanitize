@@ -697,7 +697,12 @@ mod tests {
 
     #[test]
     fn validate_args_rejects_non_http_llm_endpoint() {
-        for bad in ["file:///etc/passwd", "ftp://host/v1", "javascript:alert(1)", "//host/v1"] {
+        for bad in [
+            "file:///etc/passwd",
+            "ftp://host/v1",
+            "javascript:alert(1)",
+            "//host/v1",
+        ] {
             let mut cli = real_file_cli();
             cli.llm = Some("troubleshoot".into());
             cli.llm_endpoint = Some(bad.into());
@@ -747,9 +752,7 @@ mod tests {
     #[test]
     fn validate_endpoint_scheme_accepts_http_and_https() {
         assert!(crate::llm_client::validate_endpoint_scheme("http://localhost:11434/v1").is_ok());
-        assert!(
-            crate::llm_client::validate_endpoint_scheme("https://api.openai.com/v1").is_ok()
-        );
+        assert!(crate::llm_client::validate_endpoint_scheme("https://api.openai.com/v1").is_ok());
     }
 
     #[test]

@@ -120,7 +120,9 @@ fn encrypted_secrets_scan_email() {
     let encrypted = encrypt_secrets(sample_json_secrets().as_bytes(), password).unwrap();
 
     let store = make_store();
-    let SecretsLoadResult { scanner, warnings, .. } = StreamScanner::from_encrypted_secrets(
+    let SecretsLoadResult {
+        scanner, warnings, ..
+    } = StreamScanner::from_encrypted_secrets(
         &encrypted,
         password,
         Some(SecretsFormat::Json),
@@ -332,7 +334,9 @@ fn encrypted_yaml_secrets_pipeline() {
     let encrypted = encrypt_secrets(sample_yaml_secrets().as_bytes(), password).unwrap();
 
     let store = make_store();
-    let SecretsLoadResult { scanner, warnings, .. } = StreamScanner::from_encrypted_secrets(
+    let SecretsLoadResult {
+        scanner, warnings, ..
+    } = StreamScanner::from_encrypted_secrets(
         &encrypted,
         password,
         Some(SecretsFormat::Yaml),
@@ -359,7 +363,9 @@ fn encrypted_toml_secrets_pipeline() {
     let encrypted = encrypt_secrets(sample_toml_secrets().as_bytes(), password).unwrap();
 
     let store = make_store();
-    let SecretsLoadResult { scanner, warnings, .. } = StreamScanner::from_encrypted_secrets(
+    let SecretsLoadResult {
+        scanner, warnings, ..
+    } = StreamScanner::from_encrypted_secrets(
         &encrypted,
         password,
         Some(SecretsFormat::Toml),
@@ -420,7 +426,9 @@ fn encrypted_secrets_with_extra_patterns() {
 #[test]
 fn plaintext_secrets_scan() {
     let store = make_store();
-    let SecretsLoadResult { scanner, warnings, .. } = StreamScanner::from_plaintext_secrets(
+    let SecretsLoadResult {
+        scanner, warnings, ..
+    } = StreamScanner::from_plaintext_secrets(
         sample_json_secrets().as_bytes(),
         Some(SecretsFormat::Json),
         store,
@@ -469,7 +477,9 @@ fn encrypted_bad_pattern_in_secrets_returns_warnings() {
     let encrypted = encrypt_secrets(json.as_bytes(), "pw").unwrap();
 
     let store = make_store();
-    let SecretsLoadResult { scanner, warnings, .. } = StreamScanner::from_encrypted_secrets(
+    let SecretsLoadResult {
+        scanner, warnings, ..
+    } = StreamScanner::from_encrypted_secrets(
         &encrypted,
         "pw",
         Some(SecretsFormat::Json),
@@ -560,7 +570,9 @@ fn file_backed_encrypt_decrypt() {
     // Decrypt from file.
     let enc_data = fs::read(&enc_path).unwrap();
     let store = make_store();
-    let SecretsLoadResult { scanner, warnings, .. } = StreamScanner::from_encrypted_secrets(
+    let SecretsLoadResult {
+        scanner, warnings, ..
+    } = StreamScanner::from_encrypted_secrets(
         &enc_data,
         "file-test",
         Some(SecretsFormat::Json),

@@ -620,7 +620,13 @@ mod tests {
         let secrets = global_default_secrets_path();
         let settings = global_settings_path();
         std::env::remove_var("XDG_CONFIG_HOME");
-        assert_eq!(secrets, PathBuf::from("/tmp/xdg-test/sanitize/secrets.yaml"));
-        assert_eq!(settings, PathBuf::from("/tmp/xdg-test/sanitize/settings.yaml"));
+        assert_eq!(
+            secrets,
+            PathBuf::from("/tmp/xdg-test/sanitize/secrets.yaml")
+        );
+        assert_eq!(
+            settings,
+            PathBuf::from("/tmp/xdg-test/sanitize/settings.yaml")
+        );
     }
 }
