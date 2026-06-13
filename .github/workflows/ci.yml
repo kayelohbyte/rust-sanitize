@@ -74,17 +74,6 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: Exclude workspace + temp from Defender (Windows)
-        # Real-time AV scanning briefly locks files immediately after they're
-        # written/renamed.  Integration tests using AtomicFileWriter race
-        # against that lock and fail with ERROR_ACCESS_DENIED (os error 5).
-        # Excluding the runner's temp + workspace from Defender eliminates
-        # the root cause for every test, present and future.
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Add-MpPreference -ExclusionPath $env:TEMP
-          Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE
       - run: cargo test
       - run: cargo test --doc
 

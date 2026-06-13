@@ -293,13 +293,6 @@ fn allow_flag_passes_value_through_unchanged() {
 ///          extracted and seeds the store.
 /// Phase 2: app.log is scanned as plain text with the augmented scanner
 ///          that now includes the discovered password as a literal.
-///
-/// Skipped on Windows: this test requires TWO file inputs (config.yaml +
-/// app.log) so it cannot be converted to piped-stdin, and the `password:`
-/// YAML key triggers a multi-second ACCESS_DENIED hold on the renamed
-/// AtomicFileWriter output on the Windows CI runner.  Behavior is
-/// platform-independent — Linux and macOS coverage is sufficient.
-#[cfg(not(target_os = "windows"))]
 #[test]
 fn two_pass_profile_seeds_plain_text_scan() {
     let dir = tempdir().unwrap();

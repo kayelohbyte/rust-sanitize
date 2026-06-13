@@ -68,13 +68,6 @@ fn run_stdin(args: &[&str], input: &[u8]) -> std::process::Output {
 // Validation rejections (exit non-zero, error on stderr)
 // ---------------------------------------------------------------------------
 
-// Ignored on Windows: this test consistently hits an ACCESS_DENIED race
-// on the renamed output file even with Defender exclusions and rename-
-// retry in AtomicFileWriter.  The behavior under test (--llm --output
-// emits reference-mode prompt listing the file path) is OS-independent;
-// llm_file_input_uses_reference_mode covers the same surface and passes
-// on Windows.  See the long debugging thread that led here.
-#[cfg_attr(target_os = "windows", ignore)]
 #[test]
 fn llm_reference_mode_with_output_writes_file_and_lists_path() {
     // --llm + --output is reference mode: sanitized file is written to disk and
