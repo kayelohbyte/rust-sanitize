@@ -89,6 +89,8 @@ sanitize server.log
 
 Output goes to `server-sanitized.log` next to the source. Use `-o /path/to/output` to override, or `-o -` for stdout.
 
+On first run, the same balanced pattern set is written to `~/.config/sanitize/secrets.yaml` so you can extend it for repeat use. See [Configuration](docs/cli-reference.md#configuration) for the full layered config model, env vars, and project-level `.sanitize.yaml`.
+
 ```bash
 # Dry-run — see what would be replaced without writing anything:
 sanitize server.log -n

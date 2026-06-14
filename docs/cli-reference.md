@@ -2,6 +2,57 @@
 
 > For MCP server setup, tool parameters, and JSON call examples, see [mcp.md](mcp.md).
 
+## Configuration
+
+`sanitize` reads three layered config sources on every run before CLI flags are applied.
+
+### Directory layout
+
+```
+~/.config/sanitize/             # global per-user
+  secrets.yaml                  # default pattern set — auto-created on first plain run
+  settings.yaml                 # global flag defaults — created by `sanitize init-hook`
+  apps/<name>/                  # custom or copied-and-edited app bundles
+    secrets.yaml
+    profile.yaml
+
+<project>/.sanitize.yaml        # per-project flag defaults — found by walking up from cwd
+```
+
+Path resolution:
+
+- **Unix/macOS** — `$XDG_CONFIG_HOME/sanitize/`, falling back to `~/.config/sanitize/`.
+- **Windows** — `%APPDATA%\sanitize\`, falling back to `%USERPROFILE%\.config\sanitize\`.
+
+### Apply order (lowest → highest precedence)
+
+1. Built-in defaults
+2. Global `~/.config/sanitize/settings.yaml`
+3. Project `.sanitize.yaml`
+4. CLI flags
+
+List fields (`app`, `allow`, `exclude_path`, `include_path`, `context_keywords`) merge **additively** across all layers. Scalar fields use last-wins replacement.
+
+For the full `settings.yaml` key reference and an annotated example, see the [Settings file](#settings-file) section under `sanitize install-hook`. For `.sanitize.yaml`, see [Project config (`.sanitize.yaml`)](#project-config-sanitizeyaml). For the custom apps directory, see [`sanitize apps`](#sanitize-apps).
+
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `XDG_CONFIG_HOME` | Overrides `~/.config` for the config dir base (Unix/macOS). |
+| `SANITIZE_APPS_DIR` | Overrides the apps directory (default: `<config-dir>/apps/`). |
+| `SANITIZE_CONFIG` | Explicit path to a project config file; overrides the cwd-walk. |
+| `SANITIZE_NO_CONFIG=1` | Skip project `.sanitize.yaml` loading entirely. |
+| `SANITIZE_NO_SETTINGS=1` | Skip global `settings.yaml` loading entirely. |
+| `SANITIZE_LOG` | Default log level when `--log-level` is not passed (`off`, `error`, `warn`, `info`, `debug`, `trace`). |
+| `SANITIZE_PASSWORD` | Decryption password for encrypted secrets files (non-interactive alternative to `-p` / `--password-file`). |
+| `SANITIZE_LLM_ENDPOINT` / `SANITIZE_LLM_MODEL` / `SANITIZE_LLM_KEY` | Defaults for `--llm-endpoint` / `--llm-model` / `--llm-key`. |
+| `SANITIZE_SKIP=1` | Inside an installed git hook, bypass scanning for one commit or push. |
+
+`SANITIZE_SECRETS_DIR` is **MCP-only** — it configures the MCP server's per-namespace secret store, not the CLI. See [docs/mcp.md](mcp.md).
+
+---
+
 ## `sanitize`
 
 ```
