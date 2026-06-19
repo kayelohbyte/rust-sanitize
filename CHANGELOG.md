@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-06-19
+
+### Fixed
+
+- **INI processor panic on invalid UTF-8** — a `=` followed by a non-UTF-8 byte
+  could cause the delimiter-reconstruction logic to slice a multi-byte
+  replacement character (`U+FFFD`, produced by lossy UTF-8 decoding) at a
+  non-char-boundary, panicking. The slice is now boundary-checked and falls back
+  to the default delimiter. Found by the `fuzz_ini` target.
+
+### Security
+
+- **MCP file path guards** now resolve symlinks and match the operator denylist
+  against the canonical path. This closes an absolute-path bypass where a path
+  like `/x/secrets/y` slipped past a `secrets/**` `SANITIZE_MCP_FILES_DENYLIST`
+  pattern (start-anchored glob), and prevents a symlink in an allowed directory
+  from reaching `SANITIZE_SECRETS_DIR` or a `.password` file.
+- **MCP HTTP daemon** compares the bearer token in constant time (over SHA-256
+  digests), removing a token timing/length oracle.
+
 ## [0.13.0] - 2026-06-12
 
 ### Added
@@ -689,7 +709,8 @@ contract and MSRV policy.
 - **290+ tests** including unit, integration, property-based (proptest), and
   4 fuzz targets.
 
-[Unreleased]: https://github.com/kayelohbyte/rust-sanitize/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/kayelohbyte/rust-sanitize/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/kayelohbyte/rust-sanitize/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/kayelohbyte/rust-sanitize/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/kayelohbyte/rust-sanitize/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/kayelohbyte/rust-sanitize/compare/v0.10.0...v0.11.0
