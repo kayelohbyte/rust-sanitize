@@ -162,7 +162,11 @@ fn extract_delimiter(line: &str, key: &str, after_delim: &str) -> String {
             .len()
             .saturating_sub(after_delim.len())
             .saturating_add(1);
-        if delimiter_end <= after_key.len() {
+        // `delimiter_end` is a byte offset derived from length arithmetic, so it
+        // can land inside a multi-byte char (e.g. a U+FFFD produced by
+        // from_utf8_lossy on invalid UTF-8). Guard the slice to avoid panicking;
+        // fall through to the default delimiter when it isn't a char boundary.
+        if delimiter_end <= after_key.len() && after_key.is_char_boundary(delimiter_end) {
             return after_key[..delimiter_end].to_string();
         }
     }
@@ -250,6 +254,21 @@ mod tests {
         let output = proc.process(content, &profile, &store).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(!text.contains("abc123"));
+    }
+
+    #[test]
+    fn invalid_utf8_value_does_not_panic() {
+        // Fuzz regression (fuzz_ini crash-c11471bb): `=` followed by a lone
+        // 0xCA byte becomes `=\u{FFFD}` via from_utf8_lossy, and the delimiter
+        // reconstruction sliced `after_key` at a byte index inside the 3-byte
+        // replacement char. Must process cleanly instead of panicking.
+        let store = make_store();
+        let content = [b'=', 0xCA, b'\n'];
+        let output = IniProcessor
+            .process(&content, &wildcard_profile(), &store)
+            .expect("invalid-UTF-8 INI value must not panic or error");
+        // Output is valid UTF-8 and round-trips without crashing.
+        String::from_utf8(output).expect("output must be valid UTF-8");
     }
 
     #[test]
