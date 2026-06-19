@@ -2,6 +2,23 @@
 # Mirrors the CI checks that run on every push.
 # Skip for one push:  SANITIZE_SKIP_PUSH=1 git push ...
 
+# Refuse to push commits directly to main — land changes via a feature branch
+# + PR so CI gates them first. Tool-agnostic: this fires no matter what invokes
+# `git push` (Claude Code, a Desktop shell MCP, or you by hand).
+# Emergency override for one push:  SANITIZE_ALLOW_MAIN=1 git push ...
+if [ "${SANITIZE_ALLOW_MAIN:-0}" != "1" ]; then
+  z40=0000000000000000000000000000000000000000
+  while read -r _local_ref local_sha remote_ref _remote_sha; do
+    # Only block updates to main; allow branch deletions (local_sha all-zero).
+    if [ "$remote_ref" = "refs/heads/main" ] && [ "$local_sha" != "$z40" ]; then
+      echo "pre-push: direct pushes to 'main' are blocked." >&2
+      echo "          Push a feature branch and open a PR instead." >&2
+      echo "          Emergency override: SANITIZE_ALLOW_MAIN=1 git push ..." >&2
+      exit 1
+    fi
+  done
+fi
+
 [ "${SANITIZE_SKIP_PUSH:-0}" = "1" ] && exit 0
 
 set -e
