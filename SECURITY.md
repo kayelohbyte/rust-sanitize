@@ -78,6 +78,31 @@ HMAC-SHA256(seed, category_tag || "\x00" || plaintext_value)
 - Category `domain_tag_hmac()` provides domain separation so e.g. an email
   `"alice"` and a hostname `"alice"` produce different replacements.
 
+### Determinism trade-offs
+
+Deterministic mode buys cross-run/cross-file consistency (the same value
+always maps to the same replacement) at the cost of leaking some
+structure. Callers should understand what the output still reveals:
+
+- **Equality leakage.** Identical inputs produce identical replacements,
+  so an observer can tell *which* values were the same across the
+  document or across files — even without learning the values. If two log
+  lines share a token, that relationship survives sanitization.
+- **Structural / length leakage.** Replacements are
+  **length-preserving** and category-shaped, so the output preserves the
+  length and rough format of each secret. This can narrow the space of
+  candidate plaintexts for low-entropy values.
+- **Dictionary confirmation with a weak/shared seed.** Because the
+  mapping is `HMAC(seed, value)`, anyone who knows or guesses the seed can
+  compute the replacement for any candidate value and confirm it against
+  the output. A weak or widely-shared seed therefore enables dictionary
+  confirmation of low-entropy values (short IDs, enum-like fields,
+  common usernames). Use a high-entropy seed and treat it as a secret.
+
+For maximum unlinkability where cross-run consistency is *not* required,
+prefer the non-deterministic (random) generator, which breaks all three
+of the above by mapping equal inputs to independent random replacements.
+
 ---
 
 ## 5. Memory Bounds
@@ -258,4 +283,6 @@ and error descriptions.
 | Secret leakage in logs | No secret values in tracing output |
 | Plaintext lingering in memory | Zeroize on Drop for keys, secrets, mappings |
 | Reverse-engineering replacements | One-way only; no mapping table persisted |
+| Equality/structure leakage in deterministic mode | Documented trade-off (§4); use random generator when unlinkability matters |
+| Dictionary confirmation of low-entropy values | High-entropy, secret seed; non-deterministic mode removes the oracle (§4) |
 | Thread oversubscription | CLI caps threads to `available_parallelism()` |

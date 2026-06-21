@@ -107,11 +107,12 @@ users would want it by default_.
 
 ## 9. MSRV changes require justification
 
-The minimum supported Rust version is **1.74**, pinned by the `clap`
-dependency. Raising the MSRV forces every downstream user to update their
-toolchain. It is acceptable when a dependency genuinely requires it or a
-language feature materially improves safety or correctness — not for
-convenience.
+The minimum supported Rust version is **1.86**, pinned by the
+dependency tree (current `clap`/transitive crates require it) and
+enforced by the MSRV jobs in CI. Raising the MSRV forces every
+downstream user to update their toolchain. It is acceptable when a
+dependency genuinely requires it or a language feature materially
+improves safety or correctness — not for convenience.
 
 ## 10. Test coverage for behavioral changes
 
