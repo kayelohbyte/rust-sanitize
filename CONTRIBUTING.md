@@ -89,7 +89,8 @@ property-based tests (via `proptest`). Property tests verify length-preservation
 
 ## Minimum Supported Rust Version (MSRV)
 
-The MSRV is **Rust 1.74**, driven by the `clap` dependency. Do not use
+The MSRV is **Rust 1.86**, driven by the dependency tree (current
+`clap`/transitive crates) and enforced by the MSRV jobs in CI. Do not use
 language features or library APIs that require a newer version without
 updating `rust-version` in `Cargo.toml`.
 

@@ -30,6 +30,20 @@ For archives exceeding the parallel cap, entries are processed sequentially. Tar
 
 Per-entry parallelism is suppressed when multiple archive files are already being processed in parallel at the file level, to avoid oversubscribing the rayon thread pool.
 
+### Combined Archive Worst-Case Memory
+
+The individual caps above compose multiplicatively, so the worst-case peak RAM for archive processing is the product of three factors, not any single limit:
+
+```
+peak ≈ nesting_depth × STRUCTURED_ENTRY_SIZE × concurrency
+```
+
+- **`nesting_depth`** — recursive archives (archive-in-archive) up to `--max-archive-depth` (default 5, hard max 10). Each active level can hold one entry buffered for structured processing.
+- **`STRUCTURED_ENTRY_SIZE`** (256 MiB) — the largest single entry that is buffered for structured processing before falling back to the streaming scanner. The parallel cap bounds *total* in-flight structured data per archive, but a single oversized-but-under-cap entry still buffers up to this size.
+- **`concurrency`** — the number of entries/files processed simultaneously by rayon. File-level and entry-level parallelism are mutually exclusive (entry parallelism is suppressed when files are already parallel), so this factor is bounded by `available_parallelism()`, **not** the two multiplied together.
+
+Plugging in the defaults gives a generous theoretical ceiling (e.g. `5 × 256 MiB × N_cores`); in practice real archives never approach it because production config entries are kilobytes-to-megabytes and oversized entries divert to the bounded streaming scanner (`chunk_size + overlap_size`). Operators who need a hard guarantee on a memory-constrained host should lower `--max-structured-size` and/or `--max-archive-depth` rather than rely on the default ceiling.
+
 ### Structured File Size Caps
 
 Files exceeding the structured processor's size limit are automatically demoted to the streaming scanner. This ensures bounded memory regardless of individual file size.

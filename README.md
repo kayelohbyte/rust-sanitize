@@ -4,13 +4,15 @@
 [![crates.io](https://img.shields.io/crates/v/rust-sanitize.svg)](https://crates.io/crates/rust-sanitize)
 [![docs.rs](https://docs.rs/rust-sanitize/badge.svg)](https://docs.rs/rust-sanitize)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/rust-1.74%2B-blue.svg)]()
+[![MSRV](https://img.shields.io/badge/rust-1.86%2B-blue.svg)]()
 
 Scrub sensitive data from logs and configs before sharing them — with support teams, vendors, or AI tools.
 
 `rust-sanitize` replaces API keys, emails, IPs, passwords, tokens, and other secrets with structurally plausible substitutes. Replacements are **one-way**: no mapping file is stored, there's no restore mode, and nothing sensitive persists after the run.
 
 Works as a **CLI**, a **Rust library**, and an **MCP server** — so AI assistants like Claude and Cursor can sanitize files on your behalf before raw content ever reaches the model.
+
+> **Scope:** `rust-sanitize` targets **structured secret patterns** — API keys, tokens, credentials, emails, IPs, and other typed values in logs and configs. It is **not** a general-purpose anonymization tool and does **not** perform free-text NLP redaction of prose PII (names, addresses buried in sentences). For that, reach for a dedicated anonymization/NER library.
 
 ---
 
@@ -390,7 +392,7 @@ Do not open a public issue for security-sensitive findings. Report privately via
 
 ## Stability
 
-This project follows [Semantic Versioning](https://semver.org/). As of 0.8.0, the public library API and CLI interface are considered stable. Breaking changes will be avoided but may occur in minor releases until 1.0.0. The MSRV is **1.74** (stable toolchain), declared under `rust-version` in `Cargo.toml` and enforced in CI.
+This project follows [Semantic Versioning](https://semver.org/). As of 0.8.0, the public library API and CLI interface are considered stable. Breaking changes will be avoided but may occur in minor releases until 1.0.0. The MSRV is **1.86** (stable toolchain), declared under `rust-version` in `Cargo.toml` and enforced in CI.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
