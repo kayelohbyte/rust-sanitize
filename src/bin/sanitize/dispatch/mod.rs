@@ -410,10 +410,13 @@ fn build_format_preserving_scanner(
         .filter(|(_, orig, _)| orig.len() >= 4)
         .filter_map(|(category, original, _)| {
             let s = original.as_str();
-            match ScanPattern::from_literal(s, category, format!("field:{s}")) {
+            // Label by category, never the value (labels appear in user-facing
+            // report/findings/summary output, which must contain no secrets).
+            let label = format!("field:{category}");
+            match ScanPattern::from_literal(s, category, label) {
                 Ok(pat) => Some(pat),
                 Err(e) => {
-                    warn!(value = %s, error = %e, "could not compile field literal pattern");
+                    warn!(error = %e, "could not compile field literal pattern");
                     None
                 }
             }

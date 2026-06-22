@@ -287,13 +287,16 @@ pub(crate) fn build_augmented_scanner(
         if s.is_empty() {
             continue;
         }
-        match ScanPattern::from_literal(s, category, format!("profile-discovered:{s}")) {
+        // Label by category, never the value — labels surface in the report,
+        // `--findings`, and the console summary, which must contain no secrets.
+        let label = format!("profile-discovered:{category}");
+        match ScanPattern::from_literal(s, category, label) {
             Ok(pat) => {
                 patterns.push(pat);
                 discovered += 1;
             }
             Err(e) => {
-                warn!(value = s, error = %e, "could not compile discovered literal pattern");
+                warn!(error = %e, "could not compile discovered literal pattern");
             }
         }
     }
