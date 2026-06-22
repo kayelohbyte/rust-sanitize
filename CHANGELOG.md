@@ -7,16 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
-- **Structured values containing escaped characters are no longer leaked.** The
-  format-preserving pass matches the *parsed* value against the *raw* bytes, so a
-  value that is escaped in the source (e.g. the JSON value `a"b` written as
-  `a\"b`, or XML entities) did not match and survived in plaintext. Structured
-  processors now also register the value's format-specific source-escaped form as
-  a store alias to the same token, so the escaped occurrence is redacted
-  consistently. Applies to JSON, JSONL, YAML, TOML, and XML across standalone
-  files, stdin, and archive entries.
+- **Structured redaction is now span-based — fully format-preserving and
+  leak-free.** JSON, JSONL, YAML, TOML, XML, and CSV are sanitized by replacing
+  each matched value at its **exact source byte span** rather than
+  re-serializing the parsed tree (which lost comments/formatting) or matching the
+  parsed value against the raw bytes (which leaked values escaped in the source).
+  Comments, key order, quoting style, whitespace, and the escaping of unrelated
+  content are preserved byte-for-byte, and each value is redacted **as it appears
+  in the source** — so values written `\/` or `\uXXXX` (JSON), as XML entities,
+  with CSV `""` doubling, or as quoted/escaped YAML/TOML scalars are hit directly
+  and never leak. Applies across standalone files, stdin, and archive entries; a
+  processor that can't parse an input falls back to the previous behavior.
+  New byte-span parser dependencies: `toml_edit` (TOML), `jiter` (JSON/JSONL),
+  `saphyr-parser` (YAML), and `csv-core` (CSV); XML reuses `quick-xml`.
+  Non-escaping processors (INI, env, key-value, log-line) are unchanged.
+
+### Fixed
 
 - **Structured entries inside archives now preserve comments and formatting.**
   A profile-matched entry in a `.zip`/`.tar`/`.tar.gz` was re-serialized from its
