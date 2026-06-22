@@ -167,10 +167,23 @@ impl FileProcessor<'_> {
 
         let input_bytes =
             fs::read(input).map_err(|e| format!("failed to read {}: {e}", input.display()))?;
-        // Populate the store as a side effect; the produced bytes are discarded.
-        if let Some(Err(e)) =
-            try_structured_processing(&input_bytes, &filename, fp.registry, fp.store, fp.profiles)
-        {
+        // Populate the store as a side effect; the produced bytes/edits are
+        // discarded. Prefer edit mode so discovery handles the same inputs the
+        // output pass does (multi-document YAML, source-escaped values); fall
+        // back to the literal structured pass for processors without span edits.
+        let discovery =
+            match try_structured_edits(&input_bytes, &filename, fp.registry, fp.store, fp.profiles)
+            {
+                Some(result) => Some(result),
+                None => try_structured_processing(
+                    &input_bytes,
+                    &filename,
+                    fp.registry,
+                    fp.store,
+                    fp.profiles,
+                ),
+            };
+        if let Some(Err(e)) = discovery {
             if cli.strict {
                 return Err(format!(
                     "structured discovery failed for {}: {e}",
