@@ -211,6 +211,46 @@ pub(crate) fn check_size_and_decode<'a>(
     })
 }
 
+/// Compute the sanitized token for a matched value during span-based editing,
+/// applying the same rule / field-signal / `min_length` / entropy logic as the
+/// tree walk's [`replace_value`] / [`replace_by_signal`]. Returns `None` when
+/// the value is not matched or is filtered out (and so left unedited).
+///
+/// Unlike the tree-walk path, this does **not** register source-escaped aliases:
+/// span editing replaces the exact source bytes, so escaped occurrences are
+/// handled directly.
+///
+/// # Errors
+///
+/// Propagates capacity errors from the mapping store.
+pub(crate) fn edit_token(
+    key: &str,
+    path: &str,
+    value: &str,
+    profile: &FileTypeProfile,
+    store: &MappingStore,
+) -> Result<Option<String>> {
+    if let Some(rule) = find_matching_rule(path, profile) {
+        if let Some(min) = rule.min_length {
+            if value.len() < min {
+                return Ok(None);
+            }
+        }
+        let category = rule
+            .category
+            .clone()
+            .unwrap_or(Category::Custom("field".into()));
+        return Ok(Some(store.get_or_insert(&category, value)?.to_string()));
+    }
+    if let Some(sig) = find_field_signal(key, &profile.field_name_signals) {
+        if value.is_empty() || shannon_entropy(value.as_bytes()) < sig.threshold {
+            return Ok(None);
+        }
+        return Ok(Some(store.get_or_insert(&sig.category, value)?.to_string()));
+    }
+    Ok(None)
+}
+
 /// A byte-range edit on the original source: replace `content[start..end]` with
 /// `value`.
 ///

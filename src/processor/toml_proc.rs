@@ -19,12 +19,10 @@
 //! field rules (e.g. `"database.password"`) rather than `"*"` if you want
 //! to avoid replacing non-sensitive numeric values.
 
-use crate::category::Category;
 use crate::error::{Result, SanitizeError};
 use crate::processor::limits::DEFAULT_INPUT_SIZE;
 use crate::processor::{
-    build_path, find_field_signal, find_matching_rule, shannon_entropy, walk_tree, FileTypeProfile,
-    Processor, Replacement, TreeNode,
+    build_path, edit_token, walk_tree, FileTypeProfile, Processor, Replacement, TreeNode,
 };
 use crate::store::MappingStore;
 use toml::Value;
@@ -88,37 +86,6 @@ impl Processor for TomlProcessor {
     }
 }
 
-/// Compute the sanitized token for a matched value, applying the same rule /
-/// signal / `min_length` / entropy logic as the tree walk. Returns `None` when
-/// the value is not matched or is filtered out (and therefore left unedited).
-fn token_for_value(
-    key: &str,
-    path: &str,
-    value: &str,
-    profile: &FileTypeProfile,
-    store: &MappingStore,
-) -> Result<Option<String>> {
-    if let Some(rule) = find_matching_rule(path, profile) {
-        if let Some(min) = rule.min_length {
-            if value.len() < min {
-                return Ok(None);
-            }
-        }
-        let category = rule
-            .category
-            .clone()
-            .unwrap_or(Category::Custom("field".into()));
-        return Ok(Some(store.get_or_insert(&category, value)?.to_string()));
-    }
-    if let Some(sig) = find_field_signal(key, &profile.field_name_signals) {
-        if value.is_empty() || shannon_entropy(value.as_bytes()) < sig.threshold {
-            return Ok(None);
-        }
-        return Ok(Some(store.get_or_insert(&sig.category, value)?.to_string()));
-    }
-    Ok(None)
-}
-
 /// String form of a scalar `toml_edit` value, used as the mapping-store key.
 fn edit_scalar_string(value: &EditValue) -> Option<String> {
     match value {
@@ -180,7 +147,7 @@ fn collect_value_edits(
             let Some(s) = edit_scalar_string(scalar) else {
                 return Ok(());
             };
-            if let Some(token) = token_for_value(key, path, &s, profile, store)? {
+            if let Some(token) = edit_token(key, path, &s, profile, store)? {
                 if let Some(span) = value.span() {
                     edits.push(Replacement {
                         start: span.start,
