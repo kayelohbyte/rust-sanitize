@@ -139,6 +139,29 @@ impl ProcessorRegistry {
             None => Ok(None),
         }
     }
+
+    /// Span-based structured processing: returns the edited bytes when the
+    /// matching processor supports [`Processor::process_to_edits`], or `None`
+    /// when there is no matching processor or it does not support span editing
+    /// (the caller then falls back to [`Self::process`] + the scanner).
+    ///
+    /// # Errors
+    ///
+    /// Propagates parse/replacement errors from the processor.
+    pub fn process_to_edits(
+        &self,
+        content: &[u8],
+        profile: &FileTypeProfile,
+        store: &MappingStore,
+    ) -> Result<Option<Vec<u8>>> {
+        match self.find_processor(content, profile) {
+            Some(proc) => match proc.process_to_edits(content, profile, store)? {
+                Some(edits) => Ok(Some(super::apply_edits(content, edits))),
+                None => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
 }
 
 impl Default for ProcessorRegistry {

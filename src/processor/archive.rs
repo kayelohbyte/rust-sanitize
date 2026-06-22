@@ -637,21 +637,32 @@ impl ArchiveProcessor {
                 // rather than failing the whole archive.
                 // A parse error or heuristic rejection falls through to the scanner below.
                 let pre_snapshot = self.store.snapshot();
-                if let Ok(Some(_)) = self.registry.process(&content, profile, &self.store) {
-                    // The structured pass populated the store with this entry's
-                    // field values; its re-serialized output is intentionally
-                    // discarded. Replace those values (and non-structural base
-                    // patterns) over the ORIGINAL bytes so comments, key order,
-                    // and whitespace are preserved — matching the plain-file
-                    // format-preserving path.
-                    //
-                    // Field values discovered *for this entry* are added as
-                    // literal patterns so they are redacted even when the
-                    // caller's scanner does not already carry them (library
-                    // usage without a pre-discovery pass). When the delta is
-                    // empty — the common case in the CLI, where the augmented
-                    // scanner already holds every literal — a cached scanner is
-                    // reused to avoid rebuilding the automaton per entry.
+                // Prefer span-based edit mode (field values replaced in place —
+                // exact, format-preserving, leak-free even for escaped values).
+                // Fall back to the literal structured pass, whose re-serialized
+                // output is discarded; either way the store is populated.
+                let structured_base: Option<Vec<u8>> =
+                    match self
+                        .registry
+                        .process_to_edits(&content, profile, &self.store)
+                    {
+                        Ok(Some(edited)) => Some(edited),
+                        Ok(None) => match self.registry.process(&content, profile, &self.store) {
+                            Ok(Some(_)) => Some(content.clone()),
+                            _ => None,
+                        },
+                        Err(_) => None,
+                    };
+                if let Some(base) = structured_base {
+                    // Run the format-preserving scanner over the structured-redacted
+                    // bytes to catch the same values in comments / unstructured
+                    // regions. Field values discovered *for this entry* are added
+                    // as literal patterns so they are redacted even when the
+                    // caller's scanner does not already carry them (library usage
+                    // without a pre-discovery pass). When the delta is empty — the
+                    // common case in the CLI, where the augmented scanner already
+                    // holds every literal — a cached scanner is reused to avoid
+                    // rebuilding the automaton per entry.
                     let extra: Vec<ScanPattern> = self
                         .store
                         .iter_since(pre_snapshot)
@@ -665,11 +676,9 @@ impl ArchiveProcessor {
                         })
                         .collect();
                     let (output, scan_stats) = if extra.is_empty() {
-                        self.structured_pass_scanner()?.scan_bytes(&content)?
+                        self.structured_pass_scanner()?.scan_bytes(&base)?
                     } else {
-                        self.scanner
-                            .for_structured_pass(extra)?
-                            .scan_bytes(&content)?
+                        self.scanner.for_structured_pass(extra)?.scan_bytes(&base)?
                     };
                     stats.structured_hits += 1;
                     stats.total_output_bytes += output.len() as u64;
