@@ -1,15 +1,16 @@
 //! NDJSON / JSON Lines structured processor.
 //!
 //! Processes files where each non-empty line is an independent JSON object
-//! (Newline-Delimited JSON, also called JSON Lines). Unlike the [`JsonProcessor`](crate::processor::json_proc::JsonProcessor),
-//! this processor never builds a full in-memory parse tree for the whole file —
-//! each line is parsed, walked, serialised, and written out independently,
-//! keeping per-line memory overhead constant regardless of input size.
+//! (Newline-Delimited JSON, also called JSON Lines).
 //!
-//! When used via the CLI with a matching profile, the processor is invoked
-//! through the streaming path: the file is opened as a reader and processed
-//! line-by-line without `fs::read` loading it into a `Vec<u8>` first. This
-//! makes GB-scale NDJSON log files practical to sanitize.
+//! The CLI uses [`process_to_edits`](JsonLinesProcessor::process_to_edits): it
+//! runs the JSON span walker on each line and offsets the resulting edits by the
+//! line's byte position, so each line's exact formatting is preserved and values
+//! escaped in the source never leak. Files within `--max-structured-size` are
+//! processed this way; larger files fall back to the bounded-memory streaming
+//! path ([`process_stream`](JsonLinesProcessor::process_stream)), which parses,
+//! walks, and re-serializes each line independently — keeping per-line memory
+//! constant for GB-scale NDJSON.
 //!
 //! # Options
 //!

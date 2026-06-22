@@ -1,7 +1,9 @@
 //! TOML structured processor.
 //!
-//! Parses TOML input, walks the value tree, replaces matched field
-//! values, and serializes back to TOML preserving structure.
+//! The CLI uses [`process_to_edits`](TomlProcessor::process_to_edits): it parses
+//! with `toml_edit` (which retains byte spans) and replaces each matched value
+//! at its exact source span, preserving comments, key order, quote style, and
+//! whitespace byte-for-byte. `process` is the re-serializing fallback.
 //!
 //! # Key Paths
 //!

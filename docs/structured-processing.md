@@ -138,13 +138,15 @@ sanitize a.log b.log c.log -s secrets.yaml   # identical result to c.log b.log a
 
 ## Format Preservation
 
-The structured pass operates on the **original bytes** of the file, not a re-serialized copy. This means:
+The structured pass edits each matched value **at its exact byte span in the original file**, never re-serializing a parsed copy. This means:
 
 - Comments are preserved
 - Indentation style is preserved
 - Key ordering is preserved
 - Quoting style is preserved
 - Blank lines are preserved
+
+Because the edit targets the source bytes directly, a value that is **escaped in the source** — JSON `\/` or `\uXXXX`, XML entities (`a&lt;b`), CSV `""` doubling, or quoted/escaped YAML/TOML scalars — is redacted exactly where it appears and never leaks. (JSON/JSONL use `jiter`, YAML `saphyr-parser`, TOML `toml_edit`, XML `quick-xml`, CSV `csv-core` for byte spans.)
 
 ```yaml
 # Before

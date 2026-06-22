@@ -26,8 +26,9 @@ default = ["cli", "archive", "structured"]
 cli = ["dep:clap", "dep:ureq", "dep:walkdir", "dep:ctrlc", "dep:rpassword", "archive", "structured"]
 # Archive processing (zip / tar / tar.gz).
 archive = ["dep:zip", "dep:tar", "dep:flate2"]
-# CSV and XML structured processors. (JSON/YAML/TOML/INI/env are always built —
-# they ride on the core serde stack and pull no extra heavy deps.)
+# CSV and XML structured processors. (JSON/YAML/TOML/INI/env/key-value/log are
+# always built; JSON/YAML/TOML pull small byte-span parsers — jiter /
+# saphyr-parser / toml_edit — for format-preserving in-place editing.)
 structured = ["dep:csv", "dep:csv-core", "dep:quick-xml"]
 bench = []
 

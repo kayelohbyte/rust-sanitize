@@ -1,8 +1,10 @@
 //! YAML structured processor.
 //!
-//! Parses YAML input, walks the value tree, replaces matched field
-//! values, and serializes back. Structure is preserved but minor
-//! formatting differences are possible (serde_yaml normalizes some
+//! The CLI uses [`process_to_edits`](YamlProcessor::process_to_edits): it drives
+//! a span-aware event parser (`saphyr-parser`) and replaces each matched scalar
+//! at its exact source span, preserving comments, anchors, key order, and quote
+//! style byte-for-byte (escaped/quoted scalars are hit as written, so they never
+//! leak). `process` is the re-serializing fallback (which normalizes some
 //! whitespace).
 //!
 //! Key paths use the same dot-separated convention as the JSON processor.
