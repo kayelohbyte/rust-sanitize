@@ -18,6 +18,43 @@ use crate::store::MappingStore;
 use saphyr_parser::{Event, Parser, ScalarStyle};
 use serde_yaml_ng::Value;
 
+/// Byte length of a leading quoted scalar (`"..."` or `'...'`) within `src` —
+/// the index just past its closing quote — or `None` for non-quoted styles or
+/// when no closing quote is found (then the caller keeps saphyr's span).
+///
+/// saphyr's reported span for a quoted scalar can extend to end-of-line
+/// (including a trailing inline comment), so we re-scan to the actual closing
+/// quote to avoid clobbering comments and trailing formatting.
+fn quoted_scalar_end(src: &[u8], style: ScalarStyle) -> Option<usize> {
+    let quote = match style {
+        ScalarStyle::DoubleQuoted => b'"',
+        ScalarStyle::SingleQuoted => b'\'',
+        _ => return None,
+    };
+    if src.first() != Some(&quote) {
+        return None;
+    }
+    let mut i = 1;
+    while i < src.len() {
+        let b = src[i];
+        // Double-quoted YAML uses backslash escapes; skip the escaped byte.
+        if style == ScalarStyle::DoubleQuoted && b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b == quote {
+            // Single-quoted YAML escapes a quote by doubling it (`''`).
+            if style == ScalarStyle::SingleQuoted && src.get(i + 1) == Some(&quote) {
+                i += 2;
+                continue;
+            }
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// A container frame for the YAML event-stream walk (span-based editing).
 enum YamlFrame {
     /// Inside a mapping. `path`/`key` locate the mapping itself; `current_key`
@@ -182,7 +219,14 @@ impl Processor for YamlProcessor {
                         let (path, key) = yaml_value_position(&frames);
                         if let Some(token) = edit_token(&key, &path, &value, profile, store)? {
                             let start = span.start.index();
-                            let end = span.end.index();
+                            let mut end = span.end.index();
+                            // saphyr's span for a *quoted* scalar can run to the
+                            // end of the line, swallowing trailing whitespace and
+                            // an inline `# comment`. Clamp to the real closing
+                            // quote so comments/formatting survive byte-for-byte.
+                            if let Some(real) = quoted_scalar_end(&content[start..end], style) {
+                                end = start + real;
+                            }
                             let repl = yaml_scalar_replacement(&token, style, &content[start..end]);
                             edits.push(Replacement {
                                 start,
