@@ -454,6 +454,83 @@ fn duplicate_value_across_structured_files_redacted_in_both() {
     }
 }
 
+/// Regression: a value containing characters that are *escaped* by a format
+/// (a `"` and a `\`) — discovered in a matched field of one file — must still
+/// be redacted where it reappears in an **unmatched** field of another file,
+/// even though that field escapes it differently (JSON `\"`, CSV `""`).
+///
+/// The earlier cross-file test used a value with no escapable characters, so
+/// the raw-byte phase-2 scanner caught it directly and never exercised the
+/// escaped-alias path. When span editing ("Solution A") replaced the old
+/// re-serialize path it dropped alias registration in the discovery path, and
+/// nothing covered "special-char value in an unmatched field of another file"
+/// — so the leak went uncaught. This test pins that path shut.
+#[test]
+fn escaped_value_in_unmatched_field_redacted_cross_file() {
+    // Parsed value carries a special-char-free marker so any escaped leak
+    // (JSON `\"`, CSV `""`) is caught by a single substring check.
+    let marker = "SECXMARK";
+    let dir = tempdir().unwrap();
+    let outdir = dir.path().join("out");
+    fs::create_dir_all(&outdir).unwrap();
+
+    // Discovery file: token field matched by `*.token`. Raw bytes are the
+    // JSON-escaped form, so the parsed value is `tok"SECXMARK\val`.
+    let disc = dir.path().join("disc.json");
+    fs::write(&disc, r#"{"creds":{"token":"tok\"SECXMARK\\val"}}"#).unwrap();
+
+    // Unmatched JSON field (escaped) in a second file.
+    let unj = dir.path().join("un.json");
+    fs::write(&unj, r#"{"other":"tok\"SECXMARK\\val"}"#).unwrap();
+
+    // Unmatched CSV column (quote-doubled) in a third file.
+    let unc = dir.path().join("un.csv");
+    fs::write(unc, "zzz\n\"tok\"\"SECXMARK\\val\"\n").unwrap();
+
+    let secrets = dir.path().join("secrets.json");
+    fs::write(&secrets, b"[]").unwrap();
+    let profile = dir.path().join("profile.json");
+    fs::write(
+        &profile,
+        r#"[{"processor":"json","extensions":[".json"],"fields":[{"pattern":"*.token","category":"auth_token"}]},
+           {"processor":"csv","extensions":[".csv"],"fields":[{"pattern":"col_with_no_match","category":"auth_token"}]}]"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
+        .args([
+            disc.to_str().unwrap(),
+            unj.to_str().unwrap(),
+            dir.path().join("un.csv").to_str().unwrap(),
+            "-s",
+            secrets.to_str().unwrap(),
+            "--profile",
+            profile.to_str().unwrap(),
+            "--output",
+            outdir.to_str().unwrap(),
+        ])
+        .env("SANITIZE_LOG", "error")
+        .env("SANITIZE_NO_SETTINGS", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let un_json = fs::read_to_string(outdir.join("un-sanitized.json")).unwrap();
+    let un_csv = fs::read_to_string(outdir.join("un-sanitized.csv")).unwrap();
+    assert!(
+        !un_json.contains(marker),
+        "escaped value leaked in unmatched JSON field:\n{un_json}"
+    );
+    assert!(
+        !un_csv.contains(marker),
+        "escaped value leaked in unmatched CSV column:\n{un_csv}"
+    );
+}
+
 /// Build a `.tar.gz` file on disk from `(name, bytes)` entries.
 fn write_targz(path: &std::path::Path, entries: &[(&str, &[u8])]) {
     let f = fs::File::create(path).unwrap();

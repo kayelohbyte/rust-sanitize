@@ -240,15 +240,53 @@ pub(crate) fn edit_token(
             .category
             .clone()
             .unwrap_or(Category::Custom("field".into()));
-        return Ok(Some(store.get_or_insert(&category, value)?.to_string()));
+        let sanitized = store.get_or_insert(&category, value)?.to_string();
+        register_escaped_aliases(store, &category, value, &sanitized);
+        return Ok(Some(sanitized));
     }
     if let Some(sig) = find_field_signal(key, &profile.field_name_signals) {
         if value.is_empty() || shannon_entropy(value.as_bytes()) < sig.threshold {
             return Ok(None);
         }
-        return Ok(Some(store.get_or_insert(&sig.category, value)?.to_string()));
+        let sanitized = store.get_or_insert(&sig.category, value)?.to_string();
+        register_escaped_aliases(store, &sig.category, value, &sanitized);
+        return Ok(Some(sanitized));
     }
     Ok(None)
+}
+
+/// Register the format-specific *escaped* representations of a discovered
+/// `value` as store aliases pointing to `sanitized`, for every structured
+/// format whose escaping differs from the raw value.
+///
+/// The span-edit path ([`Processor::process_to_edits`]) hits the exact source
+/// bytes of a matched field and needs no alias. These aliases are purely the
+/// **phase-2 cross-location safety net**: a value discovered in one file can
+/// reappear — escaped differently — in an *unmatched* field of another file
+/// (a JSON/YAML `\"`, a CSV `""`-doubled quote, an XML `&quot;`/`&lt;`). The
+/// literal scanner only matches raw bytes, so without these aliases the
+/// escaped occurrence would leak. No-op for values without escapable
+/// characters (every variant equals the raw value).
+fn register_escaped_aliases(
+    store: &MappingStore,
+    category: &Category,
+    value: &str,
+    sanitized: &str,
+) {
+    let variants = [
+        json_string_escape(value),        // JSON / JSONL / YAML double-quoted
+        yaml_double_quoted_escape(value), // (YAML differs from JSON for some chars)
+        toml_basic_escape(value),
+        xml_escape(value),          // XML text & attribute entities
+        value.replace('"', "\"\""), // CSV quote-doubling
+    ];
+    let mut seen: Vec<&str> = Vec::new();
+    for v in &variants {
+        if v != value && !seen.contains(&v.as_str()) {
+            seen.push(v.as_str());
+            store.register_alias(category, v, sanitized);
+        }
+    }
 }
 
 /// A byte-range edit on the original source: replace `content[start..end]` with
