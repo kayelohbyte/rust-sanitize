@@ -37,21 +37,18 @@ impl FileProcessor<'_> {
             let store_snapshot = fp.store.snapshot();
             let label = format!("Processing structured stdin ({ext})");
             return with_progress_scope(fp.progress, &label, move |_| {
-                let structured_result = try_structured_processing(
-                    &input_bytes,
-                    &format!("stdin.{ext}"),
-                    fp.registry,
-                    fp.store,
-                    fp.profiles,
-                );
+                // Prefer span-based edit mode; fall back to the literal pass,
+                // then to the plain scanner.
+                let structured_base =
+                    structured_base_bytes(&input_bytes, &format!("stdin.{ext}"), &fp, cli.strict)?;
 
-                match structured_result {
-                    Some(Ok(_structured_bytes)) => {
+                if let Some(base) = structured_base {
+                    {
                         let per_content_scanner =
                             build_format_preserving_scanner(fp.scanner, fp.store, store_snapshot)
                                 .map_err(|e| format!("failed to build content scanner: {e}"))?;
                         let (mut output_bytes, scan_stats) =
-                            scanner_fallback(&per_content_scanner, &input_bytes)?;
+                            scanner_fallback(&per_content_scanner, &base)?;
                         let (ent_out, ent_lc) =
                             entropy_scan_bytes(&output_bytes, fp.entropy_configs, fp.store);
                         output_bytes = ent_out;
@@ -93,13 +90,6 @@ impl FileProcessor<'_> {
                         }
                         return Ok(had_matches);
                     }
-                    Some(Err(e)) => {
-                        if cli.strict {
-                            return Err(format!("structured processing failed: {e}"));
-                        }
-                        warn!(error = %e, "structured processing failed, falling back to scanner");
-                    }
-                    None => {}
                 }
 
                 let (mut output_bytes, mut stats) = scanner_fallback(fp.scanner, &input_bytes)?;

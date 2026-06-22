@@ -349,6 +349,57 @@ fn try_structured_processing(
     }
 }
 
+/// Span-based structured processing: returns `Some(Ok(edited_bytes))` when a
+/// profile matches *and* its processor supports byte-span edits (field values
+/// replaced in place, format-preserving and leak-free); `None` when no profile
+/// matches or the processor doesn't support edits (caller falls back to
+/// [`try_structured_processing`]); `Some(Err)` on parse failure.
+fn try_structured_edits(
+    content: &[u8],
+    filename: &str,
+    registry: &Arc<ProcessorRegistry>,
+    store: &Arc<MappingStore>,
+    profiles: &[FileTypeProfile],
+) -> Option<Result<Vec<u8>, String>> {
+    let profile = profiles.iter().find(|p| p.matches_filename(filename))?;
+    match registry.process_to_edits(content, profile, store) {
+        Ok(Some(result)) => Some(Ok(result)),
+        Ok(None) => None,
+        Err(e) => Some(Err(e.to_string())),
+    }
+}
+
+/// Compute the bytes the format-preserving scanner should run over for a
+/// structured file: edit-applied bytes when the processor supports span edits,
+/// the original bytes when only the literal structured pass applies (store still
+/// gets populated), or `None` when no structured processing happened (caller
+/// uses the plain scanner over the originals).
+pub(crate) fn structured_base_bytes(
+    input_bytes: &[u8],
+    filename: &str,
+    fp: &FileProcessor,
+    strict: bool,
+) -> Result<Option<Vec<u8>>, String> {
+    // Prefer span-based edit mode: exact, format-preserving, leak-free.
+    match try_structured_edits(input_bytes, filename, fp.registry, fp.store, fp.profiles) {
+        Some(Ok(edited)) => return Ok(Some(edited)),
+        Some(Err(e)) if strict => return Err(format!("structured processing failed: {e}")),
+        Some(Err(e)) => warn!(error = %e, "structured edit pass failed, trying literal pass"),
+        None => {}
+    }
+    // Fall back to the literal structured pass (populates the store; the
+    // format-preserving scanner then runs over the original bytes).
+    match try_structured_processing(input_bytes, filename, fp.registry, fp.store, fp.profiles) {
+        Some(Ok(_)) => Ok(Some(input_bytes.to_vec())),
+        Some(Err(e)) if strict => Err(format!("structured processing failed: {e}")),
+        Some(Err(e)) => {
+            warn!(error = %e, "structured processing failed, falling back to scanner");
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
 fn build_format_preserving_scanner(
     base_scanner: &Arc<StreamScanner>,
     store: &Arc<MappingStore>,

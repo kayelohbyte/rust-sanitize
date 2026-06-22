@@ -19,11 +19,16 @@
 //! field rules (e.g. `"database.password"`) rather than `"*"` if you want
 //! to avoid replacing non-sensitive numeric values.
 
+use crate::category::Category;
 use crate::error::{Result, SanitizeError};
 use crate::processor::limits::DEFAULT_INPUT_SIZE;
-use crate::processor::{walk_tree, FileTypeProfile, Processor, TreeNode};
+use crate::processor::{
+    build_path, find_field_signal, find_matching_rule, shannon_entropy, walk_tree, FileTypeProfile,
+    Processor, Replacement, TreeNode,
+};
 use crate::store::MappingStore;
 use toml::Value;
+use toml_edit::{ImDocument, Item, Table, Value as EditValue};
 
 /// Structured processor for TOML configuration files.
 pub struct TomlProcessor;
@@ -58,6 +63,137 @@ impl Processor for TomlProcessor {
 
         Ok(output.into_bytes())
     }
+
+    /// Span-based redaction: parse with `toml_edit` (which retains byte spans),
+    /// then emit an edit replacing each matched value's source span with a
+    /// quoted token. Comments, key order, whitespace, and unrelated escaping are
+    /// preserved exactly, and the real source bytes are hit regardless of how
+    /// the value was quoted/escaped.
+    fn process_to_edits(
+        &self,
+        content: &[u8],
+        profile: &FileTypeProfile,
+        store: &MappingStore,
+    ) -> Result<Option<Vec<Replacement>>> {
+        let text = crate::processor::check_size_and_decode(content, "TOML", DEFAULT_INPUT_SIZE)?;
+        // `ImDocument` (immutable) retains byte spans for parsed values;
+        // `DocumentMut` drops them. We only read spans, never mutate the tree.
+        let doc = ImDocument::parse(text.to_string()).map_err(|e| SanitizeError::ParseError {
+            format: "TOML".into(),
+            message: format!("TOML parse error: {e}"),
+        })?;
+        let mut edits = Vec::new();
+        collect_table_edits(doc.as_table(), "", profile, store, &mut edits)?;
+        Ok(Some(edits))
+    }
+}
+
+/// Compute the sanitized token for a matched value, applying the same rule /
+/// signal / `min_length` / entropy logic as the tree walk. Returns `None` when
+/// the value is not matched or is filtered out (and therefore left unedited).
+fn token_for_value(
+    key: &str,
+    path: &str,
+    value: &str,
+    profile: &FileTypeProfile,
+    store: &MappingStore,
+) -> Result<Option<String>> {
+    if let Some(rule) = find_matching_rule(path, profile) {
+        if let Some(min) = rule.min_length {
+            if value.len() < min {
+                return Ok(None);
+            }
+        }
+        let category = rule
+            .category
+            .clone()
+            .unwrap_or(Category::Custom("field".into()));
+        return Ok(Some(store.get_or_insert(&category, value)?.to_string()));
+    }
+    if let Some(sig) = find_field_signal(key, &profile.field_name_signals) {
+        if value.is_empty() || shannon_entropy(value.as_bytes()) < sig.threshold {
+            return Ok(None);
+        }
+        return Ok(Some(store.get_or_insert(&sig.category, value)?.to_string()));
+    }
+    Ok(None)
+}
+
+/// String form of a scalar `toml_edit` value, used as the mapping-store key.
+fn edit_scalar_string(value: &EditValue) -> Option<String> {
+    match value {
+        EditValue::String(f) => Some(f.value().clone()),
+        EditValue::Integer(f) => Some(f.value().to_string()),
+        EditValue::Float(f) => Some(f.value().to_string()),
+        EditValue::Boolean(f) => Some(f.value().to_string()),
+        EditValue::Datetime(f) => Some(f.value().to_string()),
+        EditValue::Array(_) | EditValue::InlineTable(_) => None,
+    }
+}
+
+fn collect_table_edits(
+    table: &Table,
+    prefix: &str,
+    profile: &FileTypeProfile,
+    store: &MappingStore,
+    edits: &mut Vec<Replacement>,
+) -> Result<()> {
+    for (key, item) in table {
+        let path = build_path(prefix, key);
+        match item {
+            Item::Value(v) => collect_value_edits(key, &path, v, profile, store, edits)?,
+            Item::Table(t) => collect_table_edits(t, &path, profile, store, edits)?,
+            Item::ArrayOfTables(aot) => {
+                // Array elements are path-transparent (mirrors the tree walk).
+                for t in aot {
+                    collect_table_edits(t, &path, profile, store, edits)?;
+                }
+            }
+            Item::None => {}
+        }
+    }
+    Ok(())
+}
+
+fn collect_value_edits(
+    key: &str,
+    path: &str,
+    value: &EditValue,
+    profile: &FileTypeProfile,
+    store: &MappingStore,
+    edits: &mut Vec<Replacement>,
+) -> Result<()> {
+    match value {
+        EditValue::Array(arr) => {
+            // Path-transparent: scalar/inline-table items keep the parent key/path.
+            for item in arr {
+                collect_value_edits(key, path, item, profile, store, edits)?;
+            }
+        }
+        EditValue::InlineTable(it) => {
+            for (k, v) in it {
+                let p = build_path(path, k);
+                collect_value_edits(k, &p, v, profile, store, edits)?;
+            }
+        }
+        scalar => {
+            let Some(s) = edit_scalar_string(scalar) else {
+                return Ok(());
+            };
+            if let Some(token) = token_for_value(key, path, &s, profile, store)? {
+                if let Some(span) = value.span() {
+                    edits.push(Replacement {
+                        start: span.start,
+                        end: span.end,
+                        // Token is safe ASCII (no quote/backslash), so a basic
+                        // double-quoted string is always valid here.
+                        value: format!("\"{token}\""),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl TreeNode for Value {
@@ -198,5 +334,62 @@ user = "admin@corp.com"
         let output = proc.process(content, &profile, &store).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(!text.contains("value"));
+    }
+
+    // ── process_to_edits (span-based, format-preserving) ─────────────────────
+
+    /// Edit-mode alone (no scanner) must redact a value that is **escaped** in
+    /// the source — the exact case the literal-scan approach leaks.
+    #[test]
+    fn edits_redact_escaped_basic_string() {
+        let store = make_store();
+        let proc = TomlProcessor;
+        // Source bytes contain a\"b\"c-SECRET; the parsed value is a"b"c-SECRET.
+        let content = br#"key = "a\"b\"c-SECRET""#;
+        let profile = FileTypeProfile::new(
+            "toml",
+            vec![FieldRule::new("key").with_category(Category::Custom("k".into()))],
+        );
+        let edits = proc
+            .process_to_edits(content, &profile, &store)
+            .unwrap()
+            .unwrap();
+        let out = crate::processor::apply_edits(content, edits);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains("SECRET"),
+            "escaped value leaked via edits: {text}"
+        );
+    }
+
+    /// Edits preserve comments, key order, whitespace, and non-matched values.
+    #[test]
+    fn edits_preserve_comments_and_layout() {
+        let store = make_store();
+        let proc = TomlProcessor;
+        let content =
+            b"# top\n[db]\npassword = \"SECRETpw\"  # inline\nhost = \"keep.local\"\nport = 5432\n";
+        let profile = FileTypeProfile::new(
+            "toml",
+            vec![FieldRule::new("db.password").with_category(Category::Custom("pw".into()))],
+        );
+        let edits = proc
+            .process_to_edits(content, &profile, &store)
+            .unwrap()
+            .unwrap();
+        let out = crate::processor::apply_edits(content, edits);
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("SECRETpw"), "secret leaked: {text}");
+        assert!(text.contains("# top"), "top comment dropped: {text}");
+        assert!(text.contains("# inline"), "inline comment dropped: {text}");
+        assert!(
+            text.contains("host = \"keep.local\""),
+            "non-secret changed: {text}"
+        );
+        assert!(text.contains("port = 5432"), "non-secret changed: {text}");
+        assert!(
+            toml::from_str::<toml::Value>(&text).is_ok(),
+            "invalid TOML: {text}"
+        );
     }
 }

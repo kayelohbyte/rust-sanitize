@@ -119,6 +119,36 @@ pub trait Processor: Send + Sync {
         store: &MappingStore,
     ) -> Result<Vec<u8>>;
 
+    /// Span-based structured sanitization: return the byte-range edits to apply
+    /// to the original `content` so each matched field value is replaced **in
+    /// place** with its sanitized token, or `None` if this processor does not
+    /// support span editing.
+    ///
+    /// Unlike [`process`](Self::process), which re-serializes the parsed tree
+    /// (losing comments/formatting and, when matched against raw bytes, missing
+    /// values that were escaped in the source), edit-based processing splices
+    /// tokens directly into the source. This is both leak-free and fully
+    /// format-preserving. Edits must be non-overlapping.
+    ///
+    /// The store is populated with `original -> token` mappings as a side
+    /// effect, so the streaming scanner can also redact the same values where
+    /// they appear in comments or other files.
+    ///
+    /// The default returns `None`; callers then fall back to `process` plus the
+    /// format-preserving scanner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SanitizeError`] if parsing or replacement generation fails.
+    fn process_to_edits(
+        &self,
+        _content: &[u8],
+        _profile: &FileTypeProfile,
+        _store: &MappingStore,
+    ) -> Result<Option<Vec<Replacement>>> {
+        Ok(None)
+    }
+
     /// Whether this processor supports bounded-memory streaming via
     /// [`process_stream`](Self::process_stream).
     ///
@@ -179,6 +209,47 @@ pub(crate) fn check_size_and_decode<'a>(
         format: format.into(),
         message: format!("invalid UTF-8: {e}"),
     })
+}
+
+/// A byte-range edit on the original source: replace `content[start..end]` with
+/// `value`.
+///
+/// Produced by span-based processors ([`Processor::process_to_edits`]) so a
+/// matched field value is replaced exactly where it appears in the source,
+/// leaving all surrounding bytes — quotes, comments, whitespace, key order, and
+/// the precise escaping of unrelated content — byte-for-byte intact. This is
+/// what makes structured sanitization both leak-free (the real bytes are hit,
+/// regardless of how the value was escaped) and fully format-preserving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replacement {
+    /// Start byte offset (inclusive) of the range to replace.
+    pub start: usize,
+    /// End byte offset (exclusive) of the range to replace.
+    pub end: usize,
+    /// Replacement text (the sanitized token, already in the form it should
+    /// take in the source — e.g. including surrounding quotes for a string).
+    pub value: String,
+}
+
+/// Apply non-overlapping byte-range `edits` to `content`, returning the edited
+/// bytes. Edits are applied in ascending start order; any edit that overlaps a
+/// previous one or falls outside `content` is skipped defensively (a correct
+/// processor never emits such edits).
+#[must_use]
+pub(crate) fn apply_edits(content: &[u8], mut edits: Vec<Replacement>) -> Vec<u8> {
+    edits.sort_by_key(|e| e.start);
+    let mut out = Vec::with_capacity(content.len());
+    let mut pos = 0usize;
+    for e in edits {
+        if e.start < pos || e.end > content.len() || e.start > e.end {
+            continue;
+        }
+        out.extend_from_slice(&content[pos..e.start]);
+        out.extend_from_slice(e.value.as_bytes());
+        pos = e.end;
+    }
+    out.extend_from_slice(&content[pos..]);
+    out
 }
 
 /// Replace a value through the mapping store using a field rule's category.

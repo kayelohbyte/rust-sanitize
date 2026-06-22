@@ -427,35 +427,24 @@ impl FileProcessor<'_> {
 
         let label = format!("Processing structured {}", input.display());
         with_progress_scope(fp.progress, &label, move |_| {
-            let structured_result = try_structured_processing(
-                &input_bytes,
-                filename,
-                fp.registry,
-                fp.store,
-                fp.profiles,
-            );
+            // Prefer span-based edit mode (exact, format-preserving, leak-free);
+            // fall back to the literal structured pass, then to the plain scanner.
+            let structured_base = structured_base_bytes(&input_bytes, filename, &fp, cli.strict)?;
 
-            let (output_bytes, method, fallback_stats) = match structured_result {
-                Some(Ok(_)) => {
+            let (output_bytes, method, fallback_stats) = match structured_base {
+                Some(base) => {
                     let ext = filename.rsplit('.').next().unwrap_or("unknown");
                     let per_file_scanner =
                         build_format_preserving_scanner(fp.scanner, fp.store, store_snapshot)
                             .map_err(|e| format!("failed to build per-file scanner: {e}"))?;
-                    let (scanned_bytes, scan_stats) =
-                        scanner_fallback(&per_file_scanner, &input_bytes)?;
+                    // Scan the structured-redacted bytes for cross-occurrence
+                    // (values in comments / unstructured regions) and base patterns.
+                    let (scanned_bytes, scan_stats) = scanner_fallback(&per_file_scanner, &base)?;
                     (
                         scanned_bytes,
                         format!("structured+scan:{ext}"),
                         Some(scan_stats),
                     )
-                }
-                Some(Err(e)) => {
-                    if cli.strict {
-                        return Err(format!("structured processing failed: {e}"));
-                    }
-                    warn!(error = %e, "structured processing failed, falling back to scanner");
-                    let (out, stats) = scanner_fallback(fp.scanner, &input_bytes)?;
-                    (out, "scanner".into(), Some(stats))
                 }
                 None => {
                     let (out, stats) = scanner_fallback(fp.scanner, &input_bytes)?;
