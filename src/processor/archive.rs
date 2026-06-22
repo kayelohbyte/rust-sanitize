@@ -667,12 +667,10 @@ impl ArchiveProcessor {
                         .store
                         .iter_since(pre_snapshot)
                         .filter_map(|(category, original, _)| {
-                            ScanPattern::from_literal(
-                                original.as_str(),
-                                category,
-                                format!("field:{original}"),
-                            )
-                            .ok()
+                            // Label by category, never the value (labels surface
+                            // in report/findings/summary output — no secrets).
+                            let label = format!("field:{category}");
+                            ScanPattern::from_literal(original.as_str(), category, label).ok()
                         })
                         .collect();
                     let (output, scan_stats) = if extra.is_empty() {
