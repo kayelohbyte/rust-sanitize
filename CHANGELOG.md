@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Structured entries inside archives now preserve comments and formatting.**
+  A profile-matched entry in a `.zip`/`.tar`/`.tar.gz` was re-serialized from its
+  parsed tree, which silently dropped YAML/TOML comments and reflowed JSON
+  whitespace and key spacing — unlike standalone files, which are byte-preserving.
+  Archive entries now redact field values (and non-structural patterns) over the
+  original bytes, matching the plain-file path: comments, key order, and
+  whitespace are preserved, and a secret that also appears in a comment is still
+  redacted.
+
 ## [0.14.0] - 2026-06-21
 
 ### Added

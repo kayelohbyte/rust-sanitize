@@ -53,7 +53,7 @@
 use crate::error::{Result, SanitizeError};
 use crate::processor::profile::FileTypeProfile;
 use crate::processor::registry::ProcessorRegistry;
-use crate::scanner::{ScanStats, StreamScanner};
+use crate::scanner::{ScanPattern, ScanStats, StreamScanner};
 use crate::store::MappingStore;
 
 /// Strip path traversal components from an archive entry path before writing output.
@@ -101,7 +101,7 @@ use glob::MatchOptions;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, Write};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::processor::limits::{
     DEFAULT_ARCHIVE_DEPTH, MAX_ARCHIVE_DEPTH, PARALLEL_ENTRY_THRESHOLD, PARALLEL_TAR_DATA_SIZE,
@@ -419,6 +419,10 @@ pub struct ArchiveProcessor {
     /// Optional callback invoked with `(entry_name, sanitized_bytes)` after
     /// each file entry is processed. Only called for regular file entries.
     entry_callback: Option<EntryCallback>,
+    /// Lazily-built format-preserving scanner for structured entries: the
+    /// scanner with structure-corrupting key/value patterns stripped. Built
+    /// once on first use and reused across entries (and threads).
+    structured_scanner: OnceLock<Arc<StreamScanner>>,
 }
 
 impl ArchiveProcessor {
@@ -447,7 +451,26 @@ impl ArchiveProcessor {
             filter: ArchiveFilter::default(),
             force_text: false,
             entry_callback: None,
+            structured_scanner: OnceLock::new(),
         }
+    }
+
+    /// Format-preserving scanner for structured entries, built lazily from
+    /// `self.scanner` with structure-corrupting key/value patterns removed (see
+    /// [`StreamScanner::for_structured_pass`]). Applied to an entry's **original**
+    /// bytes so comments, key order, and whitespace are preserved while
+    /// discovered field values and non-structural patterns are still redacted.
+    fn structured_pass_scanner(&self) -> Result<&Arc<StreamScanner>> {
+        if let Some(scanner) = self.structured_scanner.get() {
+            return Ok(scanner);
+        }
+        let built = Arc::new(self.scanner.for_structured_pass(Vec::new())?);
+        // A racing thread may have set it first; either value is equivalent.
+        let _ = self.structured_scanner.set(built);
+        Ok(self
+            .structured_scanner
+            .get()
+            .expect("structured scanner was just set"))
     }
 
     /// Override the maximum nesting depth for recursive archive
@@ -613,12 +636,41 @@ impl ArchiveProcessor {
                 // macOS resource-fork ._* files) falls through to the scanner
                 // rather than failing the whole archive.
                 // A parse error or heuristic rejection falls through to the scanner below.
-                if let Ok(Some(structured_out)) =
-                    self.registry.process(&content, profile, &self.store)
-                {
-                    // Double-pass: run the streaming scanner on the structured
-                    // output to catch anything the field rules missed.
-                    let (output, scan_stats) = self.scanner.scan_bytes(&structured_out)?;
+                let pre_snapshot = self.store.snapshot();
+                if let Ok(Some(_)) = self.registry.process(&content, profile, &self.store) {
+                    // The structured pass populated the store with this entry's
+                    // field values; its re-serialized output is intentionally
+                    // discarded. Replace those values (and non-structural base
+                    // patterns) over the ORIGINAL bytes so comments, key order,
+                    // and whitespace are preserved — matching the plain-file
+                    // format-preserving path.
+                    //
+                    // Field values discovered *for this entry* are added as
+                    // literal patterns so they are redacted even when the
+                    // caller's scanner does not already carry them (library
+                    // usage without a pre-discovery pass). When the delta is
+                    // empty — the common case in the CLI, where the augmented
+                    // scanner already holds every literal — a cached scanner is
+                    // reused to avoid rebuilding the automaton per entry.
+                    let extra: Vec<ScanPattern> = self
+                        .store
+                        .iter_since(pre_snapshot)
+                        .filter_map(|(category, original, _)| {
+                            ScanPattern::from_literal(
+                                original.as_str(),
+                                category,
+                                format!("field:{original}"),
+                            )
+                            .ok()
+                        })
+                        .collect();
+                    let (output, scan_stats) = if extra.is_empty() {
+                        self.structured_pass_scanner()?.scan_bytes(&content)?
+                    } else {
+                        self.scanner
+                            .for_structured_pass(extra)?
+                            .scan_bytes(&content)?
+                    };
                     stats.structured_hits += 1;
                     stats.total_output_bytes += output.len() as u64;
                     stats.file_methods.insert(
@@ -1628,6 +1680,67 @@ mod tests {
             );
             assert!(!content.contains("Bob"), "name should be sanitized");
         }
+    }
+
+    /// Regression: structured entries inside archives must preserve comments,
+    /// key order, and whitespace (byte-level), redacting only field values —
+    /// not re-serialize the parsed tree. Uses a scanner with NO pre-loaded
+    /// literals, so the field value is redacted purely via the per-entry
+    /// discovery delta; the same value embedded in a comment is redacted too.
+    #[test]
+    fn archive_structured_entry_preserves_comments_and_formatting() {
+        let gen = Arc::new(HmacGenerator::new([7u8; 32]));
+        let store = Arc::new(MappingStore::new(gen, None));
+        // Empty pattern set: redaction of the email can only come from the
+        // structured field discovery, not from a base regex.
+        let scanner = Arc::new(
+            StreamScanner::new(vec![], Arc::clone(&store), ScanConfig::default()).unwrap(),
+        );
+        let registry = Arc::new(ProcessorRegistry::with_builtins());
+        let profiles = vec![FileTypeProfile::new(
+            "yaml",
+            vec![FieldRule::new("owner_email").with_category(Category::Email)],
+        )
+        .with_extension(".yaml")];
+        let proc = ArchiveProcessor::new(registry, scanner, store, profiles);
+
+        let yaml = b"# owner was secret.person@corp.test  (keep this comment)\nowner_email: secret.person@corp.test\nport: 8080\n";
+        let input = build_test_tar(&[("settings.yaml", yaml)]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&input[..], &mut output).unwrap();
+        assert_eq!(stats.structured_hits, 1);
+
+        let mut archive = tar::Archive::new(&output[..]);
+        let mut content = String::new();
+        for entry in archive.entries().unwrap() {
+            entry.unwrap().read_to_string(&mut content).unwrap();
+        }
+
+        // Secret email gone from both the field and the comment.
+        assert!(
+            !content.contains("secret.person@corp.test"),
+            "email must be redacted everywhere: {content}"
+        );
+        // Formatting preserved byte-for-byte around the redactions: the comment
+        // line (with its trailing text) and the unrelated `port` line survive,
+        // and the file was not re-serialized into a different shape.
+        assert!(
+            content.starts_with("# owner was "),
+            "leading comment must be preserved: {content}"
+        );
+        assert!(
+            content.contains("(keep this comment)"),
+            "comment trailing text must be preserved: {content}"
+        );
+        assert!(
+            content.contains("\nport: 8080\n"),
+            "unrelated line and surrounding whitespace must be untouched: {content}"
+        );
+        assert!(
+            content.contains("owner_email: "),
+            "key and `: ` separator must be preserved: {content}"
+        );
     }
 
     #[test]
