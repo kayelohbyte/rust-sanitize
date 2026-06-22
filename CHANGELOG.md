@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Cargo feature flags** for slimmer library builds. The crate now exposes
+  `cli` (clap/ureq/walkdir/ctrlc/rpassword), `archive` (zip/tar/flate2), and
+  `structured` (csv/quick-xml) features, all on by default. Library-only
+  consumers can opt out via `default-features = false` and re-enable only what
+  they need; JSON/YAML/TOML/INI/env/key-value/log-line and the streaming
+  scanner remain always-on. Default builds (`cargo install`, release artifacts)
+  are unchanged.
+
+### Changed
+
+- **Documented MSRV corrected to 1.86** across README, DESIGN.md, and
+  CONTRIBUTING.md to match `Cargo.toml` and CI (docs previously lagged at 1.74).
+
 ## [0.13.1] - 2026-06-19
 
 ### Fixed
