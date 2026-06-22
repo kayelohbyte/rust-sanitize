@@ -15,7 +15,7 @@ use crate::processor::{
     build_path, edit_token, walk_tree, FileTypeProfile, Processor, Replacement, TreeNode,
 };
 use crate::store::MappingStore;
-use saphyr_parser::{Event, Parser};
+use saphyr_parser::{Event, Parser, ScalarStyle};
 use serde_yaml_ng::Value;
 
 /// A container frame for the YAML event-stream walk (span-based editing).
@@ -50,6 +50,34 @@ fn yaml_value_position(frames: &[YamlFrame]) -> (String, String) {
 fn yaml_note_value_consumed(frames: &mut [YamlFrame]) {
     if let Some(YamlFrame::Mapping { expecting_key, .. }) = frames.last_mut() {
         *expecting_key = true;
+    }
+}
+
+/// Replacement text for a matched YAML scalar, given its source bytes (`span_src`)
+/// and scalar style.
+///
+/// Flow scalars (plain, single/double-quoted) become a double-quoted token.
+/// **Block** scalars (`|` literal, `>` folded) must stay block-valid: their value
+/// spans the indented content lines, so replacing it with an inline `"token"`
+/// would collapse the block and absorb the following keys. Instead, emit a single
+/// indented line — `<indent>token` plus the trailing newline the span consumed —
+/// keeping the block structure intact.
+fn yaml_scalar_replacement(token: &str, style: ScalarStyle, span_src: &[u8]) -> String {
+    match style {
+        ScalarStyle::Literal | ScalarStyle::Folded => {
+            let indent: String = span_src
+                .iter()
+                .take_while(|&&b| b == b' ' || b == b'\t')
+                .map(|&b| b as char)
+                .collect();
+            let trailing_nl = if span_src.last() == Some(&b'\n') {
+                "\n"
+            } else {
+                ""
+            };
+            format!("{indent}{token}{trailing_nl}")
+        }
+        _ => format!("\"{token}\""),
     }
 }
 
@@ -132,7 +160,7 @@ impl Processor for YamlProcessor {
                 message: format!("YAML parse error: {e}"),
             })?;
             match event {
-                Event::Scalar(value, _style, _aid, _tag) => {
+                Event::Scalar(value, style, _aid, _tag) => {
                     let is_key = matches!(
                         frames.last(),
                         Some(YamlFrame::Mapping {
@@ -153,10 +181,13 @@ impl Processor for YamlProcessor {
                     } else {
                         let (path, key) = yaml_value_position(&frames);
                         if let Some(token) = edit_token(&key, &path, &value, profile, store)? {
+                            let start = span.start.index();
+                            let end = span.end.index();
+                            let repl = yaml_scalar_replacement(&token, style, &content[start..end]);
                             edits.push(Replacement {
-                                start: span.start.index(),
-                                end: span.end.index(),
-                                value: format!("\"{token}\""),
+                                start,
+                                end,
+                                value: repl,
                             });
                         }
                         yaml_note_value_consumed(&mut frames);
@@ -494,5 +525,36 @@ mod tests {
             serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text).is_ok(),
             "invalid YAML: {text}"
         );
+    }
+
+    /// Regression: block scalars (`|`, `>`) must be redacted while staying
+    /// block-valid — the inline-`"token"` replacement collapsed the block and
+    /// absorbed following keys.
+    #[test]
+    fn edits_keep_block_scalars_valid() {
+        let store = make_store();
+        let proc = YamlProcessor;
+        let content = b"lit: |\n  line1-SEC1\n  line2-SEC2\nfold: >\n  folded-SEC3\nnext: keep\n";
+        let profile = FileTypeProfile::new(
+            "yaml",
+            vec![
+                FieldRule::new("lit").with_category(Category::Custom("k".into())),
+                FieldRule::new("fold").with_category(Category::Custom("k".into())),
+            ],
+        );
+        let edits = proc
+            .process_to_edits(content, &profile, &store)
+            .unwrap()
+            .unwrap();
+        let out = crate::processor::apply_edits(content, edits);
+        let text = String::from_utf8(out).unwrap();
+        for leak in ["SEC1", "SEC2", "SEC3"] {
+            assert!(!text.contains(leak), "leaked {leak}: {text}");
+        }
+        // Following keys are NOT absorbed into the block; output is valid YAML.
+        assert!(text.contains("fold:"), "fold key absorbed: {text}");
+        assert!(text.contains("next: keep"), "next key absorbed: {text}");
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).unwrap();
+        assert_eq!(parsed["next"].as_str(), Some("keep"));
     }
 }
