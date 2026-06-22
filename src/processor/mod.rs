@@ -273,12 +273,21 @@ fn register_escaped_aliases(
     value: &str,
     sanitized: &str,
 ) {
+    // XML escaping is context-dependent: only `&` and `<` must always be
+    // escaped; `"` is escaped only inside double-quoted attributes, `'` only
+    // inside single-quoted attributes, and `>` is usually left literal. A
+    // single maximally-escaped form would miss the realistic minimal encodings,
+    // so register each context's form (the dedup below drops no-op variants).
+    let xml_min = value.replace('&', "&amp;").replace('<', "&lt;");
     let variants = [
         json_string_escape(value),        // JSON / JSONL / YAML double-quoted
         yaml_double_quoted_escape(value), // (YAML differs from JSON for some chars)
         toml_basic_escape(value),
-        xml_escape(value),          // XML text & attribute entities
-        value.replace('"', "\"\""), // CSV quote-doubling
+        xml_min.clone(),                 // XML element text (`&`,`<` only)
+        xml_min.replace('"', "&quot;"),  // XML double-quoted attribute
+        xml_min.replace('\'', "&apos;"), // XML single-quoted attribute
+        xml_escape(value),               // XML maximal (over-escaping writers)
+        value.replace('"', "\"\""),      // CSV quote-doubling
     ];
     let mut seen: Vec<&str> = Vec::new();
     for v in &variants {
