@@ -1,7 +1,11 @@
 //! CSV structured processor.
 //!
-//! Parses CSV (or TSV) input, replaces values in specified columns,
-//! and writes back preserving the delimiter and quoting style.
+//! The CLI uses [`process_to_edits`](CsvProcessor::process_to_edits): it drives
+//! `csv-core` (a byte-accurate field state machine) and replaces each matched
+//! column's value at its exact source span, preserving the delimiter, quoting
+//! style, line endings, and non-matched columns (`""`-escaped/quoted fields are
+//! hit as written, so they never leak). `process` re-serializes via the csv
+//! writer as a fallback.
 //!
 //! # Column Matching
 //!

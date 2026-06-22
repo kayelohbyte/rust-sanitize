@@ -1,7 +1,11 @@
 //! XML structured processor.
 //!
-//! Uses `quick-xml` to parse and rewrite XML, preserving the document
-//! structure, attributes, and non-matched content.
+//! The CLI uses [`process_to_edits`](XmlProcessor::process_to_edits): it walks
+//! the document with `quick-xml` and replaces each matched element-text and
+//! attribute value at its exact source span, preserving structure, comments, and
+//! the entity encoding of unrelated content (entity-encoded values are hit as
+//! written, so they never leak). `process` re-serializes via the quick-xml
+//! writer as a fallback.
 //!
 //! # Key Paths
 //!

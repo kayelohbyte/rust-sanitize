@@ -1,7 +1,11 @@
 //! JSON structured processor.
 //!
-//! Parses JSON input, walks the value tree, replaces values at matched
-//! key paths, and serializes back to JSON preserving structure.
+//! The CLI uses [`process_to_edits`](JsonProcessor::process_to_edits): it walks
+//! the document with a byte-position parser (`jiter`) and replaces each matched
+//! value at its exact source span, so whitespace, key order, and the escaping of
+//! unrelated content are preserved byte-for-byte and values escaped in the
+//! source (e.g. `\/`, `\uXXXX`) are redacted without leaking. `process` is the
+//! re-serializing fallback used when span editing is unavailable.
 //!
 //! # Key Paths
 //!
