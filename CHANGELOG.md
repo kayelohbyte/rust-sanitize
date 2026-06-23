@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **VCS and hidden directories are now actually pruned during a directory walk.**
+  Skipping the directory *entry* still let walkdir descend into it, so `.git/`
+  contents and hidden-directory contents (e.g. `.secretdir/inner.txt`) were
+  processed and written to the output despite "VCS dirs always skipped" and the
+  `--hidden` documentation. The walk now prunes the whole subtree (the
+  explicitly-provided root is never pruned).
 - **stdin is now discovered before structured files are written.** A value seen
   only as a matched field in stdin reappearing in another file (e.g. a comment)
   used to leak from that file, because stdin was processed *after* the structured

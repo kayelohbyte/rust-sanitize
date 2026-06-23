@@ -271,3 +271,61 @@ fn hidden_skipped_by_default() {
         entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
     );
 }
+
+/// Regression: a hidden directory and a VCS directory must have their whole
+/// subtrees pruned, not just their directory entry skipped. (A plain `continue`
+/// during the walk skipped the dir entry but still descended into it, so a
+/// `.git/config` or `.hidden/inner.txt` was processed and written.)
+#[test]
+fn hidden_and_vcs_directories_are_pruned() {
+    let secrets_dir = tempdir().unwrap();
+    let input_dir = tempdir().unwrap();
+    let secrets = write_secrets(secrets_dir.path());
+
+    // A VCS dir, a hidden dir, and a normal subdir — each with a *non-hidden*
+    // child file (so only subtree pruning, not the per-file hidden check, can
+    // keep them out of the output).
+    fs::create_dir_all(input_dir.path().join(".git")).unwrap();
+    fs::create_dir_all(input_dir.path().join(".secretdir")).unwrap();
+    fs::create_dir_all(input_dir.path().join("sub")).unwrap();
+    fs::write(input_dir.path().join(".git/config"), b"SUPERSECRET\n").unwrap();
+    fs::write(
+        input_dir.path().join(".secretdir/inner.txt"),
+        b"SUPERSECRET\n",
+    )
+    .unwrap();
+    fs::write(input_dir.path().join("sub/ok.txt"), b"SUPERSECRET\n").unwrap();
+
+    let out_dir = input_dir.path().join("outdir");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
+        .args([
+            input_dir.path().to_str().unwrap(),
+            "-s",
+            secrets.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+        ])
+        .env("SANITIZE_LOG", "error")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        !out_dir.join(".git").exists(),
+        ".git subtree must be pruned (was processed into outdir)"
+    );
+    assert!(
+        !out_dir.join(".secretdir").exists(),
+        "hidden directory subtree must be pruned without --hidden"
+    );
+    assert!(
+        out_dir.join("sub/ok.txt").exists(),
+        "normal subdir file should be processed"
+    );
+}

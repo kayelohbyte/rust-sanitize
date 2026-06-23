@@ -268,20 +268,33 @@ struct ExpandedInput {
 pub(crate) fn walk_dir(dir: &Path, include_hidden: bool) -> Result<Vec<PathBuf>, String> {
     use walkdir::WalkDir;
     let mut files = Vec::new();
-    let walker = WalkDir::new(dir).follow_links(false).sort_by_file_name();
+    // `filter_entry` PRUNES a directory's whole subtree when it returns false —
+    // unlike a plain `continue`, which skips only the directory entry while
+    // walkdir keeps descending into it (so the dir's children would still be
+    // processed). Pruning is required so VCS dirs are actually skipped and
+    // hidden directories are not walked without `--hidden`.
+    let walker = WalkDir::new(dir)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            // Never prune the explicitly-provided root, even if it is itself
+            // hidden or VCS-named (the user pointed us at it directly).
+            if entry.depth() == 0 {
+                return true;
+            }
+            let name = entry.file_name().to_str().unwrap_or("");
+            if entry.file_type().is_dir() && SKIP_VCS_DIRS.contains(&name) {
+                return false;
+            }
+            if !include_hidden && name.starts_with('.') {
+                return false;
+            }
+            true
+        });
 
     for entry in walker {
         let entry = entry.map_err(|e| format!("error walking {}: {e}", dir.display()))?;
-        let name = entry.file_name().to_str().unwrap_or("");
-
-        if entry.file_type().is_dir() && SKIP_VCS_DIRS.contains(&name) {
-            continue;
-        }
-
-        if !include_hidden && entry.depth() > 0 && name.starts_with('.') {
-            continue;
-        }
-
         if entry.file_type().is_file() {
             files.push(entry.into_path());
         }
