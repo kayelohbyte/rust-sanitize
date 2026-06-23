@@ -345,12 +345,7 @@ pub(crate) fn apply_edits(content: &[u8], mut edits: Vec<Replacement>) -> Vec<u8
 /// `rule.min_length` (if set). This prevents broad glob patterns like
 /// `*token*` from redacting obviously non-secret values such as `"false"`,
 /// `"0"`, or `"nil"`.
-pub(crate) fn replace_value(
-    value: &str,
-    rule: &FieldRule,
-    store: &MappingStore,
-    format: &str,
-) -> Result<String> {
+pub(crate) fn replace_value(value: &str, rule: &FieldRule, store: &MappingStore) -> Result<String> {
     if let Some(min) = rule.min_length {
         if value.len() < min {
             return Ok(value.to_string());
@@ -361,40 +356,8 @@ pub(crate) fn replace_value(
         .clone()
         .unwrap_or(Category::Custom("field".into()));
     let sanitized = store.get_or_insert(&category, value)?;
-    register_source_alias(store, &category, value, sanitized.as_str(), format);
+    register_escaped_aliases(store, &category, value, sanitized.as_str());
     Ok(sanitized.to_string())
-}
-
-/// Register the format-specific source-escaped form of `original` (if any) as a
-/// store alias to `sanitized`, so a value that appears escaped in the raw bytes
-/// of the source document is still matched by the format-preserving scanner.
-fn register_source_alias(
-    store: &MappingStore,
-    category: &Category,
-    original: &str,
-    sanitized: &str,
-    format: &str,
-) {
-    if let Some(escaped) = source_escape(original, format) {
-        store.register_alias(category, &escaped, sanitized);
-    }
-}
-
-/// Format-specific source (escaped) representation of `value` — how the value
-/// appears in the raw bytes of a `format` document after string escaping —
-/// returned only when it differs from `value`. `None` for formats without
-/// string escaping (key-value, INI, env, CSV, log lines) or when no escaping is
-/// needed. Used so the byte-level format-preserving scanner can redact a value
-/// that is escaped in the source (e.g. JSON `a\"b` for the parsed value `a"b`).
-fn source_escape(value: &str, format: &str) -> Option<String> {
-    let escaped = match format.to_ascii_lowercase().as_str() {
-        "json" | "jsonl" => json_string_escape(value),
-        "yaml" => yaml_double_quoted_escape(value),
-        "toml" => toml_basic_escape(value),
-        "xml" => xml_escape(value),
-        _ => return None,
-    };
-    (escaped != value).then_some(escaped)
 }
 
 /// JSON string-body escaping (the bytes between the surrounding quotes).
@@ -574,7 +537,6 @@ pub(crate) fn replace_by_signal(
     value: &str,
     sig: &FieldNameSignal,
     store: &MappingStore,
-    format: &str,
 ) -> Result<Option<String>> {
     if value.is_empty() {
         return Ok(None);
@@ -583,7 +545,7 @@ pub(crate) fn replace_by_signal(
         return Ok(None);
     }
     let replaced = store.get_or_insert(&sig.category, value)?;
-    register_source_alias(store, &sig.category, value, replaced.as_str(), format);
+    register_escaped_aliases(store, &sig.category, value, replaced.as_str());
     Ok(Some(replaced.to_string()))
 }
 
@@ -660,20 +622,20 @@ pub(crate) fn walk_tree<V: TreeNode>(
         let path = build_path(prefix, key);
         if let Some(s) = v.as_str_mut() {
             if let Some(rule) = find_matching_rule(&path, profile) {
-                *s = replace_value(s, rule, store, format_name)?;
+                *s = replace_value(s, rule, store)?;
             } else if let Some(sig) = find_field_signal(key, &profile.field_name_signals) {
-                if let Some(replaced) = replace_by_signal(s, sig, store, format_name)? {
+                if let Some(replaced) = replace_by_signal(s, sig, store)? {
                     *s = replaced;
                 }
             }
         } else if v.is_scalar() {
             if let Some(rule) = find_matching_rule(&path, profile) {
                 let repr = v.scalar_to_string();
-                let replaced = replace_value(&repr, rule, store, format_name)?;
+                let replaced = replace_value(&repr, rule, store)?;
                 v.set_string(replaced);
             } else if let Some(sig) = find_field_signal(key, &profile.field_name_signals) {
                 let repr = v.scalar_to_string();
-                if let Some(replaced) = replace_by_signal(&repr, sig, store, format_name)? {
+                if let Some(replaced) = replace_by_signal(&repr, sig, store)? {
                     v.set_string(replaced);
                 }
             }
@@ -694,28 +656,31 @@ mod tests {
     use super::*;
     use crate::category::Category;
 
-    // ── source_escape ────────────────────────────────────────────────────────
+    // ── register_escaped_aliases ─────────────────────────────────────────────
 
     #[test]
-    fn source_escape_per_format() {
-        // JSON / TOML / YAML escape backslash and double-quote in the string body.
-        assert_eq!(source_escape(r#"a"b"#, "json").as_deref(), Some(r#"a\"b"#));
-        assert_eq!(source_escape(r#"a"b"#, "JSON").as_deref(), Some(r#"a\"b"#));
-        assert_eq!(source_escape(r#"a"b"#, "toml").as_deref(), Some(r#"a\"b"#));
-        assert_eq!(source_escape(r#"a"b"#, "yaml").as_deref(), Some(r#"a\"b"#));
-        assert_eq!(source_escape(r"a\b", "json").as_deref(), Some(r"a\\b"));
-        // XML escapes entities.
+    fn escaped_aliases_cover_all_formats() {
+        let gen = std::sync::Arc::new(crate::generator::HmacGenerator::new([7u8; 32]));
+        let store = MappingStore::new(gen, None);
+        let cat = Category::AuthToken;
+        // A value with a quote and a backslash → distinct escaped forms register.
+        let sanitized = store.get_or_insert(&cat, r#"a"b\c"#).unwrap().to_string();
+        register_escaped_aliases(&store, &cat, r#"a"b\c"#, &sanitized);
+        // JSON/YAML/TOML body escaping (`\"` + `\\`) is now an alias.
         assert_eq!(
-            source_escape("a<b&c", "xml").as_deref(),
-            Some("a&lt;b&amp;c")
+            store.get_or_insert(&cat, r#"a\"b\\c"#).unwrap().as_str(),
+            sanitized
         );
-        // No escaping needed → None (value appears verbatim in the source).
-        assert_eq!(source_escape("plainvalue", "json"), None);
-        // Formats without string escaping → always None.
-        assert_eq!(source_escape(r#"a"b"#, "ini"), None);
-        assert_eq!(source_escape(r#"a"b"#, "env"), None);
-        assert_eq!(source_escape(r#"a"b"#, "key-value"), None);
-        assert_eq!(source_escape(r#"a"b"#, "csv"), None);
+        // XML double-quoted-attribute form (`&quot;`, `\` literal) is an alias.
+        assert_eq!(
+            store.get_or_insert(&cat, "a&quot;b\\c").unwrap().as_str(),
+            sanitized
+        );
+        // CSV quote-doubling form is an alias.
+        assert_eq!(
+            store.get_or_insert(&cat, r#"a""b\c"#).unwrap().as_str(),
+            sanitized
+        );
     }
 
     // ── shannon_entropy ──────────────────────────────────────────────────────

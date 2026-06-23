@@ -301,7 +301,7 @@ fn process_line(
                     let (quote_char, inner) = detect_quotes(after_delim.trim());
                     let (sanitize_inner, suffix) =
                         strip_value_suffix(inner, cfg.value_strip_suffix);
-                    let replaced = replace_value(sanitize_inner, rule, cfg.store, "key-value")?;
+                    let replaced = replace_value(sanitize_inner, rule, cfg.store)?;
                     emit_kv_replacement(
                         raw_key,
                         cfg.delimiter,
@@ -317,9 +317,7 @@ fn process_line(
                     let (quote_char, inner) = detect_quotes(after_delim.trim());
                     let (sanitize_inner, suffix) =
                         strip_value_suffix(inner, cfg.value_strip_suffix);
-                    if let Some(replaced) =
-                        replace_by_signal(sanitize_inner, sig, cfg.store, "key-value")?
-                    {
+                    if let Some(replaced) = replace_by_signal(sanitize_inner, sig, cfg.store)? {
                         emit_kv_replacement(
                             raw_key,
                             cfg.delimiter,
@@ -348,7 +346,7 @@ fn process_line(
                     if let Some(rule) = find_matching_rule(unquoted_key, cfg.profile) {
                         let (quote_char, inner, suffix) =
                             detect_quoted_value_with_suffix(after_delim);
-                        let replaced = replace_value(inner, rule, cfg.store, "key-value")?;
+                        let replaced = replace_value(inner, rule, cfg.store)?;
                         emit_replaced_with_suffix(
                             raw_key,
                             sec_delim,
@@ -365,9 +363,7 @@ fn process_line(
                     {
                         let (quote_char, inner, suffix) =
                             detect_quoted_value_with_suffix(after_delim);
-                        if let Some(replaced) =
-                            replace_by_signal(inner, sig, cfg.store, "key-value")?
-                        {
+                        if let Some(replaced) = replace_by_signal(inner, sig, cfg.store)? {
                             emit_replaced_with_suffix(
                                 raw_key,
                                 sec_delim,
@@ -458,7 +454,7 @@ fn try_sanitize_kv_body(body: &str, cfg: &KvConfig<'_>) -> Result<Option<String>
         if let Some(rule) = find_matching_rule(key, cfg.profile) {
             let (quote_char, inner) = detect_quotes(after_delim.trim());
             let (sanitize_inner, suffix) = strip_value_suffix(inner, cfg.value_strip_suffix);
-            let replaced = replace_value(sanitize_inner, rule, cfg.store, "key-value")?;
+            let replaced = replace_value(sanitize_inner, rule, cfg.store)?;
             let mut out = String::new();
             emit_kv_replacement(
                 raw_key,
@@ -473,8 +469,7 @@ fn try_sanitize_kv_body(body: &str, cfg: &KvConfig<'_>) -> Result<Option<String>
         } else if let Some(sig) = find_field_signal(key, &cfg.profile.field_name_signals) {
             let (quote_char, inner) = detect_quotes(after_delim.trim());
             let (sanitize_inner, suffix) = strip_value_suffix(inner, cfg.value_strip_suffix);
-            if let Some(replaced) = replace_by_signal(sanitize_inner, sig, cfg.store, "key-value")?
-            {
+            if let Some(replaced) = replace_by_signal(sanitize_inner, sig, cfg.store)? {
                 let mut out = String::new();
                 emit_kv_replacement(
                     raw_key,
@@ -499,7 +494,7 @@ fn try_sanitize_kv_body(body: &str, cfg: &KvConfig<'_>) -> Result<Option<String>
             let (_, unquoted_key) = detect_quotes(trimmed_key);
             if let Some(rule) = find_matching_rule(unquoted_key, cfg.profile) {
                 let (quote_char, inner, suffix) = detect_quoted_value_with_suffix(after_delim);
-                let replaced = replace_value(inner, rule, cfg.store, "key-value")?;
+                let replaced = replace_value(inner, rule, cfg.store)?;
                 let mut out = String::new();
                 emit_replaced_with_suffix(
                     raw_key,
@@ -515,7 +510,7 @@ fn try_sanitize_kv_body(body: &str, cfg: &KvConfig<'_>) -> Result<Option<String>
                 find_field_signal(unquoted_key, &cfg.profile.field_name_signals)
             {
                 let (quote_char, inner, suffix) = detect_quoted_value_with_suffix(after_delim);
-                if let Some(replaced) = replace_by_signal(inner, sig, cfg.store, "key-value")? {
+                if let Some(replaced) = replace_by_signal(inner, sig, cfg.store)? {
                     let mut out = String::new();
                     emit_replaced_with_suffix(
                         raw_key,
