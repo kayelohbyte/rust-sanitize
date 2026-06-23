@@ -173,7 +173,7 @@ impl Processor for XmlProcessor {
                             format: "XML".into(),
                             message: format!("XML decode error: {}", e),
                         })?;
-                        let replaced = replace_value(&text, rule, store, "xml")?;
+                        let replaced = replace_value(&text, rule, store)?;
                         writer
                             .write_event(Event::Text(BytesText::new(&replaced)))
                             .map_err(|e| {
@@ -393,7 +393,7 @@ fn process_attributes(
                     format: "XML".into(),
                     message: format!("XML attr decode error: {}", e),
                 })?;
-            let replaced = replace_value(&attr_value, rule, store, "xml")?;
+            let replaced = replace_value(&attr_value, rule, store)?;
             new_elem.push_attribute((attr_key.as_str(), replaced.as_str()));
         } else {
             let attr_value = attr

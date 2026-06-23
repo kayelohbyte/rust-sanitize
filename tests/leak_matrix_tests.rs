@@ -26,6 +26,8 @@ use tempfile::tempdir;
 
 const M_PLAIN: &str = "MARKPLAIN";
 const M_SPEC: &str = "MARKSPEC";
+const M_UNI: &str = "MARKUNI";
+const MARKERS: [&str; 3] = [M_PLAIN, M_SPEC, M_UNI];
 
 /// Plain value: no characters that any format escapes.
 fn plain() -> String {
@@ -35,6 +37,12 @@ fn plain() -> String {
 /// runs, with the marker up front so any partial/escaped leak is detectable.
 fn spec() -> String {
     format!("{M_SPEC}-a\"b\\c/d,e'f-plainrun-42")
+}
+/// Unicode value: multi-byte UTF-8 (accented, emoji/snowman, Greek) interleaved
+/// with the escapable specials — exercises byte-span slicing on char boundaries.
+/// The ASCII marker ensures any partial/escaped leak is still detectable.
+fn unicode() -> String {
+    format!("{M_UNI}-café\"☃/λ\\x,β'γ-Ünïcödé")
 }
 
 // ---- per-format encoders: embed `v` as a quoted/escaped scalar literal ----
@@ -124,7 +132,7 @@ fn run(files: &[(&str, Vec<u8>)], profile: &str) -> BTreeMap<String, String> {
 /// Assert no marker (plain or special) survives in any output entry.
 fn assert_no_leak(label: &str, outs: &BTreeMap<String, String>) {
     for (name, text) in outs {
-        for m in [M_PLAIN, M_SPEC] {
+        for m in MARKERS {
             assert!(!text.contains(m), "[{label}] leaked {m} in {name}:\n{text}");
         }
     }
@@ -151,7 +159,7 @@ fn assert_kept(label: &str, outs: &BTreeMap<String, String>, name: &str, fragmen
 
 #[test]
 fn matrix_toml() {
-    for v in [plain(), spec()] {
+    for v in [plain(), spec(), unicode()] {
         let disc = format!(
             "# header comment with raw secret: {v}\n\
              [s]\n\
@@ -182,7 +190,7 @@ fn matrix_toml() {
 
 #[test]
 fn matrix_json() {
-    for v in [plain(), spec()] {
+    for v in [plain(), spec(), unicode()] {
         let disc = format!(
             r#"{{"creds":{{"secret":{}}},"keep":"KEEPVAL"}}"#,
             e_json(&v)
@@ -215,7 +223,7 @@ fn matrix_json() {
 
 #[test]
 fn matrix_jsonl() {
-    for v in [plain(), spec()] {
+    for v in [plain(), spec(), unicode()] {
         // line 1: matched field; line 2: unmatched field (same file);
         // line 3: a non-JSON text line carrying the raw value (skip_invalid).
         let disc = format!(
@@ -239,7 +247,7 @@ fn matrix_jsonl() {
 
 #[test]
 fn matrix_yaml() {
-    for v in [plain(), spec()] {
+    for v in [plain(), spec(), unicode()] {
         let disc = format!(
             "# header comment with raw secret: {v}\n\
              s:\n  secret: {}   # inline keep-comment\n  keep: KEEPVAL\n",
@@ -268,7 +276,7 @@ fn matrix_yaml() {
 
 #[test]
 fn matrix_xml() {
-    for v in [plain(), spec()] {
+    for v in [plain(), spec(), unicode()] {
         // matched attribute + same-file comment (raw) + text (escaped);
         // cross-file unmatched attribute and unmatched element text.
         let disc = format!(
@@ -300,7 +308,7 @@ fn matrix_xml() {
 
 #[test]
 fn matrix_csv() {
-    for v in [plain(), spec()] {
+    for v in [plain(), spec(), unicode()] {
         // matched column `secret`; cross-file unmatched column `zzz`.
         let disc = format!("name,secret,keep\nAlice,{},KEEPVAL\n", e_csv(&v));
         let unmatched = format!("zzz,keep2\n{},KEEPVAL2\n", e_csv(&v));
@@ -355,6 +363,57 @@ fn bom_prefixed_files_redact_and_preserve() {
         assert!(
             out.contains("BOMKEEP") || file.ends_with(".jsonl"),
             "bom/{file}: keep lost"
+        );
+    }
+}
+
+/// The non-span `process()` / `replace_value` path (INI, env, key-value, and the
+/// oversized-file fallback) must register the same cross-format escaped aliases
+/// as the span-edit path. Here a special-char value discovered in an INI file
+/// (no span editor) must be redacted where it reappears — JSON-escaped — in an
+/// unmatched field of another file.
+#[test]
+fn process_path_registers_escaped_aliases_cross_file() {
+    let marker = "MARKINI";
+    let value = format!("a\"b\\c-{marker}-x"); // quote + backslash
+    let ini = format!("[s]\nsecret = {value}\nkeep = plain\n");
+    let unmatched = format!(r#"{{"other":{}}}"#, e_json(&value));
+    let profile = r#"[{"processor":"ini","extensions":[".ini"],"fields":[{"pattern":"s.secret","category":"auth_token"}]},
+        {"processor":"json","extensions":[".json"],"fields":[{"pattern":"col_with_no_match","category":"auth_token"}]}]"#;
+    let outs = run(
+        &[
+            ("disc.ini", ini.into_bytes()),
+            ("un.json", unmatched.into_bytes()),
+        ],
+        profile,
+    );
+    assert_no_leak("process-path", &outs);
+}
+
+/// TSV (tab-delimited CSV via the `delimiter` option): a matched column with a
+/// special-char value in the LAST column and NO trailing newline — exercises
+/// the EOF flush with a non-comma delimiter. Header + unmatched column kept.
+#[test]
+fn tsv_tab_delimited_redacts_and_preserves() {
+    for v in [spec(), unicode()] {
+        // TSV-quote on tab/quote/newline (comma is an ordinary char here).
+        let field = if v.contains(['\t', '"', '\n', '\r']) {
+            format!("\"{}\"", v.replace('"', "\"\""))
+        } else {
+            v.clone()
+        };
+        // last column `secret` is matched; no trailing newline.
+        let content = format!("name\tsecret\nAlice\t{field}");
+        // `\t` inside the raw-string profile is the two bytes `\t` → JSON tab escape.
+        let profile = r#"[{"processor":"csv","extensions":[".tsv"],"options":{"delimiter":"\t"},
+            "fields":[{"pattern":"secret","category":"auth_token"}]}]"#;
+        let outs = run(&[("rows.tsv", content.into_bytes())], profile);
+        assert_no_leak("tsv", &outs);
+        assert_kept(
+            "tsv",
+            &outs,
+            "rows-sanitized.tsv",
+            &["name\tsecret", "Alice\t"],
         );
     }
 }

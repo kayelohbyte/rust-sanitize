@@ -191,6 +191,28 @@ impl Processor for YamlProcessor {
         let mut edits = Vec::new();
         let mut frames: Vec<YamlFrame> = Vec::new();
 
+        // saphyr reports span markers as CHARACTER counts, not byte offsets
+        // (its `Marker::index()` "in bytes" doc is wrong — every char advances
+        // the index by 1). For multi-byte UTF-8 we must translate char index →
+        // byte offset before slicing `content`, or a scalar that follows
+        // multi-byte content is sliced at the wrong position and the output is
+        // corrupted. ASCII needs no map (char index == byte offset).
+        let char_to_byte: Option<Vec<usize>> = if text.is_ascii() {
+            None
+        } else {
+            Some(
+                text.char_indices()
+                    .map(|(b, _)| b)
+                    .chain(std::iter::once(text.len()))
+                    .collect(),
+            )
+        };
+        let to_byte = |char_idx: usize| -> usize {
+            char_to_byte
+                .as_ref()
+                .map_or(char_idx, |m| m.get(char_idx).copied().unwrap_or(text.len()))
+        };
+
         for event in Parser::new_from_str(text) {
             let (event, span) = event.map_err(|e| SanitizeError::ParseError {
                 format: "YAML".into(),
@@ -218,8 +240,8 @@ impl Processor for YamlProcessor {
                     } else {
                         let (path, key) = yaml_value_position(&frames);
                         if let Some(token) = edit_token(&key, &path, &value, profile, store)? {
-                            let start = span.start.index();
-                            let mut end = span.end.index();
+                            let start = to_byte(span.start.index());
+                            let mut end = to_byte(span.end.index());
                             // saphyr's span for a *quoted* scalar can run to the
                             // end of the line, swallowing trailing whitespace and
                             // an inline `# comment`. Clamp to the real closing
