@@ -1,30 +1,171 @@
+use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use rust_sanitize::secrets::{entries_to_patterns, parse_category, SecretEntry};
 use rust_sanitize::{
-    FieldNameSignal, HmacGenerator, MappingStore, RandomGenerator, ReplacementGenerator,
-    ScanConfig, ScanPattern, StreamScanner, DEFAULT_FIELD_SIGNAL_THRESHOLD,
+    atomic_write, FieldNameSignal, HmacGenerator, LengthPolicy, MappingStore, RandomGenerator,
+    ReplacementGenerator, ScanConfig, ScanPattern, StreamScanner, DEFAULT_FIELD_SIGNAL_THRESHOLD,
 };
+
+/// Environment variable supplying the deterministic seed salt directly.
+///
+/// To reproduce deterministic output created before per-install salts existed
+/// (pre-0.14.2), set this to the legacy constant
+/// `rust-sanitize:deterministic-seed:v1`.
+const SEED_SALT_ENV: &str = "SANITIZE_SEED_SALT";
+
+/// Resolve the deterministic seed salt used as the PBKDF2 salt.
+///
+/// Priority:
+/// 1. `--seed-salt-file <PATH>` — file contents used verbatim.
+/// 2. `SANITIZE_SEED_SALT` env var — string bytes used verbatim.
+/// 3. Persisted per-install salt at `<config_dir>/seed-salt`.
+/// 4. Freshly generated 32 random bytes, persisted (mode 0600) for reuse.
+///
+/// The salt is used directly as the PBKDF2 salt (any length is valid), so the
+/// legacy constant remains reproducible via the env var.
+fn resolve_seed_salt(
+    seed_salt_file: Option<&Path>,
+) -> std::result::Result<Zeroizing<Vec<u8>>, String> {
+    if let Some(path) = seed_salt_file {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("cannot read seed-salt file {}: {e}", path.display()))?;
+        if bytes.is_empty() {
+            return Err(format!("seed-salt file {} is empty", path.display()));
+        }
+        return Ok(Zeroizing::new(bytes));
+    }
+
+    if let Ok(env) = std::env::var(SEED_SALT_ENV) {
+        if !env.is_empty() {
+            return Ok(Zeroizing::new(env.into_bytes()));
+        }
+    }
+
+    let path = crate::hooks::sanitize_config_dir().join("seed-salt");
+    resolve_or_create_salt_at(&path)
+}
+
+/// Read the persisted salt at `path`, or atomically create and persist a fresh
+/// one if it does not yet exist.
+///
+/// Creation is safe under concurrent first-run processes: a fresh 32-byte salt
+/// is written to a unique temp file, then `hard_link`ed into place. `hard_link`
+/// fails atomically if the destination already exists, so exactly one process
+/// wins; every other process reads the **winner's** salt (the winner finishes
+/// writing the temp before linking, so the destination is never observed
+/// half-written). This avoids the check-then-write race where each process would
+/// otherwise persist — and return — its own salt, producing inconsistent
+/// deterministic output across concurrent first runs.
+fn resolve_or_create_salt_at(path: &Path) -> std::result::Result<Zeroizing<Vec<u8>>, String> {
+    use rand::Rng;
+
+    // Fast path: already persisted (from this or an earlier run).
+    if let Some(existing) = read_existing_salt(path)? {
+        return Ok(existing);
+    }
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create config dir {}: {e}", dir.display()))?;
+    }
+
+    // Generate a candidate and write it fully to a unique temp file (0600).
+    let mut salt = Zeroizing::new(vec![0u8; 32]);
+    rand::rng().fill(salt.as_mut_slice());
+    let tmp = path.with_file_name(format!(
+        "seed-salt.tmp.{}.{:016x}",
+        std::process::id(),
+        rand::rng().random::<u64>()
+    ));
+    write_new_private(&tmp, &salt)
+        .map_err(|e| format!("cannot write temp seed-salt {}: {e}", tmp.display()))?;
+
+    // Atomically claim the destination. hard_link errors if it already exists.
+    let result = match std::fs::hard_link(&tmp, path) {
+        Ok(()) => {
+            info!(path = %path.display(), "created a new per-install deterministic seed salt");
+            eprintln!(
+                "info: created a new per-install deterministic seed salt at {}.\n\
+                 info: copy this file (or set {SEED_SALT_ENV}) to reproduce identical output on other machines.",
+                path.display()
+            );
+            Ok(salt)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another process won the race — adopt its salt for consistency.
+            match read_existing_salt(path)? {
+                Some(winner) => Ok(winner),
+                None => Err(format!(
+                    "seed-salt file {} exists but is empty; delete it to regenerate",
+                    path.display()
+                )),
+            }
+        }
+        Err(e) => Err(format!(
+            "cannot create seed-salt file {}: {e}",
+            path.display()
+        )),
+    };
+
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// Read an existing salt file. Returns `Ok(None)` when the file is absent,
+/// `Err` when it exists but is empty (corrupt — the user must remove it).
+fn read_existing_salt(path: &Path) -> std::result::Result<Option<Zeroizing<Vec<u8>>>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.is_empty() => Err(format!(
+            "seed-salt file {} is empty; delete it to regenerate",
+            path.display()
+        )),
+        Ok(bytes) => Ok(Some(Zeroizing::new(bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "cannot read seed-salt file {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+/// Create `path` exclusively (fails if it exists), write `data` with owner-only
+/// permissions, and flush to disk. Used for the seed-salt temp file.
+fn write_new_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(data)?;
+    f.sync_all()
+}
 
 /// Build an `Arc<MappingStore>` with the chosen generator mode.
 pub(crate) fn build_store(
     deterministic: bool,
     password: Option<&str>,
+    seed_salt_file: Option<&Path>,
     max_mappings: usize,
     allowlist: Option<Arc<rust_sanitize::allowlist::AllowlistMatcher>>,
+    length_policy: LengthPolicy,
 ) -> std::result::Result<Arc<MappingStore>, String> {
     let generator: Arc<dyn ReplacementGenerator> = if deterministic {
         match password {
             Some(k) => {
                 use hmac::Hmac;
                 use sha2::Sha256;
+                let salt = resolve_seed_salt(seed_salt_file)?;
                 let mut buf = Zeroizing::new([0u8; 32]);
-                let salt = b"rust-sanitize:deterministic-seed:v1";
-                pbkdf2::pbkdf2::<Hmac<Sha256>>(k.as_bytes(), salt, 600_000, buf.as_mut())
+                pbkdf2::pbkdf2::<Hmac<Sha256>>(k.as_bytes(), &salt, 600_000, buf.as_mut())
                     .expect("PBKDF2 output length is valid");
-                Arc::new(HmacGenerator::new(*buf))
+                Arc::new(HmacGenerator::new(*buf).with_length_policy(length_policy))
             }
             None => {
                 return Err(
@@ -35,7 +176,7 @@ pub(crate) fn build_store(
             }
         }
     } else {
-        Arc::new(RandomGenerator::new())
+        Arc::new(RandomGenerator::new().with_length_policy(length_policy))
     };
     let capacity = if max_mappings == 0 {
         None
@@ -82,6 +223,43 @@ pub(crate) fn common_allow_patterns() -> Vec<String> {
         "${*}".into(),
         "{{*}}".into(),
     ]
+}
+
+/// Render the default global secrets file (balanced patterns + allowlist) and
+/// write it to `path` atomically.
+///
+/// Uses [`atomic_write`] (random-suffix temp + rename) so that concurrent
+/// first-runs each render the byte-identical default file and rename it into
+/// place — a parallel run never observes a half-written or empty file and falls
+/// through to running with zero patterns (an unsanitized passthrough). The
+/// content is deterministic, so whichever process wins the rename, every reader
+/// sees a complete, valid file.
+pub(crate) fn write_default_secrets(path: &Path) -> std::result::Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create config dir {}: {e}", parent.display()))?;
+    }
+    let mut entries = balanced_secret_entries();
+    entries.push(SecretEntry {
+        kind: "allow".into(),
+        pattern: String::new(),
+        category: String::new(),
+        label: None,
+        values: common_allow_patterns(),
+        min_length: None,
+        max_length: None,
+        threshold: None,
+        charset: None,
+    });
+    let yaml = serde_yaml_ng::to_string(&entries)
+        .map_err(|e| format!("cannot serialize default secrets: {e}"))?;
+    let header = "# Global sanitize secrets — balanced detection patterns + allowlist.\n# Auto-loaded on every plain run. Edit freely; deleted values take effect immediately.\n\n";
+    atomic_write(path, format!("{header}{yaml}").as_bytes()).map_err(|e| {
+        format!(
+            "cannot write default secrets file {}: {e}\nPass --secrets-file or --app explicitly.",
+            path.display()
+        )
+    })
 }
 
 /// Build the canonical balanced set of `SecretEntry` values.
@@ -349,4 +527,171 @@ pub(crate) fn build_scan_config(chunk_size: usize) -> Result<ScanConfig, String>
     let cfg = ScanConfig::new(chunk_size, overlap);
     cfg.validate().map_err(|e| e.to_string())?;
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn seed_salt_file_used_verbatim() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"rust-sanitize:deterministic-seed:v1").unwrap();
+        f.flush().unwrap();
+        let salt = resolve_seed_salt(Some(f.path())).unwrap();
+        assert_eq!(&salt[..], b"rust-sanitize:deterministic-seed:v1");
+    }
+
+    #[test]
+    fn seed_salt_file_empty_is_error() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let err = resolve_seed_salt(Some(f.path())).unwrap_err();
+        assert!(err.contains("empty"), "expected empty error, got: {err}");
+    }
+
+    #[test]
+    fn deterministic_requires_password() {
+        match build_store(true, None, None, 0, None, LengthPolicy::Preserve) {
+            Ok(_) => panic!("expected an error without a password"),
+            Err(err) => assert!(err.contains("--password"), "got: {err}"),
+        }
+    }
+
+    #[test]
+    fn default_secrets_write_is_atomic_under_concurrency() {
+        // Concurrent first-runs writing the default secrets file must never
+        // leave a half-written/empty file that a parallel run would load as zero
+        // patterns (an unsanitized passthrough). Every writer must succeed and
+        // the final file must always parse to the full balanced entry set.
+        use rust_sanitize::secrets::parse_secrets;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("nested").join("secrets.yaml"));
+        let n = 16;
+        let barrier = Arc::new(Barrier::new(n));
+        let expected = balanced_secret_entries().len() + 1; // + allow entry
+
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    write_default_secrets(&path)
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join()
+                .unwrap()
+                .expect("every concurrent write must succeed");
+        }
+
+        // The persisted file is always complete and parses to the full set.
+        let bytes = std::fs::read(&*path).unwrap();
+        let entries = parse_secrets(&bytes, None).expect("default secrets file must parse");
+        assert_eq!(entries.len(), expected, "incomplete default secrets file");
+
+        // No temp files left behind in the directory.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn salt_creation_is_consistent_under_concurrent_first_runs() {
+        // Reproduces the first-run race: many processes/threads resolving a
+        // fresh salt path at once must all converge on a single persisted salt,
+        // or concurrent deterministic runs would produce inconsistent output.
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("sub").join("seed-salt"));
+        let n = 16;
+        let barrier = Arc::new(Barrier::new(n));
+
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait(); // maximize contention on first creation
+                    resolve_or_create_salt_at(&path).unwrap().to_vec()
+                })
+            })
+            .collect();
+
+        let salts: Vec<Vec<u8>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Every thread must have seen the same salt.
+        assert!(
+            salts.windows(2).all(|w| w[0] == w[1]),
+            "concurrent first-run resolved differing salts: {salts:?}"
+        );
+        // And it must equal what is persisted on disk.
+        let persisted = std::fs::read(&*path).unwrap();
+        assert_eq!(persisted.len(), 32, "persisted salt must be 32 bytes");
+        assert_eq!(
+            salts[0], persisted,
+            "returned salt must match persisted file"
+        );
+        // No temp files left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn length_policy_applies_to_both_generator_modes() {
+        use rust_sanitize::category::Category;
+
+        // Use an explicit seed-salt file for the deterministic arm so the test
+        // never touches the per-install config dir.
+        let mut salt = tempfile::NamedTempFile::new().unwrap();
+        salt.write_all(b"unit-test-salt").unwrap();
+        salt.flush().unwrap();
+
+        // A 6-digit phone value: under Randomized it becomes a band-length digit
+        // run (>= 8 digits), so its length must differ from the input regardless
+        // of which generator mode build_store selected.
+        let stores = [
+            build_store(false, None, None, 0, None, LengthPolicy::Randomized).unwrap(),
+            build_store(
+                true,
+                Some("pw"),
+                Some(salt.path()),
+                0,
+                None,
+                LengthPolicy::Randomized,
+            )
+            .unwrap(),
+        ];
+        for store in stores {
+            let out = store.get_or_insert(&Category::Phone, "123456").unwrap();
+            assert!(out.chars().all(|c| c.is_ascii_digit()), "got: {out}");
+            assert!(out.len() >= 8, "randomized digit run must be >= 8: {out}");
+        }
+
+        // Sanity: under Preserve the same value keeps its length.
+        let store = build_store(false, None, None, 0, None, LengthPolicy::Preserve).unwrap();
+        let out = store.get_or_insert(&Category::Phone, "123456").unwrap();
+        assert_eq!(out.len(), 6, "preserve must keep length: {out}");
+    }
 }

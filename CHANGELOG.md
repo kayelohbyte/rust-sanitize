@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-26
+
+### Security
+
+- **Fixed a chunk-boundary secret leak in the streaming scanner.** A single
+  match longer than the scan window (`chunk_size + overlap`) was matched
+  greedily to the window edge, committed as a *complete* replacement, and its
+  continuation in the next chunk was emitted **verbatim** (the continuation no
+  longer matched the pattern). This affected unbounded patterns (`url`,
+  `credential_url`, `secret_kv`, long token/base64 runs). The scanner now
+  carries an edge-touching match into the next window instead of committing a
+  truncated one, so matches up to `chunk_size` are always seen in full. A
+  single match longer than `chunk_size` (pathological) is now redacted with a
+  fixed `__SANITIZED_OVERLONG__` marker rather than leaking its tail. See
+  SECURITY.md §16.
+
+### Added
+
+- **`--randomize-length` ("format doesn't matter") replacement mode.** Opt-in
+  flag that draws each replacement's length from a per-category band derived
+  from the hash, independent of the original, so the output no longer leaks the
+  secret's length. Output stays type-valid (a number stays digits, an email
+  stays an email, a path keeps its extension) and preserved substrings (email
+  domain, file extension, ARN/Azure known segments) are unchanged. Composes with
+  `--deterministic`. Canonical-shape categories (UUID, MAC, IPv4/6, container ID,
+  Windows SID, JWT) keep their natural length. Exposed in the library as
+  `LengthPolicy` / `Generator::with_length_policy`. See SECURITY.md §4.
+- **Per-install deterministic seed salt.** The PBKDF2 salt for `--deterministic`
+  mode is now a unique, secret, per-install value (generated and persisted at
+  `<config_dir>/seed-salt`, mode `0600`) instead of a global constant. This
+  prevents a single password→seed table from attacking every install, and
+  closes the off-box dictionary-confirmation attack against shared output.
+  Override with `--seed-salt-file <PATH>` or `SANITIZE_SEED_SALT` to share a
+  salt across machines for reproducible team output. See SECURITY.md §4.
+- **`min_length` / `max_length` secrets-file fields are now enforced.** These
+  documented per-entry bounds were previously dropped during pattern
+  compilation; matches outside `[min_length, max_length]` are now discarded.
+  `max_length` also bounds greedy patterns before the over-long redaction path.
+- **Scripted demo recordings** under `docs/demos/` — four flows (zero-config
+  scan, dry-run/CI gate, app bundles, pipe/structured fields) captured as both
+  VHS GIFs and asciinema casts, regenerable via `docs/demos/render.sh`. The
+  quickstart GIF is embedded in the README.
+
+### Changed
+
+- **BREAKING (deterministic output):** because the seed salt is now per-install,
+  deterministic output changes versus prior versions. To reproduce pre-upgrade
+  output, set `SANITIZE_SEED_SALT=rust-sanitize:deterministic-seed:v1` (the
+  legacy constant). Cross-machine reproducibility now requires copying the
+  `seed-salt` file or setting the env/flag to a shared value.
+
+### Fixed
+
+- **First-run creation of the default secrets file and the per-install seed
+  salt is now atomic and safe under concurrent first runs.** Each is written to
+  a temp file and then claimed (rename / `hard_link`), so a parallel first run
+  can no longer observe a half-written file. Previously two concurrent first
+  runs could persist different seed salts (inconsistent deterministic output),
+  or a run could load a half-written secrets file and fall through to zero
+  patterns (an unsanitized passthrough). First-run write errors now fail closed
+  instead of silently running with no patterns.
+
 ## [0.14.1] - 2026-06-24
 
 ### Added
