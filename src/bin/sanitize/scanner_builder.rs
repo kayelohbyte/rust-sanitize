@@ -26,7 +26,9 @@ const SEED_SALT_ENV: &str = "SANITIZE_SEED_SALT";
 ///
 /// The salt is used directly as the PBKDF2 salt (any length is valid), so the
 /// legacy constant remains reproducible via the env var.
-fn resolve_seed_salt(seed_salt_file: Option<&Path>) -> std::result::Result<Zeroizing<Vec<u8>>, String> {
+fn resolve_seed_salt(
+    seed_salt_file: Option<&Path>,
+) -> std::result::Result<Zeroizing<Vec<u8>>, String> {
     if let Some(path) = seed_salt_file {
         let bytes = std::fs::read(path)
             .map_err(|e| format!("cannot read seed-salt file {}: {e}", path.display()))?;
@@ -102,7 +104,10 @@ fn resolve_or_create_salt_at(path: &Path) -> std::result::Result<Zeroizing<Vec<u
                 )),
             }
         }
-        Err(e) => Err(format!("cannot create seed-salt file {}: {e}", path.display())),
+        Err(e) => Err(format!(
+            "cannot create seed-salt file {}: {e}",
+            path.display()
+        )),
     };
 
     let _ = std::fs::remove_file(&tmp);
@@ -119,7 +124,10 @@ fn read_existing_salt(path: &Path) -> std::result::Result<Option<Zeroizing<Vec<u
         )),
         Ok(bytes) => Ok(Some(Zeroizing::new(bytes))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("cannot read seed-salt file {}: {e}", path.display())),
+        Err(e) => Err(format!(
+            "cannot read seed-salt file {}: {e}",
+            path.display()
+        )),
     }
 }
 
@@ -578,7 +586,9 @@ mod tests {
             .collect();
 
         for h in handles {
-            h.join().unwrap().expect("every concurrent write must succeed");
+            h.join()
+                .unwrap()
+                .expect("every concurrent write must succeed");
         }
 
         // The persisted file is always complete and parses to the full set.
@@ -592,7 +602,10 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 
     #[test]
@@ -629,14 +642,20 @@ mod tests {
         // And it must equal what is persisted on disk.
         let persisted = std::fs::read(&*path).unwrap();
         assert_eq!(persisted.len(), 32, "persisted salt must be 32 bytes");
-        assert_eq!(salts[0], persisted, "returned salt must match persisted file");
+        assert_eq!(
+            salts[0], persisted,
+            "returned salt must match persisted file"
+        );
         // No temp files left behind.
         let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 
     #[test]

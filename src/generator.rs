@@ -1306,7 +1306,10 @@ mod tests {
             let user = "a".repeat(ulen);
             let orig = format!("{user}@corp.com");
             let out = gen.generate(&Category::Email, &orig);
-            assert!(out.ends_with("@corp.com"), "domain must be preserved: {out}");
+            assert!(
+                out.ends_with("@corp.com"),
+                "domain must be preserved: {out}"
+            );
             assert!(out.contains('@'));
             let out_user = out.split('@').next().unwrap().len();
             assert!(
@@ -1320,7 +1323,10 @@ mod tests {
     fn randomized_hostname_keeps_suffix() {
         let gen = rand_gen(5);
         let out = gen.generate(&Category::Hostname, "db-prod-01.internal");
-        assert!(out.ends_with(".internal"), "suffix must be preserved: {out}");
+        assert!(
+            out.ends_with(".internal"),
+            "suffix must be preserved: {out}"
+        );
         let prefix = out.strip_suffix(".internal").unwrap().len();
         assert!(prefix >= HOSTNAME_PREFIX_BAND.0 && prefix <= HOSTNAME_PREFIX_BAND.1);
     }
@@ -1351,9 +1357,15 @@ mod tests {
     #[test]
     fn randomized_url_arn_keep_structure() {
         let gen = rand_gen(9);
-        let url = gen.generate(&Category::Url, "https://internal.corp.com/api/users?token=abc123");
+        let url = gen.generate(
+            &Category::Url,
+            "https://internal.corp.com/api/users?token=abc123",
+        );
         assert!(url.contains("://"), "url scheme separator preserved: {url}");
-        assert!(url.contains('?') && url.contains('='), "url query preserved: {url}");
+        assert!(
+            url.contains('?') && url.contains('='),
+            "url query preserved: {url}"
+        );
 
         let arn = gen.generate(&Category::AwsArn, "arn:aws:iam::123456789012:user/admin");
         assert_eq!(
@@ -1376,7 +1388,10 @@ mod tests {
         assert!(out.contains("/resourceGroups/"));
         assert!(out.contains("/providers/"));
         assert!(out.contains("Microsoft.Compute"));
-        assert!(!out.contains("rg-prod"), "variable segment must be replaced: {out}");
+        assert!(
+            !out.contains("rg-prod"),
+            "variable segment must be replaced: {out}"
+        );
     }
 
     #[test]

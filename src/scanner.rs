@@ -41,7 +41,7 @@
 //! being committed. A single match longer than `chunk_size` (a pathological
 //! unbroken token) can never be buffered; rather than leak its tail, the
 //! scanner fails closed and replaces the whole run with a fixed redaction
-//! marker (see [`OVERLONG_MARKER`]).
+//! marker (see `OVERLONG_MARKER`).
 //!
 //! # Thread Safety
 //!
@@ -1067,9 +1067,7 @@ impl StreamScanner {
             stats.matches_found += 1;
             stats.replacements_applied += 1;
             on_match(MatchLocation {
-                line: newlines_before_window
-                    + count_newlines(&window[..commit_point])
-                    + 1,
+                line: newlines_before_window + count_newlines(&window[..commit_point]) + 1,
                 byte_offset: window_file_offset + commit_point as u64,
                 pattern: OVERLONG_LABEL.to_string(),
             });
@@ -1772,10 +1770,7 @@ mod tests {
         let (output, stats) = scanner.scan_bytes(input.as_bytes()).unwrap();
         let out = String::from_utf8_lossy(&output);
 
-        assert!(
-            !out.contains("AAAAAAAAAA"),
-            "raw token bytes leaked: {out}"
-        );
+        assert!(!out.contains("AAAAAAAAAA"), "raw token bytes leaked: {out}");
         assert!(!out.contains(&secret), "full token survived: {out}");
         assert_eq!(stats.matches_found, 1, "token must match exactly once");
         assert_eq!(store.len(), 1, "token must map to a single replacement");
@@ -1805,7 +1800,10 @@ mod tests {
             "overlong token must be redacted with the marker: {out}"
         );
         assert!(out.starts_with("before "), "prefix preserved: {out}");
-        assert!(out.ends_with(" after"), "suffix after the run preserved: {out}");
+        assert!(
+            out.ends_with(" after"),
+            "suffix after the run preserved: {out}"
+        );
     }
 
     #[test]
