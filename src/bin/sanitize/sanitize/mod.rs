@@ -36,10 +36,10 @@ use crate::input::{
 };
 use crate::progress::{ProgressContext, ProgressPolicy, ProgressReporter, SharedProgressReporter};
 use crate::run_header::{print_run_header, CliConfigSnapshot};
-use crate::scanner_builder::balanced_secret_entries;
 use crate::scanner_builder::{
     build_augmented_scanner, build_default_patterns, build_scan_config, build_store,
     builtin_field_name_signals, common_allow_patterns, field_signals_from_entries,
+    write_default_secrets,
 };
 use rust_sanitize::{DEFAULT_ARCHIVE_DEPTH, DEFAULT_CONTEXT_LINES, DEFAULT_MAX_MATCHES};
 
@@ -86,27 +86,12 @@ pub(crate) fn run_sanitize(
 
     if cli.secrets_file.is_none() && cli.app.is_empty() {
         let default_path = global_default_secrets_path();
+        // Atomically create the default secrets file on first run. Fail closed
+        // on write error rather than silently running with zero patterns (an
+        // unsanitized passthrough); the atomic write also stops a concurrent
+        // first-run from reading a half-written file and doing the same.
         if !default_path.exists() {
-            if let Some(parent) = default_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let allow_entry = SecretEntry {
-                kind: "allow".into(),
-                pattern: String::new(),
-                category: String::new(),
-                label: None,
-                values: common_allow_patterns(),
-                min_length: None,
-                max_length: None,
-                threshold: None,
-                charset: None,
-            };
-            let mut entries = balanced_secret_entries();
-            entries.push(allow_entry);
-            if let Ok(yaml) = serde_yaml_ng::to_string(&entries) {
-                let header = "# Global sanitize secrets — balanced detection patterns + allowlist.\n# Auto-loaded on every plain run. Edit freely; deleted values take effect immediately.\n\n";
-                let _ = fs::write(&default_path, format!("{header}{yaml}"));
-            }
+            write_default_secrets(&default_path).map_err(|e| (e, 1))?;
         }
         if default_path.exists() {
             cli.secrets_file = Some(default_path);
