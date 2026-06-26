@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-26
+
 ### Security
 
 - **Fixed a chunk-boundary secret leak in the streaming scanner.** A single
@@ -43,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   documented per-entry bounds were previously dropped during pattern
   compilation; matches outside `[min_length, max_length]` are now discarded.
   `max_length` also bounds greedy patterns before the over-long redaction path.
+- **Scripted demo recordings** under `docs/demos/` — four flows (zero-config
+  scan, dry-run/CI gate, app bundles, pipe/structured fields) captured as both
+  VHS GIFs and asciinema casts, regenerable via `docs/demos/render.sh`. The
+  quickstart GIF is embedded in the README.
 
 ### Changed
 
@@ -51,6 +57,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   output, set `SANITIZE_SEED_SALT=rust-sanitize:deterministic-seed:v1` (the
   legacy constant). Cross-machine reproducibility now requires copying the
   `seed-salt` file or setting the env/flag to a shared value.
+
+### Fixed
+
+- **First-run creation of the default secrets file and the per-install seed
+  salt is now atomic and safe under concurrent first runs.** Each is written to
+  a temp file and then claimed (rename / `hard_link`), so a parallel first run
+  can no longer observe a half-written file. Previously two concurrent first
+  runs could persist different seed salts (inconsistent deterministic output),
+  or a run could load a half-written secrets file and fall through to zero
+  patterns (an unsanitized passthrough). First-run write errors now fail closed
+  instead of silently running with no patterns.
 
 ## [0.14.1] - 2026-06-24
 
