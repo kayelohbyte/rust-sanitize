@@ -81,6 +81,10 @@ cargo add rust-sanitize
 
 ## Quick Start
 
+![Zero-config scan: secrets in a log replaced with structurally plausible substitutes](docs/demos/out/01-quickstart.gif)
+
+> More demos — dry-run & CI gate, app bundles, stdin piping, structured field rules — in [docs/demos](docs/demos/). All recordings are scripted and regenerable.
+
 ### No setup — scan immediately
 
 When you run `sanitize` with no secrets file or app bundle, the built-in patterns activate automatically. They cover the most common secrets: API keys (AWS, GCP, GitHub, Stripe, Slack, OpenAI, Anthropic, HuggingFace, and more), JWTs, emails, IPv4/IPv6, UUIDs, MAC addresses, PEM headers, credential URLs, and password/secret key=value pairs.
