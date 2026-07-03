@@ -259,3 +259,59 @@ fn extract_context_snippets_hide_canary() {
     );
     assert_no_canary("extract-context report", &report_text);
 }
+
+// ---------------------------------------------------------------------------
+// Malformed secrets files — parse errors must not echo file content (S1)
+// ---------------------------------------------------------------------------
+
+/// Run the CLI with a deliberately malformed secrets file that carries the
+/// canary inside the broken region, and assert the parse error reaching the
+/// user never echoes it.
+fn assert_malformed_secrets_no_echo(file_name: &str, content: String) {
+    let dir = tempdir().unwrap();
+    let secrets = dir.path().join(file_name);
+    fs::write(&secrets, content).unwrap();
+    let input = write_fixture(dir.path());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
+        .args([
+            input.to_str().unwrap(),
+            "-s",
+            secrets.to_str().unwrap(),
+            "-n",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "malformed secrets file should fail the run"
+    );
+    assert_no_canary("stdout", &String::from_utf8_lossy(&out.stdout));
+    assert_no_canary("stderr", &String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn malformed_toml_secrets_error_hides_canary() {
+    assert_malformed_secrets_no_echo(
+        "secrets.toml",
+        format!("secrets = [\n{{ pattern = \"{CANARY}\", kind = }}\n]"),
+    );
+}
+
+#[test]
+fn malformed_json_secrets_error_hides_canary() {
+    // Data error: serde_json embeds the mistyped value in its message.
+    assert_malformed_secrets_no_echo(
+        "secrets.json",
+        format!(r#"[{{"pattern": "{CANARY}", "min_length": "{CANARY}"}}]"#),
+    );
+}
+
+#[test]
+fn malformed_yaml_secrets_error_hides_canary() {
+    assert_malformed_secrets_no_echo(
+        "secrets.yaml",
+        format!("- pattern: \"{CANARY}\n  min_length: {CANARY}\n"),
+    );
+}

@@ -411,28 +411,55 @@ pub fn parse_secrets(plaintext: &[u8], format: Option<SecretsFormat>) -> Result<
     let text = std::str::from_utf8(plaintext)
         .map_err(|e| SanitizeError::SecretsInvalidUtf8(e.to_string()))?;
 
+    // Parser error messages are deliberately reduced to a location: a secrets
+    // file's content is secret by definition, and both serde data errors
+    // (`invalid type: string "…"`) and toml's snippet rendering echo source
+    // text verbatim — straight into stderr, CI logs, and scrollback.
     match fmt {
-        SecretsFormat::Json => {
-            serde_json::from_str(text).map_err(|e| SanitizeError::SecretsFormatError {
-                format: "JSON".into(),
-                message: e.to_string(),
-            })
-        }
-        SecretsFormat::Yaml => {
-            serde_yaml_ng::from_str(text).map_err(|e| SanitizeError::SecretsFormatError {
-                format: "YAML".into(),
-                message: e.to_string(),
-            })
-        }
+        SecretsFormat::Json => serde_json::from_str(text).map_err(|e| {
+            let loc = (e.line() > 0).then(|| (e.line(), e.column()));
+            secrets_parse_error("JSON", loc)
+        }),
+        SecretsFormat::Yaml => serde_yaml_ng::from_str(text)
+            .map_err(|e| secrets_parse_error("YAML", e.location().map(|l| (l.line(), l.column())))),
         SecretsFormat::Toml => {
-            let wrapper: TomlSecrets =
-                toml::from_str(text).map_err(|e| SanitizeError::SecretsFormatError {
-                    format: "TOML".into(),
-                    message: e.to_string(),
-                })?;
+            let wrapper: TomlSecrets = toml::from_str(text).map_err(|e| {
+                secrets_parse_error("TOML", e.span().map(|s| line_col_at(text, s.start)))
+            })?;
             Ok(wrapper.secrets)
         }
     }
+}
+
+/// Build a location-only secrets parse error. The parser's own message is
+/// never included — see the comment in [`parse_secrets`].
+fn secrets_parse_error(format: &str, location: Option<(usize, usize)>) -> SanitizeError {
+    let loc = location.map_or_else(String::new, |(line, col)| {
+        format!(" at line {line}, column {col}")
+    });
+    SanitizeError::SecretsFormatError {
+        format: format.into(),
+        message: format!(
+            "invalid secrets file{loc} \
+             (parser details withheld — secrets file content is never echoed)"
+        ),
+    }
+}
+
+/// 1-based (line, column) of a byte offset within `text`. Columns count bytes
+/// since the last newline, which is exact for the ASCII syntax around a TOML
+/// error and close enough for an error pointer otherwise.
+fn line_col_at(text: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(text.len());
+    let before = &text.as_bytes()[..offset];
+    let line = bytecount::count(before, b'\n') + 1;
+    let col = offset
+        - before
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |p| p + 1)
+        + 1;
+    (line, col)
 }
 
 /// Serialize secret entries back into a plaintext format.
@@ -1234,6 +1261,62 @@ label = "openai_key"
         let encrypted = encrypt_secrets(sample_json().as_bytes(), "pw").unwrap();
         let result = load_secrets_auto(&encrypted, None, None, false);
         assert!(result.is_err());
+    }
+
+    // ---- Parse errors never echo file content (S1) ----
+
+    /// Marker standing in for a secret value inside a malformed secrets file.
+    const LEAK_MARKER: &str = "SEKRET-MARKER-0xD34DB33F";
+
+    #[track_caller]
+    fn assert_error_omits_marker(result: Result<Vec<SecretEntry>>) {
+        let msg = result
+            .expect_err("malformed input must fail to parse")
+            .to_string();
+        assert!(
+            !msg.contains(LEAK_MARKER),
+            "parse error echoed secrets file content: {msg}"
+        );
+        assert!(msg.contains("line"), "expected location info, got: {msg}");
+    }
+
+    #[test]
+    fn toml_syntax_error_omits_content() {
+        // Unclosed inline table — toml's Display normally renders the whole
+        // offending line with a caret.
+        let bad = format!("secrets = [\n{{ pattern = \"{LEAK_MARKER}\", kind = }}\n]");
+        assert_error_omits_marker(parse_secrets(bad.as_bytes(), Some(SecretsFormat::Toml)));
+    }
+
+    #[test]
+    fn json_data_error_omits_content() {
+        // Type mismatch — serde_json's message embeds the value verbatim:
+        // `invalid type: string "SEKRET-…", expected usize`.
+        let bad = format!(r#"[{{"pattern": "p", "min_length": "{LEAK_MARKER}"}}]"#);
+        assert_error_omits_marker(parse_secrets(bad.as_bytes(), Some(SecretsFormat::Json)));
+    }
+
+    #[test]
+    fn yaml_data_error_omits_content() {
+        let bad = format!("- pattern: p\n  min_length: {LEAK_MARKER}\n");
+        assert_error_omits_marker(parse_secrets(bad.as_bytes(), Some(SecretsFormat::Yaml)));
+    }
+
+    #[test]
+    fn yaml_syntax_error_omits_content() {
+        // Unterminated quoted scalar spanning the marker.
+        let bad = format!("- pattern: \"{LEAK_MARKER}\n  kind: literal\n");
+        assert_error_omits_marker(parse_secrets(bad.as_bytes(), Some(SecretsFormat::Yaml)));
+    }
+
+    #[test]
+    fn line_col_at_positions() {
+        let text = "ab\ncd\nef";
+        assert_eq!(line_col_at(text, 0), (1, 1));
+        assert_eq!(line_col_at(text, 4), (2, 2));
+        assert_eq!(line_col_at(text, 6), (3, 1));
+        // Clamped past the end.
+        assert_eq!(line_col_at(text, 100), (3, 3));
     }
 
     #[test]
