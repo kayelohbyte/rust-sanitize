@@ -1,0 +1,14 @@
+# Detection corpus: SaaS service tokens.
+cases:
+  - label: slack_token
+    text: "slack api error invalid_auth token={{SECRET}}"
+    secret: "xoxb-1~|~234567~|~890123~|~-12345~|~678901~|~23-AbC~|~dEfGhI~|~jKlMnO~|~pQrStU~|~vWx"
+  - label: stripe_key
+    text: "STRIPE_SECRET_KEY={{SECRET}} charge failed"
+    secret: "sk_liv~|~e_AbCd~|~EfGhIj~|~KlMnOp~|~QrStUv~|~Wx4242"
+  - label: sendgrid_api_key
+    text: "sendgrid 202 accepted using {{SECRET}}"
+    secret: "SG.AbC~|~dEfGhI~|~jKlMnO~|~pQrStU~|~v.AbCd~|~EfGhIj~|~KlMnOp~|~QrStUv~|~WxYz01~|~234567~|~89abcd~|~efg"
+  - label: twilio_account_sid
+    text: "twilio request sid={{SECRET}} status=queued"
+    secret: "AC0123~|~456789~|~abcdef~|~012345~|~6789ab~|~cdef"

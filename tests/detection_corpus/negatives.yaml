@@ -1,0 +1,12 @@
+# Detection corpus: hard lookalikes that NO built-in pattern may match.
+# Each line must appear byte-identical in sanitized output.
+negatives:
+  - "commit 4af6661d9e0b8f2c31a57e2f8a9b0c1d2e3f4a5b (HEAD -> main)"
+  - "upgraded package to v2.16.4-rc.1 from v2.16.3"
+  - "2026-06-01 12:00:01,342 INFO scheduler heartbeat ok"
+  - "pod nginx-deployment-66b6c48dd5-4x9mp restarted 2 times"
+  - "checksum sha1:da39a3ee5e6b4b0d3255bfef95601890afd80709 verified"
+  - "dependency org.apache.commons:commons-lang3:3.12.0 resolved"
+  - "base64 header Q29udGVudC1UeXBlOiBhcHBsaWNhdGlvbi9qc29u decoded"
+  - "thread pool sized to 16 workers, queue depth 4096"
+  - "ETA 00h12m33s remaining, 87.5 percent complete"

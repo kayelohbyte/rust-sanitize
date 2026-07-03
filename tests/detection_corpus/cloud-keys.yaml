@@ -1,0 +1,20 @@
+# Detection corpus: cloud provider API keys.
+# Each positive embeds a synthetic, format-valid secret in a realistic context;
+# `secret` is the exact substring that must be absent from sanitized output.
+# Seeded from gitleaks/trufflehog rule-test shapes (MIT) + provider format docs.
+cases:
+  - label: aws_access_key_id
+    text: "2026-06-01T12:00:01Z INFO boto3 credentials loaded aws_access_key_id={{SECRET}} region=us-east-1"
+    secret: "AKIAIO~|~SFODNN~|~7EXAMP~|~LE"
+  - label: aws_access_key_id
+    text: "export AWS_ACCESS_KEY_ID={{SECRET}} # temporary STS credentials"
+    secret: "ASIAY3~|~4FZKBO~|~KMUTVV~|~7A"
+  - label: gcp_api_key
+    text: "curl 'https://maps.googleapis.com/maps/api/geocode/json?key={{SECRET}}'"
+    secret: "AIzaSy~|~D9tSrk~|~e72Pou~|~QMnMXa~|~7eZSW0~|~jkFMBW~|~Y1x"
+  - label: openai_api_key
+    text: "OPENAI_API_KEY={{SECRET}} openai client initialized"
+    secret: "sk-pro~|~j-Ab3d~|~Ef6hIj~|~9kLmNo~|~PqRsTu~|~VwXyZ0~|~123456~|~789abc~|~def"
+  - label: anthropic_api_key
+    text: "anthropic: 401 unauthorized for key {{SECRET}}"
+    secret: "sk-ant~|~-api03~|~-Ab3dE~|~f6hIj9~|~kLmNoP~|~qRsTuV~|~wXyZ01~|~234567~|~89abcd~|~efghij~|~klmnop~|~qrstuv~|~wxyzAB~|~CDEFGH~|~IJKLMN~|~OPQRST~|~UVWXYZ~|~01"

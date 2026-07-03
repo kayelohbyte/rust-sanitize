@@ -1,0 +1,29 @@
+# Detection corpus: network identifiers and structured PII.
+cases:
+  - label: email
+    text: "2026-06-02 WARN password reset requested for {{SECRET}} from web"
+    secret: "alice.~|~smith+~|~test@c~|~orp-ma~|~il.exa~|~mple.c~|~om"
+  - label: ipv4
+    text: "ERROR upstream timeout connecting to {{SECRET}} after 30s"
+    secret: "203.0.~|~113.42"
+  - label: ipv6_full
+    text: "neighbor {{SECRET}} state=REACHABLE"
+    secret: "2001:0~|~db8:85~|~a3:000~|~0:0000~|~:8a2e:~|~0370:7~|~334"
+  - label: ipv6_compressed
+    text: "listening on {{SECRET}} port 8443"
+    secret: "2001:d~|~b8::8a~|~2e:370~|~:7334"
+  - label: uuid
+    text: "request_id={{SECRET}} completed in 34ms"
+    secret: "f47ac1~|~0b-58c~|~c-4372~|~-a567-~|~0e02b2~|~c3d479"
+  - label: mac_address
+    text: "dhcp lease granted to {{SECRET}} on vlan 12"
+    secret: "00:1B:~|~44:11:~|~3A:B7"
+  - label: image_digest
+    text: "pulled image nginx@{{SECRET}}"
+    secret: "sha256~|~:9d6b5~|~8feebd~|~2dbd3c~|~56ab58~|~53333d~|~627cc6~|~e28101~|~1cfd60~|~50fa4b~|~cf2072~|~c9496"
+  - label: user_home_path
+    text: "config loaded from /home/{{SECRET}}/.config/app/settings.toml"
+    secret: "jsmith~|~42"
+  - label: url
+    text: "fetching {{SECRET}}"
+    secret: "https:~|~//inte~|~rnal-w~|~iki.co~|~rp.exa~|~mple/r~|~unbook~|~s/db-f~|~ailove~|~r?step~|~=3"
