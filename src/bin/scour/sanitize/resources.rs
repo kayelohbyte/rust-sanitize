@@ -212,17 +212,7 @@ pub(super) fn load_run_resources(
                 } else {
                     ("literal", p.as_str())
                 };
-                SecretEntry {
-                    pattern: pattern.to_string(),
-                    kind: kind.to_string(),
-                    category: "auth_token".to_string(),
-                    label: Some(format!("quick:{p}")),
-                    values: vec![],
-                    min_length: None,
-                    max_length: None,
-                    threshold: None,
-                    charset: None,
-                }
+                SecretEntry::new(pattern, kind, "auth_token").with_label(format!("quick:{p}"))
             })
             .collect();
         let (patterns, errors) = entries_to_patterns(&quick_entries);
