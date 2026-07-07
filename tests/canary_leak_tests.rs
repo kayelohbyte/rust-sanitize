@@ -273,7 +273,7 @@ fn assert_malformed_secrets_no_echo(file_name: &str, content: String) {
     fs::write(&secrets, content).unwrap();
     let input = write_fixture(dir.path());
 
-    let out = Command::new(env!("CARGO_BIN_EXE_sanitize"))
+    let out = Command::new(env!("CARGO_BIN_EXE_scour-secrets"))
         .args([
             input.to_str().unwrap(),
             "-s",
