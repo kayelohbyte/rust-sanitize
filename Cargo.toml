@@ -95,7 +95,7 @@ harness = false
 
 [[bin]]
 name = "scour-secrets"
-path = "src/bin/sanitize/main.rs"
+path = "src/bin/scour/main.rs"
 required-features = ["cli"]
 
 [profile.release]
