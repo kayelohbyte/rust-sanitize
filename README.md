@@ -390,6 +390,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model and mitigations.
 | [Supported Categories](docs/categories.md) | All 18 built-in replacement categories with strategies and examples, plus custom categories. |
 | [Pluggable Strategies](docs/strategies.md) | The `Strategy` trait, 6 built-in strategies, and guide to writing custom strategies. |
 | [Library API Reference](docs/api-reference.md) | Module-by-module public API tables. |
+| [Detection Quality](docs/detection-quality.md) | CI-gated corpus scorecard: per-pattern positives, hard negatives, chunk-boundary checks. |
 | [Defensive Limits & Streaming](docs/defensive-limits.md) | Streaming chunking model, archive processing flow, and all defensive size/depth/count limits. |
 | [Architecture](ARCHITECTURE.md) | Internal architecture, data flow, module map, concurrency model, and streaming design. |
 | [Security](SECURITY.md) | Security properties, threat mitigations, encryption details, and zeroization strategy. |

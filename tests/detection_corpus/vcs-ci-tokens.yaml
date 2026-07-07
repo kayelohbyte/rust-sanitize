@@ -1,0 +1,17 @@
+# Detection corpus: VCS and package-registry tokens.
+cases:
+  - label: github_token
+    text: "remote: Invalid username or password for token {{SECRET}}"
+    secret: "ghp_Ab~|~CdEfGh~|~IjKlMn~|~OpQrSt~|~UvWxYz~|~012345~|~6789"
+  - label: github_pat_fine_grained
+    text: "GH_TOKEN={{SECRET}} gh auth status"
+    secret: "github~|~_pat_1~|~1ABCDE~|~FG0abc~|~defghi~|~jklmno~|~pqrstu~|~vwxyzA~|~BCDEFG~|~HIJKLM~|~NOPQRS~|~TUVWXY~|~Z01234~|~56789_~|~abcdef~|~ghi"
+  - label: gitlab_token
+    text: "job failed: 403 forbidden using {{SECRET}} for project 42"
+    secret: "glpat-~|~AbCdEf~|~Gh1jKl~|~MnOpQr~|~St"
+  - label: npm_token
+    text: "//registry.npmjs.org/:_authToken={{SECRET}}"
+    secret: "npm_Ab~|~CdEfGh~|~IjKlMn~|~OpQrSt~|~UvWxYz~|~012345~|~6789"
+  - label: huggingface_token
+    text: "huggingface_hub login succeeded with token {{SECRET}}"
+    secret: "hf_AbC~|~dEfGhI~|~jKlMnO~|~pQrStU~|~vWxYz0~|~123456~|~7"

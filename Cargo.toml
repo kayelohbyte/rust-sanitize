@@ -84,6 +84,9 @@ nix = { version = "0.29", features = ["fs"] }
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+# Detection-quality corpus files are YAML; serde is already a main dependency.
+serde_yaml_ng = "0.10"
+serde = { version = "1", features = ["derive"] }
 
 [[bench]]
 name = "mapping_bench"
