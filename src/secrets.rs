@@ -513,7 +513,7 @@ fn secrets_parse_error(format: &str, location: Option<(usize, usize)>) -> Saniti
 /// 1-based (line, column) of a byte offset within `text`. Columns count bytes
 /// since the last newline, which is exact for the ASCII syntax around a TOML
 /// error and close enough for an error pointer otherwise.
-fn line_col_at(text: &str, offset: usize) -> (usize, usize) {
+pub(crate) fn line_col_at(text: &str, offset: usize) -> (usize, usize) {
     let offset = offset.min(text.len());
     let before = &text.as_bytes()[..offset];
     let line = bytecount::count(before, b'\n') + 1;

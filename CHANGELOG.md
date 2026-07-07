@@ -14,6 +14,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   values) into the error on stderr; serde JSON/YAML data errors embedded
   mistyped values the same way. All three parsers now report format +
   line/column only.
+- **TOML *data-file* parse errors never echo input content.** The structured
+  TOML processor had the same bug as the secrets-file parser above: a
+  malformed TOML input file rendered the offending source line — including
+  any secret on it — into the `warn!`/error output during a `--profile` run.
+  Both the re-serializing and the span-edit TOML paths now report line/column
+  only.
+- **The streaming scanner fails closed on invalid capture bounds.** If a
+  match ever carried capture-group bounds outside the match bounds (not
+  reachable with the `regex` crate; defensive path), the scanner previously
+  emitted the full match *unreplaced*. It now falls back to replacing the
+  full match.
+- **MCP `test_pattern` / `test_allowlist` no longer pass candidate values on
+  the command line.** Test values — which are frequently real secrets — were
+  visible to every local user via `ps` while the subprocess ran. They are now
+  piped over stdin (one per line); as a side effect, values starting with `-`
+  are now testable, while empty values and values containing newlines are
+  rejected with a clear error (the line protocol cannot carry them).
 - **Encrypted secrets files now receive the structured-handoff write-back**:
   decrypt → merge discovered literals → re-encrypt (fresh salt + nonce) with
   the same password. The file on disk is never downgraded to plaintext, and

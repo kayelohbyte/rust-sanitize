@@ -131,6 +131,20 @@ async function readReport(path: string, format?: string): Promise<unknown> {
   return format === "html" ? text : JSON.parse(text);
 }
 
+/// Encode test values for the CLI's stdin line protocol (`test-pattern` /
+/// `allow-test` read one value per line when no positional values are given).
+/// Values containing newlines would silently split into multiple values, and
+/// empty lines are dropped by the CLI — reject both up front.
+function encodeStdinValues(values: string[]): string {
+  for (const val of values) {
+    if (val.length === 0) throw new Error("test values must not be empty");
+    if (val.includes("\n") || val.includes("\r")) {
+      throw new Error("test values must not contain newlines (values are passed one per line)");
+    }
+  }
+  return values.map((v) => v + "\n").join("");
+}
+
 async function runSanitize(
   args: string[],
   stdinData: string | null,
@@ -1163,17 +1177,17 @@ async function toolTestAllowlist(params: {
     if (pat.startsWith("-")) throw new Error(`allow pattern '${pat}' must not start with '-' (flag injection)`);
     args.push("--allow", pat);
   }
-  for (const val of params.values) {
-    if (val.startsWith("-")) throw new Error(`test value '${val}' must not start with '-' (flag injection)`);
-  }
-  args.push(...params.values);
+  // Values are piped via stdin (one per line), never argv — candidate values
+  // may be real secrets, and argv is visible to every user in `ps` while the
+  // child runs.
+  const stdinValues = encodeStdinValues(params.values);
 
   if (activeCalls >= MAX_CONCURRENT) {
     throw new Error(`Too many concurrent requests (max ${MAX_CONCURRENT}). Retry after current calls complete.`);
   }
   activeCalls++;
   try {
-    const result = await runSanitize(args, null);
+    const result = await runSanitize(args, stdinValues);
     if (result.exitCode !== 0) {
       throw new Error(`scour-secrets exited with code ${result.exitCode}: ${safeStderr(result)}`);
     }
@@ -1318,12 +1332,10 @@ async function toolTestPattern(params: {
       }
       args.push("--app", params.app.join(","));
     }
-    for (const val of params.values) {
-      if (val.startsWith("-")) throw new Error(`test value '${val}' must not start with '-' (flag injection)`);
-    }
-    args.push(...params.values);
-
-    const result = await runSanitize(args, null, env);
+    // Values are piped via stdin (one per line), never argv — candidate values
+    // may be real secrets, and argv is visible to every user in `ps` while the
+    // child runs.
+    const result = await runSanitize(args, encodeStdinValues(params.values), env);
     // Exit code 1 means some values didn't match — the JSON output is still valid.
     // Detect this by attempting to parse stdout; a real error produces no JSON.
     if (result.exitCode !== 0) {
