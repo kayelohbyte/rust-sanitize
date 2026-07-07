@@ -741,7 +741,7 @@ fn structured_field_edits_are_counted_in_summary() {
 /// discovered value in plain logs (proving the write-back is real).
 #[test]
 fn encrypted_handoff_writes_back_reencrypted() {
-    use scour::secrets::{decrypt_secrets, encrypt_secrets, looks_encrypted, parse_secrets};
+    use scour_secrets::secrets::{decrypt_secrets, encrypt_secrets, looks_encrypted, parse_secrets};
 
     let dir = tempdir().unwrap();
     let outdir = dir.path().join("out");
@@ -776,7 +776,7 @@ fn encrypted_handoff_writes_back_reencrypted() {
     .unwrap();
 
     // Run 1: structured scan discovers the password; handoff re-encrypts.
-    let out = Command::new(env!("CARGO_BIN_EXE_scour"))
+    let out = Command::new(env!("CARGO_BIN_EXE_scour-secrets"))
         .args([
             config.to_str().unwrap(),
             "-s",
@@ -787,9 +787,9 @@ fn encrypted_handoff_writes_back_reencrypted() {
             "--output",
             outdir.to_str().unwrap(),
         ])
-        .env("SCOUR_PASSWORD", file_pw)
-        .env("SCOUR_LOG", "error")
-        .env("SCOUR_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_PASSWORD", file_pw)
+        .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_NO_SETTINGS", "1")
         .output()
         .unwrap();
     assert!(
@@ -824,7 +824,7 @@ fn encrypted_handoff_writes_back_reencrypted() {
     // encrypted secrets file, proving cross-run usefulness of the write-back.
     let log = dir.path().join("later.log");
     fs::write(&log, format!("ERROR auth failed using {password}\n")).unwrap();
-    let out2 = Command::new(env!("CARGO_BIN_EXE_scour"))
+    let out2 = Command::new(env!("CARGO_BIN_EXE_scour-secrets"))
         .args([
             log.to_str().unwrap(),
             "-s",
@@ -833,9 +833,9 @@ fn encrypted_handoff_writes_back_reencrypted() {
             "--output",
             outdir.to_str().unwrap(),
         ])
-        .env("SCOUR_PASSWORD", file_pw)
-        .env("SCOUR_LOG", "error")
-        .env("SCOUR_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_PASSWORD", file_pw)
+        .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_NO_SETTINGS", "1")
         .output()
         .unwrap();
     assert!(

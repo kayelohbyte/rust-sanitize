@@ -5,7 +5,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
-use scour_secrets::secrets::SecretEntry;
+use scour_secrets::secrets::{
+    decrypt_secrets, encrypt_secrets, looks_encrypted, parse_secrets, serialize_secrets,
+    SecretEntry, SecretsFormat,
+};
 use scour_secrets::{
     atomic_write, atomic_write_private, extract_context, extract_context_reader, ArchiveFilter,
     ArchiveFormat, ArchiveProcessor, ArchiveProgress, AtomicFileWriter, EntryCallback, FileReport,
