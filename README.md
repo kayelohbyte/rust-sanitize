@@ -419,7 +419,9 @@ Do not open a public issue for security-sensitive findings. Report privately via
 
 ## Stability
 
-This project follows [Semantic Versioning](https://semver.org/). As of 0.8.0, the public library API and CLI interface are considered stable. Breaking changes will be avoided but may occur in minor releases until 1.0.0. The MSRV is **1.86** (stable toolchain), declared under `rust-version` in `Cargo.toml` and enforced in CI.
+This project follows [Semantic Versioning](https://semver.org/). As of 0.8.0, the public library API and CLI interface are considered stable. Breaking changes will be avoided but may occur in minor releases until 1.0.0.
+
+The MSRV is **1.86** (stable toolchain), declared under `rust-version` in `Cargo.toml` and enforced in CI. **MSRV policy:** raising the MSRV is treated as a **minor** version bump (noted in the changelog), not a breaking change, and it is only raised when a dependency or a required language feature makes it necessary.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 

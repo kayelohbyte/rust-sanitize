@@ -85,7 +85,7 @@ property-based tests (via `proptest`). Property tests verify length-preservation
 | `tests/report_tests.rs` | Report generation |
 | `tests/property_tests.rs` | Property-based tests (proptest) |
 | `tests/audit_fix_tests.rs` | Regression tests for audit findings |
-| `src/bin/sanitize.rs` (inline) | CLI argument parsing smoke tests |
+| `src/bin/scour/` (inline) | CLI argument parsing smoke tests |
 
 ## Minimum Supported Rust Version (MSRV)
 
@@ -93,6 +93,10 @@ The MSRV is **Rust 1.86**, driven by the dependency tree (current
 `clap`/transitive crates) and enforced by the MSRV jobs in CI. Do not use
 language features or library APIs that require a newer version without
 updating `rust-version` in `Cargo.toml`.
+
+**Policy:** raising the MSRV is a **minor** version bump (called out in the
+changelog), not a breaking change. Only raise it when a dependency or a needed
+language feature requires it — never gratuitously.
 
 ## Commit Guidelines
 

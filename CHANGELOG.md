@@ -91,6 +91,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   new trait methods will always ship with default implementations.
 - Root re-exports for `ReportSummary`, `MatchLocationsResult`, `Replacement`,
   and the `secrets::` free functions.
+- **CI: `cargo-semver-checks` job** that diffs the public library API against
+  the latest crates.io release and fails a PR whose version bump is not
+  semver-appropriate. It self-skips until the crate is first published (there
+  is no baseline yet), then activates automatically.
+- **Documented MSRV policy:** raising the MSRV is a minor-version bump (noted
+  in the changelog), not a breaking change, and only happens when a dependency
+  or a required language feature makes it necessary (README + CONTRIBUTING).
 
 ### Fixed
 

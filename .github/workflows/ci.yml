@@ -219,6 +219,40 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  semver:
+    name: SemVer API compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: changes
+    if: github.event_name != 'schedule' && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for a published baseline on crates.io
+        id: baseline
+        # cargo-semver-checks diffs the crate's public API against the latest
+        # version published on crates.io. Until scour-secrets is first published
+        # there is no baseline (and the last git tag predates the rename), so
+        # skip cleanly rather than failing every PR. The check activates
+        # automatically once the crate is on crates.io.
+        run: |
+          if curl -sfL \
+               -H "User-Agent: scour-secrets-ci (github.com/kayelohbyte/scour-secrets)" \
+               "https://crates.io/api/v1/crates/scour-secrets" -o /dev/null; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::scour-secrets is not on crates.io yet — SemVer check skipped until the first publish."
+          fi
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: steps.baseline.outputs.published == 'true'
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        if: steps.baseline.outputs.published == 'true'
+      - name: cargo-semver-checks
+        if: steps.baseline.outputs.published == 'true'
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+
   fuzz:
     name: Fuzz targets
     runs-on: ubuntu-latest

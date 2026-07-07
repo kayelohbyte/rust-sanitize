@@ -11,7 +11,7 @@ Download the `scour-secrets-mcp` binary for your platform from the [Releases](ht
 Alternatively, run from source with [Deno](https://deno.land) 2.x (no compile step):
 
 ```bash
-SCOUR_SECRETS_BIN=/usr/local/bin/sanitize \
+SCOUR_SECRETS_BIN=/usr/local/bin/scour-secrets \
   deno run --allow-run --allow-env --allow-read --allow-write \
   mcp/src/index.ts
 ```
@@ -151,7 +151,7 @@ openssl rand -hex 32
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>SCOUR_SECRETS_BIN</key>             <string>/usr/local/bin/sanitize</string>
+    <key>SCOUR_SECRETS_BIN</key>             <string>/usr/local/bin/scour-secrets</string>
     <key>SCOUR_SECRETS_SECRETS_DIR</key>     <string>/var/sanitize/secrets</string>
     <key>SCOUR_SECRETS_MCP_HTTP_TOKEN</key>  <string>YOUR_TOKEN_HERE</string>
   </dict>
@@ -175,7 +175,7 @@ Store secrets in a separate environment file rather than inline in the unit — 
 ```bash
 sudo mkdir -p /etc/scour-secrets-mcp
 sudo tee /etc/scour-secrets-mcp/env > /dev/null <<'EOF'
-SCOUR_SECRETS_BIN=/usr/local/bin/sanitize
+SCOUR_SECRETS_BIN=/usr/local/bin/scour-secrets
 SCOUR_SECRETS_SECRETS_DIR=/var/sanitize/secrets
 SCOUR_SECRETS_MCP_HTTP_TOKEN=YOUR_TOKEN_HERE
 EOF
@@ -441,7 +441,7 @@ sudo chmod 0600 /var/sanitize/secrets/acme-corp/.password
 
 ## IDE & Editor Setup
 
-All configurations assume `scour-secrets-mcp` is at `/usr/local/bin/scour-secrets-mcp` and `scour-secrets` is at `/usr/local/bin/sanitize`. Adjust paths to match your installation.
+All configurations assume `scour-secrets-mcp` is at `/usr/local/bin/scour-secrets-mcp` and `scour-secrets` is at `/usr/local/bin/scour-secrets`. Adjust paths to match your installation.
 
 ### Claude Code
 
@@ -449,14 +449,14 @@ Add at **project scope** (writes `.mcp.json` in the repo root, checked into vers
 
 ```bash
 claude mcp add --scope project scour-secrets /usr/local/bin/scour-secrets-mcp \
-  -e SCOUR_SECRETS_BIN=/usr/local/bin/sanitize
+  -e SCOUR_SECRETS_BIN=/usr/local/bin/scour-secrets
 ```
 
 Add at **user scope** (available across all your projects):
 
 ```bash
 claude mcp add --scope user scour-secrets /usr/local/bin/scour-secrets-mcp \
-  -e SCOUR_SECRETS_BIN=/usr/local/bin/sanitize
+  -e SCOUR_SECRETS_BIN=/usr/local/bin/scour-secrets
 ```
 
 Or write `.mcp.json` at the repo root manually:
@@ -467,7 +467,7 @@ Or write `.mcp.json` at the repo root manually:
     "scour-secrets": {
       "command": "/usr/local/bin/scour-secrets-mcp",
       "env": {
-        "SCOUR_SECRETS_BIN": "/usr/local/bin/sanitize"
+        "SCOUR_SECRETS_BIN": "/usr/local/bin/scour-secrets"
       }
     }
   }
@@ -485,7 +485,7 @@ Or write `.mcp.json` at the repo root manually:
       "command": "/usr/local/bin/scour-secrets-mcp",
       "args": [],
       "env": {
-        "SCOUR_SECRETS_BIN": "/usr/local/bin/sanitize"
+        "SCOUR_SECRETS_BIN": "/usr/local/bin/scour-secrets"
       }
     }
   }
@@ -509,7 +509,7 @@ Requires VS Code 1.99 or later with the GitHub Copilot extension.
       "type": "stdio",
       "command": "/usr/local/bin/scour-secrets-mcp",
       "env": {
-        "SCOUR_SECRETS_BIN": "/usr/local/bin/sanitize"
+        "SCOUR_SECRETS_BIN": "/usr/local/bin/scour-secrets"
       }
     }
   }
@@ -550,7 +550,7 @@ Restart VS Code after editing the file.
       "command": "/usr/local/bin/scour-secrets-mcp",
       "args": [],
       "env": {
-        "SCOUR_SECRETS_BIN": "/usr/local/bin/sanitize"
+        "SCOUR_SECRETS_BIN": "/usr/local/bin/scour-secrets"
       }
     }
   }
@@ -597,7 +597,7 @@ require("avante").setup({
       "type": "local",
       "command": ["/usr/local/bin/scour-secrets-mcp"],
       "environment": {
-        "SCOUR_SECRETS_BIN": "/usr/local/bin/sanitize",
+        "SCOUR_SECRETS_BIN": "/usr/local/bin/scour-secrets",
         "PATH": "{env:PATH}"
       }
     }
