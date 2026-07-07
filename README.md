@@ -347,7 +347,7 @@ The default build includes the CLI binary and every processor. Library-only cons
 ```toml
 # Core only — HMAC/random generators, mapping store, streaming scanner,
 # and the always-on JSON/YAML/TOML/INI/env/key-value/log-line processors.
-# Drops clap, ureq, walkdir, ctrlc, rpassword, zip, tar, flate2, csv, csv-core, quick-xml.
+# Drops clap, ureq, walkdir, ctrlc, rpassword, tracing-subscriber, zip, tar, flate2, csv, csv-core, quick-xml.
 scour-secrets = { version = "0.16", default-features = false }
 
 # Add archive (zip/tar/tar.gz) and/or the CSV + XML processors as needed.
@@ -356,7 +356,7 @@ scour-secrets = { version = "0.16", default-features = false, features = ["archi
 
 | Feature | Pulls in | Enables |
 |---------|----------|---------|
-| `cli` *(default)* | `clap`, `ureq`, `walkdir`, `ctrlc`, `rpassword` | The `scour-secrets` binary; implies `archive` + `structured` |
+| `cli` *(default)* | `clap`, `ureq`, `walkdir`, `ctrlc`, `rpassword`, `tracing-subscriber` | The `scour-secrets` binary; implies `archive` + `structured` |
 | `archive` *(default)* | `zip`, `tar`, `flate2` | `ArchiveProcessor` (zip / tar / tar.gz) |
 | `structured` *(default)* | `csv`, `csv-core`, `quick-xml` | `CsvProcessor` and `XmlProcessor` |
 
@@ -395,6 +395,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model and mitigations.
 | [Architecture](ARCHITECTURE.md) | Internal architecture, data flow, module map, concurrency model, and streaming design. |
 | [Security](SECURITY.md) | Security properties, threat mitigations, encryption details, and zeroization strategy. |
 | [Contributing](CONTRIBUTING.md) | Build instructions, test suite, fuzz targets, linting, and PR guidelines. |
+| [Roadmap](ROADMAP.md) | Stability posture, path to 1.0, and deliberately deferred features. |
 | [Changelog](CHANGELOG.md) | Release history and version notes. |
 
 ---

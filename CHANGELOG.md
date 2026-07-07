@@ -91,6 +91,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   new trait methods will always ship with default implementations.
 - Root re-exports for `ReportSummary`, `MatchLocationsResult`, `Replacement`,
   and the `secrets::` free functions.
+- **`tracing-subscriber` is now gated behind the `cli` feature.** It is only
+  used by the binary's logging setup; library-only consumers
+  (`default-features = false`) no longer pull it (and its `json` / `env-filter`
+  machinery). No effect on the default build or the CLI.
+- **`ROADMAP.md`** documenting the stability posture, the path to 1.0, and the
+  features deliberately deferred past 1.0.
+- **Release: `cargo publish` to crates.io** is now automated in the release
+  workflow (gated on the build matrix, with a tag-vs-`Cargo.toml`-version
+  guard), so tagged releases reach crates.io instead of only shipping binaries.
 - **CI: `cargo-semver-checks` job** that diffs the public library API against
   the latest crates.io release and fails a PR whose version bump is not
   semver-appropriate. It self-skips until the crate is first published (there
