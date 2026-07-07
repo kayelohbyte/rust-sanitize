@@ -230,14 +230,20 @@ mod tests {
 
     #[test]
     fn cli_parses_output_long_flag() {
-        let cli = Cli::try_parse_from(["scour-secrets", "input.txt", "--output", "out.txt"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["scour-secrets", "input.txt", "--output", "out.txt"]).unwrap();
         assert_eq!(cli.output.unwrap(), PathBuf::from("out.txt"));
     }
 
     #[test]
     fn cli_parses_secrets_file_flag() {
-        let cli = Cli::try_parse_from(["scour-secrets", "input.txt", "--secrets-file", "secrets.json"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "scour-secrets",
+            "input.txt",
+            "--secrets-file",
+            "secrets.json",
+        ])
+        .unwrap();
         assert_eq!(cli.secrets_file.unwrap(), PathBuf::from("secrets.json"));
     }
 
@@ -290,9 +296,14 @@ mod tests {
 
     #[test]
     fn cli_explicit_progress_takes_precedence_over_no_progress() {
-        let cli =
-            Cli::try_parse_from(["scour-secrets", "input.txt", "--no-progress", "--progress", "on"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "scour-secrets",
+            "input.txt",
+            "--no-progress",
+            "--progress",
+            "on",
+        ])
+        .unwrap();
         assert!(cli.no_progress);
         assert_eq!(cli.progress, Some(ProgressMode::On));
         assert_eq!(cli.effective_progress_mode(), ProgressMode::On);
@@ -300,8 +311,13 @@ mod tests {
 
     #[test]
     fn cli_parses_progress_interval() {
-        let cli = Cli::try_parse_from(["scour-secrets", "input.txt", "--progress-interval-ms", "500"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "scour-secrets",
+            "input.txt",
+            "--progress-interval-ms",
+            "500",
+        ])
+        .unwrap();
         assert_eq!(cli.progress_interval_ms, 500);
     }
 
