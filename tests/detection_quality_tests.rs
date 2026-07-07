@@ -90,13 +90,13 @@ fn run_default_scan(input: &str, extra_args: &[&str]) -> String {
     let input_path = dir.path().join("input.log");
     fs::write(&input_path, input).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_scour"))
+    let out = Command::new(env!("CARGO_BIN_EXE_scour-secrets"))
         .args([input_path.to_str().unwrap(), "-o", "-"])
         .args(extra_args)
         .env("XDG_CONFIG_HOME", &config_home)
         .env("APPDATA", &config_home)
-        .env("SCOUR_LOG", "error")
-        .env("SCOUR_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_NO_SETTINGS", "1")
         .env("SCOUR_NO_CONFIG", "1")
         .output()
         .unwrap();
