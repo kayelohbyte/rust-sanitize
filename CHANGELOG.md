@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reachable with the `regex` crate; defensive path), the scanner previously
   emitted the full match *unreplaced*. It now falls back to replacing the
   full match.
+- **XML parse errors never echo input content.** The structured XML processor
+  rendered `quick-xml`'s error `Display` — which embeds element names
+  (mismatched-tag errors) and, in some entity/attribute decode errors, the
+  offending substring — into the `warn!`/error output. All XML parse, decode,
+  and attribute error paths now report a byte position only.
 - **MCP `test_pattern` / `test_allowlist` no longer pass candidate values on
   the command line.** Test values — which are frequently real secrets — were
   visible to every local user via `ps` while the subprocess ran. They are now
@@ -68,6 +73,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   new trait methods will always ship with default implementations.
 - Root re-exports for `ReportSummary`, `MatchLocationsResult`, `Replacement`,
   and the `secrets::` free functions.
+
+### Fixed
+
+- **The structured-handoff write-back no longer persists trivially short
+  discovered values.** A structured field that held a 1–3 character value
+  (e.g. `v`, `id`) was written to the secrets file as a global `kind: literal`
+  entry, which then matched that fragment everywhere in every subsequent run —
+  corrupting unrelated text (`sensitive` → `sensiti9e`). Discovered literals
+  now share the format-preserving scanner's minimum-length threshold
+  (`MIN_DISCOVERED_LITERAL_LEN`, currently 4) for both in-run use and
+  write-back, so a value the scanner would reject is never persisted. Existing
+  secrets files that already accumulated such short literals should have them
+  removed by hand.
 
 ## [0.15.0] - 2026-06-26
 
