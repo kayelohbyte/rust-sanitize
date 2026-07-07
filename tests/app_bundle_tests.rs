@@ -741,7 +741,9 @@ fn structured_field_edits_are_counted_in_summary() {
 /// discovered value in plain logs (proving the write-back is real).
 #[test]
 fn encrypted_handoff_writes_back_reencrypted() {
-    use scour_secrets::secrets::{decrypt_secrets, encrypt_secrets, looks_encrypted, parse_secrets};
+    use scour_secrets::secrets::{
+        decrypt_secrets, encrypt_secrets, looks_encrypted, parse_secrets,
+    };
 
     let dir = tempdir().unwrap();
     let outdir = dir.path().join("out");
