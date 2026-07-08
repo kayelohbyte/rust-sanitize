@@ -166,6 +166,23 @@
       label: dku_dbserver_key
       min_length: 8
 
+# --- Live sessions (run/user-sessions.json) ------------------------------
+# accessToken / identityToken are live bearer credentials for open UI/API
+# sessions; xsrfTokenSalt seeds the CSRF tokens. All are also echoed into
+# backend.log on auth events, so discovery here scrubs them there too.
+- processor: json
+  extensions: [".json"]
+  include: ["user-sessions.json", "*/user-sessions.json"]
+  fields:
+    - pattern: "*Token*"
+      category: auth_token
+      label: dku_session_token
+      min_length: 8
+    - pattern: "*.user"
+      category: name
+      label: dku_session_user
+      min_length: 3
+
 # --- API keys + config key (apikeys.json, public-apikeys.json, configkey.json) ---
 - processor: json
   extensions: [".json"]
