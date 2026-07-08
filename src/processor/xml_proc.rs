@@ -25,6 +25,22 @@ use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer, XmlVersion};
 use std::io::Cursor;
 
+/// Content-free XML parse error. quick-xml's error `Display` embeds document
+/// content — element names in `IllFormed` mismatched-tag errors, and the
+/// offending substring in some entity/attribute decode errors — which would
+/// echo input (potentially secret) into stderr and logs. Report only a
+/// position when one is available, never the parser's rendered message.
+fn xml_parse_error(kind: &str, byte_pos: Option<usize>) -> SanitizeError {
+    let loc = byte_pos.map_or_else(String::new, |p| format!(" at byte {p}"));
+    SanitizeError::ParseError {
+        format: "XML".into(),
+        message: format!(
+            "XML {kind} error{loc} \
+             (parser details withheld — input content is never echoed)"
+        ),
+    }
+}
+
 /// Scan a start/empty-tag's raw bytes (`<el a="v" b='w'/>`) for each attribute's
 /// **value** byte range (the content between the quotes), in source order.
 ///
@@ -194,11 +210,11 @@ impl Processor for XmlProcessor {
                         )))
                     })?;
                 }
-                Err(e) => {
-                    return Err(SanitizeError::ParseError {
-                        format: "XML".into(),
-                        message: format!("XML parse error: {}", e),
-                    });
+                Err(_) => {
+                    return Err(xml_parse_error(
+                        "parse",
+                        Some(to_pos(reader.buffer_position())),
+                    ));
                 }
             }
             buf.clear();
@@ -292,11 +308,11 @@ impl Processor for XmlProcessor {
                 }
                 Ok(Event::Eof) => break,
                 Ok(_) => {}
-                Err(e) => {
-                    return Err(SanitizeError::ParseError {
-                        format: "XML".into(),
-                        message: format!("XML parse error: {e}"),
-                    });
+                Err(_) => {
+                    return Err(xml_parse_error(
+                        "parse",
+                        Some(to_pos(reader.buffer_position())),
+                    ));
                 }
             }
             buf.clear();
@@ -324,14 +340,8 @@ fn to_pos(p: u64) -> usize {
 /// Decode and entity-unescape element text (quick-xml 0.38 split the old
 /// `BytesText::unescape` into `decode()` + `escape::unescape()`).
 fn unescape_text(e: &quick_xml::events::BytesText<'_>) -> Result<String> {
-    let raw = e.decode().map_err(|e| SanitizeError::ParseError {
-        format: "XML".into(),
-        message: format!("XML decode error: {e}"),
-    })?;
-    let text = quick_xml::escape::unescape(&raw).map_err(|e| SanitizeError::ParseError {
-        format: "XML".into(),
-        message: format!("XML decode error: {e}"),
-    })?;
+    let raw = e.decode().map_err(|_| xml_parse_error("decode", None))?;
+    let text = quick_xml::escape::unescape(&raw).map_err(|_| xml_parse_error("decode", None))?;
     Ok(text.into_owned())
 }
 
@@ -354,10 +364,7 @@ fn collect_attr_edits(
     let value_spans = scan_attr_value_spans(tag);
 
     for (idx, attr_result) in elem.attributes().enumerate() {
-        let attr = attr_result.map_err(|e| SanitizeError::ParseError {
-            format: "XML".into(),
-            message: format!("XML attribute error: {e}"),
-        })?;
+        let attr = attr_result.map_err(|_| xml_parse_error("attribute", None))?;
         let Some(span) = value_spans.get(idx) else {
             // Span scan and quick-xml disagreed on attribute count — skip
             // editing this attribute rather than risk a wrong splice.
@@ -367,10 +374,7 @@ fn collect_attr_edits(
         let attr_path = format!("{element_path}/@{key}");
         let value = attr
             .normalized_value(XmlVersion::Implicit1_0)
-            .map_err(|e| SanitizeError::ParseError {
-                format: "XML".into(),
-                message: format!("XML attr decode error: {e}"),
-            })?;
+            .map_err(|_| xml_parse_error("attribute decode", None))?;
         if let Some(token) = edit_token(&key, &attr_path, &value, profile, store)? {
             edits.push(Replacement {
                 start: tag_start + span.start,
@@ -393,29 +397,20 @@ fn process_attributes(
     let mut new_elem = BytesStart::new(String::from_utf8_lossy(name.as_ref()).to_string());
 
     for attr_result in elem.attributes() {
-        let attr = attr_result.map_err(|e| SanitizeError::ParseError {
-            format: "XML".into(),
-            message: format!("XML attribute error: {}", e),
-        })?;
+        let attr = attr_result.map_err(|_| xml_parse_error("attribute", None))?;
         let attr_key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
         let attr_path = format!("{}/@{}", element_path, attr_key);
 
         if let Some(rule) = find_matching_rule(&attr_path, profile) {
             let attr_value = attr
                 .normalized_value(XmlVersion::Implicit1_0)
-                .map_err(|e| SanitizeError::ParseError {
-                    format: "XML".into(),
-                    message: format!("XML attr decode error: {}", e),
-                })?;
+                .map_err(|_| xml_parse_error("attribute decode", None))?;
             let replaced = replace_value(&attr_value, rule, store)?;
             new_elem.push_attribute((attr_key.as_str(), replaced.as_str()));
         } else {
             let attr_value = attr
                 .normalized_value(XmlVersion::Implicit1_0)
-                .map_err(|e| SanitizeError::ParseError {
-                    format: "XML".into(),
-                    message: format!("XML attr decode error: {}", e),
-                })?;
+                .map_err(|_| xml_parse_error("attribute decode", None))?;
             new_elem.push_attribute((attr_key.as_str(), attr_value.as_ref()));
         }
     }
@@ -435,6 +430,36 @@ mod tests {
     fn make_store() -> MappingStore {
         let gen = Arc::new(HmacGenerator::new([42u8; 32]));
         MappingStore::new(gen, None)
+    }
+
+    #[test]
+    fn parse_error_omits_input_content() {
+        // quick-xml's mismatched-tag IllFormed error renders the expected
+        // element name verbatim; a malformed document must never echo its own
+        // names (or values) into the error. Cover both processing paths.
+        const LEAK_MARKER: &str = "SEKRET-TAG-0xD34DB33F";
+        let store = make_store();
+        let proc = XmlProcessor;
+        let content = format!("<config><{LEAK_MARKER}>v</WRONG></config>");
+        let profile = FileTypeProfile::new("xml", vec![FieldRule::new("*")]);
+
+        let msg = proc
+            .process(content.as_bytes(), &profile, &store)
+            .expect_err("malformed input must fail to parse")
+            .to_string();
+        assert!(
+            !msg.contains(LEAK_MARKER),
+            "parse error echoed input content: {msg}"
+        );
+
+        let msg = proc
+            .process_to_edits(content.as_bytes(), &profile, &store)
+            .expect_err("malformed input must fail to parse")
+            .to_string();
+        assert!(
+            !msg.contains(LEAK_MARKER),
+            "parse error echoed input content: {msg}"
+        );
     }
 
     #[test]

@@ -1456,35 +1456,38 @@ impl StreamScanner {
 
             let pattern = &self.patterns[m.pattern_idx];
 
-            if let Some((cap_start, cap_end)) = m.capture {
+            // Validate capture bounds before use. This should not happen with
+            // correct regex patterns; if it does, fail closed by falling back
+            // to full-match replacement below — never emit the match verbatim.
+            let capture = m.capture.filter(|&(cap_start, cap_end)| {
+                cap_start >= m.start && cap_end <= m.end && cap_start <= cap_end
+            });
+            if m.capture.is_some() && capture.is_none() {
+                let (cap_start, cap_end) = m.capture.unwrap_or_default();
+                tracing::warn!(
+                    pattern = %pattern.label,
+                    m_start = m.start,
+                    m_end = m.end,
+                    cap_start,
+                    cap_end,
+                    "capture group bounds outside match bounds — replacing full match"
+                );
+            }
+
+            if let Some((cap_start, cap_end)) = capture {
                 // Pattern has a capture group: replace only the capture group,
                 // emitting the surrounding context bytes of the full match verbatim.
                 // This preserves delimiters, key names, and prefixes that the
                 // pattern uses as anchors to reduce false positives.
-                if cap_start < m.start || cap_end > m.end || cap_start > cap_end {
-                    // Capture bounds outside match bounds — skip rather than panic.
-                    // This should not happen with correct regex patterns; log it so it
-                    // surfaces during testing without crashing production runs.
-                    tracing::warn!(
-                        pattern = %pattern.label,
-                        m_start = m.start,
-                        m_end = m.end,
-                        cap_start,
-                        cap_end,
-                        "capture group bounds outside match bounds — emitting full match unreplaced"
-                    );
-                    output_buf.extend_from_slice(&committed[m.start..m.end]);
-                    last_end = m.end;
-                    continue;
-                }
                 output_buf.extend_from_slice(&committed[m.start..cap_start]);
                 let secret = String::from_utf8_lossy(&committed[cap_start..cap_end]);
                 let replacement = self.store.get_or_insert(&pattern.category, &secret)?;
                 output_buf.extend_from_slice(replacement.as_bytes());
                 output_buf.extend_from_slice(&committed[cap_end..m.end]);
             } else {
-                // No capture group — replace the full match (e.g. token-prefix
-                // patterns like `glpat-[...]` where the full match IS the secret).
+                // No capture group (or invalid capture bounds, failed closed
+                // above) — replace the full match (e.g. token-prefix patterns
+                // like `glpat-[...]` where the full match IS the secret).
                 let matched_text = String::from_utf8_lossy(&committed[m.start..m.end]);
                 let replacement = self.store.get_or_insert(&pattern.category, &matched_text)?;
                 output_buf.extend_from_slice(replacement.as_bytes());
@@ -1587,6 +1590,49 @@ mod tests {
             "ipv4",
         )
         .unwrap()
+    }
+
+    // ---- Fail-closed on invalid capture bounds ----
+
+    #[test]
+    fn invalid_capture_bounds_fail_closed() {
+        // Capture bounds outside the match bounds should be impossible with
+        // the regex crate; if they ever occur, the match must be replaced in
+        // full — never emitted verbatim.
+        let scanner = test_scanner(vec![email_pattern()]);
+        let committed = b"user alice@corp.com done";
+        let m = RawMatch {
+            start: 5,
+            end: 19,
+            pattern_idx: 0,
+            capture: Some((3, 100)), // deliberately outside match bounds
+        };
+        let mut stats = ScanStats::default();
+        let mut out = Vec::new();
+        let mut counts = vec![0u64; 1];
+        scanner
+            .apply_replacements(
+                committed,
+                &[m],
+                &mut stats,
+                &mut out,
+                &mut counts,
+                0,
+                0,
+                &mut |_| {},
+            )
+            .unwrap();
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            !text.contains("alice@corp.com"),
+            "match emitted unreplaced: {text}"
+        );
+        assert!(
+            text.starts_with("user ") && text.ends_with(" done"),
+            "{text}"
+        );
+        assert_eq!(stats.replacements_applied, 1);
+        assert_eq!(counts[0], 1);
     }
 
     // ---- Construction ----

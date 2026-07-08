@@ -347,16 +347,16 @@ The default build includes the CLI binary and every processor. Library-only cons
 ```toml
 # Core only — HMAC/random generators, mapping store, streaming scanner,
 # and the always-on JSON/YAML/TOML/INI/env/key-value/log-line processors.
-# Drops clap, ureq, walkdir, ctrlc, rpassword, zip, tar, flate2, csv, csv-core, quick-xml.
-scour-secrets = { version = "0.13", default-features = false }
+# Drops clap, ureq, walkdir, ctrlc, rpassword, tracing-subscriber, zip, tar, flate2, csv, csv-core, quick-xml.
+scour-secrets = { version = "0.16", default-features = false }
 
 # Add archive (zip/tar/tar.gz) and/or the CSV + XML processors as needed.
-scour-secrets = { version = "0.13", default-features = false, features = ["archive", "structured"] }
+scour-secrets = { version = "0.16", default-features = false, features = ["archive", "structured"] }
 ```
 
 | Feature | Pulls in | Enables |
 |---------|----------|---------|
-| `cli` *(default)* | `clap`, `ureq`, `walkdir`, `ctrlc`, `rpassword` | The `scour-secrets` binary; implies `archive` + `structured` |
+| `cli` *(default)* | `clap`, `ureq`, `walkdir`, `ctrlc`, `rpassword`, `tracing-subscriber` | The `scour-secrets` binary; implies `archive` + `structured` |
 | `archive` *(default)* | `zip`, `tar`, `flate2` | `ArchiveProcessor` (zip / tar / tar.gz) |
 | `structured` *(default)* | `csv`, `csv-core`, `quick-xml` | `CsvProcessor` and `XmlProcessor` |
 
@@ -370,7 +370,7 @@ Replacements are one-way by design. No reverse mapping is stored or recoverable 
 
 Key properties:
 
-- **Encryption at rest** — secrets files use AES-256-GCM (PBKDF2-HMAC-SHA256, 600 000 iterations). Plaintext files are also supported.
+- **Encryption at rest** — secrets files use AES-256-GCM with an Argon2id-derived key (memory-hard: 19 MiB, 2 passes). Plaintext files are also supported.
 - **Zeroization** — HMAC keys, secret entries, mapping-store keys, and decrypted blobs are zeroized on drop.
 - **Regex hardening** — per-pattern automaton and DFA size limits (1 MiB each) prevent ReDoS and unbounded memory growth.
 - **Defensive limits** — input size caps, recursion depth limits, node-count caps, and pattern-count limits bound every parser.
@@ -395,6 +395,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model and mitigations.
 | [Architecture](ARCHITECTURE.md) | Internal architecture, data flow, module map, concurrency model, and streaming design. |
 | [Security](SECURITY.md) | Security properties, threat mitigations, encryption details, and zeroization strategy. |
 | [Contributing](CONTRIBUTING.md) | Build instructions, test suite, fuzz targets, linting, and PR guidelines. |
+| [Roadmap](ROADMAP.md) | Stability posture, path to 1.0, and deliberately deferred features. |
 | [Changelog](CHANGELOG.md) | Release history and version notes. |
 
 ---
@@ -419,7 +420,9 @@ Do not open a public issue for security-sensitive findings. Report privately via
 
 ## Stability
 
-This project follows [Semantic Versioning](https://semver.org/). As of 0.8.0, the public library API and CLI interface are considered stable. Breaking changes will be avoided but may occur in minor releases until 1.0.0. The MSRV is **1.86** (stable toolchain), declared under `rust-version` in `Cargo.toml` and enforced in CI.
+This project follows [Semantic Versioning](https://semver.org/). As of 0.8.0, the public library API and CLI interface are considered stable. Breaking changes will be avoided but may occur in minor releases until 1.0.0.
+
+The MSRV is **1.86** (stable toolchain), declared under `rust-version` in `Cargo.toml` and enforced in CI. **MSRV policy:** raising the MSRV is treated as a **minor** version bump (noted in the changelog), not a breaking change, and it is only raised when a dependency or a required language feature makes it necessary.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 

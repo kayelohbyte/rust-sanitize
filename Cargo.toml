@@ -1,6 +1,6 @@
 [package]
 name = "scour-secrets"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 rust-version = "1.86"
 description = "Deterministic one-way data sanitization engine"
@@ -23,7 +23,7 @@ path = "src/lib.rs"
 default = ["cli", "archive", "structured"]
 # CLI binary deps. Implies all processors so the installed `scour-secrets` tool is
 # fully featured. Library-only users can drop this via `default-features = false`.
-cli = ["dep:clap", "dep:ureq", "dep:walkdir", "dep:ctrlc", "dep:rpassword", "archive", "structured"]
+cli = ["dep:clap", "dep:ureq", "dep:walkdir", "dep:ctrlc", "dep:rpassword", "dep:tracing-subscriber", "archive", "structured"]
 # Archive processing (zip / tar / tar.gz).
 archive = ["dep:zip", "dep:tar", "dep:flate2"]
 # CSV and XML structured processors. (JSON/YAML/TOML/INI/env/key-value/log are
@@ -42,7 +42,7 @@ thiserror = "1"
 compact_str = "0.7"
 regex = "1"
 aes-gcm = "0.10"
-pbkdf2 = "0.12"
+argon2 = { version = "0.5", features = ["zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -70,9 +70,11 @@ ctrlc = { version = "3", features = ["termination"], optional = true }
 rpassword = { version = "7", optional = true }
 walkdir = { version = "2", optional = true }
 ureq = { version = "2", features = ["json"], optional = true }
+# CLI-only: the binary's logging setup. Library consumers emit `tracing` events
+# but bring their own subscriber, so this stays behind the `cli` feature.
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"], optional = true }
 # Core (always built)
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 rayon = "1"
 glob = "0.3"
 bytecount = "0.6"

@@ -925,18 +925,44 @@ test("test_allowlist", "multiple patterns: first match wins, summary counts corr
   ok(r.summary.blocked >= 1, `expected ≥1 blocked, got ${r.summary.blocked}`);
 });
 
-test("test_allowlist", "star-only * matches anything including empty", async (s) => {
+test("test_allowlist", "star-only * matches anything", async (s) => {
   const r = JSON.parse(toolText(await s.send("tools/call", {
     name: "test_allowlist",
     arguments: {
       patterns: ["*"],
-      values: ["anything", "192.168.1.1", ""],
+      values: ["anything", "192.168.1.1"],
     },
   })));
   const entries = r.results as Array<{ value: string; allowed: boolean }>;
   for (const e of entries) {
     ok(e.allowed === true, `'${e.value}' must be allowed by '*'`);
   }
+});
+
+test("test_allowlist", "values starting with '-' are tested, not parsed as flags", async (s) => {
+  // Values travel via stdin, so a leading dash is data, not a flag.
+  const r = JSON.parse(toolText(await s.send("tools/call", {
+    name: "test_allowlist",
+    arguments: { patterns: ["*"], values: ["-secret-value"] },
+  })));
+  const entries = r.results as Array<{ value: string; allowed: boolean }>;
+  ok(entries.length === 1 && entries[0].allowed === true, "dash-prefixed value must be matched");
+});
+
+test("test_allowlist", "error: empty-string value rejected (stdin line protocol)", async (s) => {
+  const r = await s.send("tools/call", {
+    name: "test_allowlist",
+    arguments: { patterns: ["*"], values: ["ok", ""] },
+  });
+  ok(toolIsError(r), "must be isError:true");
+});
+
+test("test_allowlist", "error: value containing newline rejected (stdin line protocol)", async (s) => {
+  const r = await s.send("tools/call", {
+    name: "test_allowlist",
+    arguments: { patterns: ["*"], values: ["line1\nline2"] },
+  });
+  ok(toolIsError(r), "must be isError:true");
 });
 
 test("test_allowlist", "error: empty patterns array rejected", async (s) => {

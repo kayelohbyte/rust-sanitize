@@ -14,19 +14,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   values) into the error on stderr; serde JSON/YAML data errors embedded
   mistyped values the same way. All three parsers now report format +
   line/column only.
+- **TOML *data-file* parse errors never echo input content.** The structured
+  TOML processor had the same bug as the secrets-file parser above: a
+  malformed TOML input file rendered the offending source line — including
+  any secret on it — into the `warn!`/error output during a `--profile` run.
+  Both the re-serializing and the span-edit TOML paths now report line/column
+  only.
+- **The streaming scanner fails closed on invalid capture bounds.** If a
+  match ever carried capture-group bounds outside the match bounds (not
+  reachable with the `regex` crate; defensive path), the scanner previously
+  emitted the full match *unreplaced*. It now falls back to replacing the
+  full match.
+- **XML parse errors never echo input content.** The structured XML processor
+  rendered `quick-xml`'s error `Display` — which embeds element names
+  (mismatched-tag errors) and, in some entity/attribute decode errors, the
+  offending substring — into the `warn!`/error output. All XML parse, decode,
+  and attribute error paths now report a byte position only.
+- **MCP `test_pattern` / `test_allowlist` no longer pass candidate values on
+  the command line.** Test values — which are frequently real secrets — were
+  visible to every local user via `ps` while the subprocess ran. They are now
+  piped over stdin (one per line); as a side effect, values starting with `-`
+  are now testable, while empty values and values containing newlines are
+  rejected with a clear error (the line protocol cannot carry them).
 - **Encrypted secrets files now receive the structured-handoff write-back**:
   decrypt → merge discovered literals → re-encrypt (fresh salt + nonce) with
   the same password. The file on disk is never downgraded to plaintext, and
   the write-back fails closed (file untouched) on a wrong or missing password.
+- **Key derivation switched from PBKDF2 to Argon2id** (memory-hard: 19 MiB,
+  2 passes, 1 lane) for both the encrypted secrets-file key and the
+  deterministic-generator seed, giving one modern KDF everywhere and dropping
+  the `pbkdf2` dependency. Argon2id resists GPU/ASIC-accelerated offline
+  brute-force far better than an iterated PBKDF2.
+- **Warns when `--llm-endpoint` uses plain `http://` to a non-loopback host** —
+  the API key and the (sanitized) prompt would travel in cleartext. A local
+  model over `http://localhost` does not warn; `https://` never warns.
+- **Encrypted secrets files carry a versioned header** (`SCOUR` magic +
+  1-byte version, then salt/nonce/ciphertext). Encrypted-vs-plaintext detection
+  is now exact instead of a content heuristic, so a plaintext file whose first
+  token is a bare key can no longer be misread as ciphertext. A future KDF or
+  parameter change bumps the version byte without changing the magic.
 
 ### Changed — BREAKING
 
-- **Project renamed to `scour`** (crate, lib, and binary; previously
-  `rust-sanitize` / `sanitize`). Env vars are now `SCOUR_*` (previously
-  `SANITIZE_*`), the config directory is `~/.config/scour/`, the project
-  config file is `.scour.yaml`, and the MCP binary is `scour-mcp` (server
-  name `scour`). MCP *tool* names (`sanitize`, `scan`, …) and `-sanitized`
-  output suffixes are unchanged.
+- **Project renamed to `scour-secrets`** (crate, lib, and binary; previously
+  `rust-sanitize` / `sanitize`). Env vars are now `SCOUR_SECRETS_*` (previously
+  `SANITIZE_*`), the config directory is `~/.config/scour-secrets/`, the project
+  config file is `.scour-secrets.yaml`, and the MCP binary is `scour-secrets-mcp`
+  (server name `scour-secrets`). MCP *tool* names (`sanitize`, `scan`, …) and
+  `-sanitized` output suffixes are unchanged.
 - **API freeze ahead of 1.0.** Public structs and the `LengthPolicy`,
   `SecretsFormat`, `ArchiveFormat`, and `EntropyMode` enums are now
   `#[non_exhaustive]`: struct literals and exhaustive matches outside the
@@ -40,6 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The structured-handoff write-back now preserves the secrets file's own
   plaintext format — a `.json` secrets file previously came back rewritten as
   YAML, and `.toml` write-back failed outright.
+- **Crypto format break (no migration).** The Argon2id switch and the new
+  versioned encrypted-file header mean secrets files encrypted by 0.15.x no
+  longer decrypt, and `--deterministic` output differs from earlier releases
+  even with the same seed salt. Re-encrypt secrets files with `scour-secrets
+  encrypt` and regenerate any shared deterministic datasets on 0.16.0+.
 
 ### Added
 
@@ -51,6 +91,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   new trait methods will always ship with default implementations.
 - Root re-exports for `ReportSummary`, `MatchLocationsResult`, `Replacement`,
   and the `secrets::` free functions.
+- **`tracing-subscriber` is now gated behind the `cli` feature.** It is only
+  used by the binary's logging setup; library-only consumers
+  (`default-features = false`) no longer pull it (and its `json` / `env-filter`
+  machinery). No effect on the default build or the CLI.
+- **`ROADMAP.md`** documenting the stability posture, the path to 1.0, and the
+  features deliberately deferred past 1.0.
+- **Release: `cargo publish` to crates.io** is now automated in the release
+  workflow (gated on the build matrix, with a tag-vs-`Cargo.toml`-version
+  guard), so tagged releases reach crates.io instead of only shipping binaries.
+- **CI: `cargo-semver-checks` job** that diffs the public library API against
+  the latest crates.io release and fails a PR whose version bump is not
+  semver-appropriate. It self-skips until the crate is first published (there
+  is no baseline yet), then activates automatically.
+- **Documented MSRV policy:** raising the MSRV is a minor-version bump (noted
+  in the changelog), not a breaking change, and only happens when a dependency
+  or a required language feature makes it necessary (README + CONTRIBUTING).
+
+### Fixed
+
+- **The structured-handoff write-back no longer persists trivially short
+  discovered values.** A structured field that held a 1–3 character value
+  (e.g. `v`, `id`) was written to the secrets file as a global `kind: literal`
+  entry, which then matched that fragment everywhere in every subsequent run —
+  corrupting unrelated text (`sensitive` → `sensiti9e`). Discovered literals
+  now share the format-preserving scanner's minimum-length threshold
+  (`MIN_DISCOVERED_LITERAL_LEN`, currently 4) for both in-run use and
+  write-back, so a value the scanner would reject is never persisted. Existing
+  secrets files that already accumulated such short literals should have them
+  removed by hand.
 
 ## [0.15.0] - 2026-06-26
 

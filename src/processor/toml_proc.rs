@@ -33,6 +33,23 @@ use toml_edit::{ImDocument, Item, Table, Value as EditValue};
 /// Structured processor for TOML configuration files.
 pub struct TomlProcessor;
 
+/// Content-free TOML parse error. The `toml`/`toml_edit` error `Display`
+/// renders the offending source line verbatim, which would echo secret values
+/// from the input into stderr and logs — report only the position.
+fn toml_parse_error(text: &str, span: Option<std::ops::Range<usize>>) -> SanitizeError {
+    let loc = span.map_or_else(String::new, |s| {
+        let (line, col) = crate::secrets::line_col_at(text, s.start);
+        format!(" at line {line}, column {col}")
+    });
+    SanitizeError::ParseError {
+        format: "TOML".into(),
+        message: format!(
+            "TOML parse error{loc} \
+             (parser details withheld — input content is never echoed)"
+        ),
+    }
+}
+
 impl Processor for TomlProcessor {
     fn name(&self) -> &'static str {
         "toml"
@@ -50,10 +67,8 @@ impl Processor for TomlProcessor {
     ) -> Result<Vec<u8>> {
         let text = crate::processor::check_size_and_decode(content, "TOML", DEFAULT_INPUT_SIZE)?;
 
-        let mut value: Value = toml::from_str(text).map_err(|e| SanitizeError::ParseError {
-            format: "TOML".into(),
-            message: format!("TOML parse error: {}", e),
-        })?;
+        let mut value: Value =
+            toml::from_str(text).map_err(|e| toml_parse_error(text, e.span()))?;
 
         walk_toml(&mut value, "", profile, store, 0)?;
 
@@ -78,10 +93,8 @@ impl Processor for TomlProcessor {
         let text = crate::processor::check_size_and_decode(content, "TOML", DEFAULT_INPUT_SIZE)?;
         // `ImDocument` (immutable) retains byte spans for parsed values;
         // `DocumentMut` drops them. We only read spans, never mutate the tree.
-        let doc = ImDocument::parse(text.to_string()).map_err(|e| SanitizeError::ParseError {
-            format: "TOML".into(),
-            message: format!("TOML parse error: {e}"),
-        })?;
+        let doc =
+            ImDocument::parse(text.to_string()).map_err(|e| toml_parse_error(text, e.span()))?;
         let mut edits = Vec::new();
         collect_table_edits(doc.as_table(), "", profile, store, &mut edits)?;
         Ok(Some(edits))
@@ -295,6 +308,38 @@ user = "admin@corp.com"
         let profile = FileTypeProfile::new("toml", vec![FieldRule::new("*")]);
         let result = proc.process(content, &profile, &store);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_error_omits_input_content() {
+        // An unterminated string puts the secret on the failing line; the
+        // toml/toml_edit Display would render that line verbatim. Both the
+        // re-serializing and the span-edit paths must report position only.
+        const LEAK_MARKER: &str = "SEKRET-MARKER-0xD34DB33F";
+        let store = make_store();
+        let proc = TomlProcessor;
+        let content = format!("password = \"{LEAK_MARKER}\nbroken");
+        let profile = FileTypeProfile::new("toml", vec![FieldRule::new("*")]);
+
+        let msg = proc
+            .process(content.as_bytes(), &profile, &store)
+            .expect_err("malformed input must fail to parse")
+            .to_string();
+        assert!(
+            !msg.contains(LEAK_MARKER),
+            "parse error echoed input content: {msg}"
+        );
+        assert!(msg.contains("line"), "expected location info, got: {msg}");
+
+        let msg = proc
+            .process_to_edits(content.as_bytes(), &profile, &store)
+            .expect_err("malformed input must fail to parse")
+            .to_string();
+        assert!(
+            !msg.contains(LEAK_MARKER),
+            "parse error echoed input content: {msg}"
+        );
+        assert!(msg.contains("line"), "expected location info, got: {msg}");
     }
 
     #[test]

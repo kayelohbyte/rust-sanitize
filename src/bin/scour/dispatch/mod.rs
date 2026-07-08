@@ -29,6 +29,15 @@ use crate::progress::{with_progress_scope, SharedProgressReporter};
 /// and the sanitized output is directed to stdout.
 pub(crate) const MAX_CONTEXT_BUFFER_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
+/// Minimum length for a structured-field-discovered value to be reused as a
+/// literal — both as an in-run scanner pattern and as a persisted secrets-file
+/// entry. Values shorter than this (e.g. a `v` or `id`) match too much
+/// unrelated text: as a scanner literal they corrupt the current run, and once
+/// written to the secrets file they poison *every* future run. The two paths
+/// (in-memory scanner build and on-disk write-back) must share this threshold
+/// so a value never gets persisted that the scanner itself would reject.
+pub(crate) const MIN_DISCOVERED_LITERAL_LEN: usize = 4;
+
 /// Shared per-run collector for `--llm`: (label, sanitized_bytes) pairs in input order.
 pub(crate) type LlmCollector = Arc<Mutex<Vec<LlmEntry>>>;
 
@@ -417,7 +426,7 @@ fn build_format_preserving_scanner(
 ) -> Result<StreamScanner, scour_secrets::error::SanitizeError> {
     let extra: Vec<ScanPattern> = store
         .iter_since(snapshot)
-        .filter(|(_, orig, _)| orig.len() >= 4)
+        .filter(|(_, orig, _)| orig.len() >= MIN_DISCOVERED_LITERAL_LEN)
         .filter_map(|(category, original, _)| {
             let s = original.as_str();
             // Label by category, never the value (labels appear in user-facing
@@ -490,7 +499,10 @@ pub(crate) fn save_discovered_secrets(
 ) -> std::result::Result<usize, String> {
     let mut new_entries: Vec<SecretEntry> = store
         .iter()
-        .filter(|(_, original, _)| !original.is_empty())
+        // Never persist a literal the format-preserving scanner would itself
+        // reject as too short (see MIN_DISCOVERED_LITERAL_LEN) — a 1–3 char
+        // value written here poisons every future run with false positives.
+        .filter(|(_, original, _)| original.len() >= MIN_DISCOVERED_LITERAL_LEN)
         .map(|(category, original, _)| {
             SecretEntry::new(original.to_string(), "literal", category.to_string())
                 .with_label("discovered")
@@ -641,6 +653,28 @@ mod tests {
         assert!(
             !path.exists(),
             "no file should be created when store is empty"
+        );
+    }
+
+    #[test]
+    fn save_discovered_secrets_skips_short_values() {
+        // A 1–3 char discovered value (e.g. a structured field that held "v")
+        // must never be persisted: as a global literal it would corrupt every
+        // future run. Nothing shorter than MIN_DISCOVERED_LITERAL_LEN is kept.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.yaml");
+        let store = empty_store();
+        for v in ["v", "id", "abc"] {
+            store
+                .get_or_insert(&scour_secrets::Category::AuthToken, v)
+                .unwrap();
+        }
+
+        let n = save_discovered_secrets(&store, &path, None, false, None).unwrap();
+        assert_eq!(n, 0, "sub-threshold values must not be persisted");
+        assert!(
+            !path.exists(),
+            "no file should be written when every value is too short"
         );
     }
 

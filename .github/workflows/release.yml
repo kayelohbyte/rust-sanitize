@@ -269,3 +269,50 @@ jobs:
             "${API}/releases"
 
           echo "GitLab release ${TAG} published."
+
+  publish-crate:
+    name: Publish to crates.io
+    # Gate on the Rust build matrix so a crate is never published if the
+    # binaries for this tag failed to build. cargo publish re-verifies the
+    # build from the packaged tarball before uploading.
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Decide whether to publish
+        id: gate
+        # A version/tag mismatch is a hard error (we'd publish the wrong
+        # version). Otherwise this step decides whether to publish, and skips
+        # cleanly — never fails the release — when publishing isn't possible or
+        # needed: no token configured (e.g. published manually), or this version
+        # is already on crates.io. That makes the job safe whether releases are
+        # published by hand or by this workflow.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')
+          if [ "$TAG" != "$VER" ]; then
+            echo "::error::git tag v$TAG does not match Cargo.toml version $VER"
+            exit 1
+          fi
+          UA="scour-secrets-ci (github.com/kayelohbyte/scour-secrets)"
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CARGO_REGISTRY_TOKEN is not set — skipping crates.io publish (publish manually, or add the secret to automate it)."
+          elif curl -sfL -H "User-Agent: $UA" \
+               "https://crates.io/api/v1/crates/scour-secrets/$VER" -o /dev/null; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::scour-secrets $VER is already on crates.io — skipping publish."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Will publish scour-secrets v$VER"
+          fi
+      - name: Publish
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked

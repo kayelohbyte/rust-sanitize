@@ -114,7 +114,7 @@ connect timeout distinct from the read timeout.
 export SCOUR_SECRETS_LLM_ENDPOINT=http://localhost:11434/v1
 export SCOUR_SECRETS_LLM_MODEL=phi4-mini
 export SCOUR_SECRETS_LLM_KEY=ollama    # any non-empty value
-sanitize server.log -s patterns.yaml --llm troubleshoot
+scour-secrets server.log -s patterns.yaml --llm troubleshoot
 
 # LM Studio (default port 1234):
 scour config.yaml -s patterns.yaml --llm review-config \
@@ -124,7 +124,7 @@ scour config.yaml -s patterns.yaml --llm review-config \
 
 # OpenAI (key from environment):
 export SCOUR_SECRETS_LLM_KEY=sk-proj-...
-sanitize nginx.conf --app nginx --llm review-security \
+scour-secrets nginx.conf --app nginx --llm review-security \
   --llm-endpoint https://api.openai.com/v1 \
   --llm-model gpt-4o
 
