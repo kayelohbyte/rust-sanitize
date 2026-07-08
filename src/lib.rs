@@ -123,6 +123,7 @@
 pub mod allowlist;
 pub mod atomic;
 pub mod category;
+pub mod entropy;
 pub mod error;
 pub mod generator;
 pub mod llm;
@@ -138,6 +139,7 @@ pub mod strip_values;
 // Re-exports for convenience.
 pub use atomic::{atomic_write, atomic_write_private, AtomicFileWriter};
 pub use category::Category;
+pub use entropy::{entropy_scan_bytes, merge_entropy_counts, EntropyCharset, EntropyConfig};
 pub use error::{Result, SanitizeError};
 pub use generator::{HmacGenerator, LengthPolicy, RandomGenerator, ReplacementGenerator};
 pub use llm::{

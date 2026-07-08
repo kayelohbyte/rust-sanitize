@@ -103,6 +103,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Seek, Write};
 use std::sync::{Arc, OnceLock};
 
+use crate::entropy::{entropy_scan_bytes, merge_entropy_counts, EntropyConfig};
 use crate::processor::limits::{
     DEFAULT_ARCHIVE_DEPTH, MAX_ARCHIVE_DEPTH, PARALLEL_ENTRY_THRESHOLD, PARALLEL_TAR_DATA_SIZE,
     PARALLEL_ZIP_DATA_SIZE, STRUCTURED_ENTRY_SIZE,
@@ -422,6 +423,12 @@ pub struct ArchiveProcessor {
     /// Optional callback invoked with `(entry_name, sanitized_bytes)` after
     /// each file entry is processed. Only called for regular file entries.
     entry_callback: Option<EntryCallback>,
+    /// Entropy-detection configs applied to each file entry's output after
+    /// the pattern pass (placeholders are low-entropy, so no double-fire).
+    /// Empty by default. When non-empty, entries that would otherwise stream
+    /// are buffered (bounded by [`STRUCTURED_ENTRY_SIZE`]); over-cap entries
+    /// fall back to streaming without entropy detection.
+    entropy_configs: Vec<EntropyConfig>,
     /// Lazily-built format-preserving scanner for structured entries: the
     /// scanner with structure-corrupting key/value patterns stripped. Built
     /// once on first use and reused across entries (and threads).
@@ -454,6 +461,7 @@ impl ArchiveProcessor {
             filter: ArchiveFilter::default(),
             force_text: false,
             entry_callback: None,
+            entropy_configs: Vec::new(),
             structured_scanner: OnceLock::new(),
         }
     }
@@ -533,6 +541,26 @@ impl ArchiveProcessor {
     pub fn with_entry_callback(mut self, callback: EntryCallback) -> Self {
         self.entry_callback = Some(callback);
         self
+    }
+
+    /// Apply entropy-detection configs to every file entry after the pattern
+    /// pass, so `kind: entropy` rules and `--entropy-threshold` behave inside
+    /// archives exactly as they do for directly-processed files.
+    #[must_use]
+    pub fn with_entropy_configs(mut self, configs: Vec<EntropyConfig>) -> Self {
+        self.entropy_configs = configs;
+        self
+    }
+
+    /// Run the entropy pass over an entry's sanitized bytes, merging label
+    /// counts into `scan_stats`. No-op (no copy) when unconfigured.
+    fn apply_entropy(&self, bytes: Vec<u8>, scan_stats: &mut ScanStats) -> Vec<u8> {
+        if self.entropy_configs.is_empty() {
+            return bytes;
+        }
+        let (out, counts) = entropy_scan_bytes(&bytes, &self.entropy_configs, &self.store);
+        merge_entropy_counts(scan_stats, counts);
+        out
     }
 
     fn emit_entry_bytes(&self, name: &str, bytes: &[u8]) {
@@ -676,11 +704,12 @@ impl ArchiveProcessor {
                             ScanPattern::from_literal(original.as_str(), category, label).ok()
                         })
                         .collect();
-                    let (output, scan_stats) = if extra.is_empty() {
+                    let (output, mut scan_stats) = if extra.is_empty() {
                         self.structured_pass_scanner()?.scan_bytes(&base)?
                     } else {
                         self.scanner.for_structured_pass(extra)?.scan_bytes(&base)?
                     };
+                    let output = self.apply_entropy(output, &mut scan_stats);
                     stats.structured_hits += 1;
                     stats.total_output_bytes += output.len() as u64;
                     stats.file_methods.insert(
@@ -698,7 +727,8 @@ impl ArchiveProcessor {
 
                 // Processor didn't match or failed — fall back to
                 // scanner with the already-buffered content.
-                let (output, scan_stats) = self.scanner.scan_bytes(&content)?;
+                let (output, mut scan_stats) = self.scanner.scan_bytes(&content)?;
+                let output = self.apply_entropy(output, &mut scan_stats);
                 stats.scanner_fallback += 1;
                 stats.total_output_bytes += output.len() as u64;
                 stats
@@ -715,6 +745,18 @@ impl ArchiveProcessor {
         }
 
         // No profile (or entry too large) → streaming scanner.
+        //
+        // Entropy detection needs whole tokens, so it can't run on the
+        // chunked stream. When configured, buffer entries whose size hint
+        // fits the cap; hintless or over-cap entries stream without it
+        // (buffering on a bad hint would consume the reader with no way to
+        // fall back).
+        if !self.entropy_configs.is_empty()
+            && entry_size_hint.is_some_and(|sz| sz <= STRUCTURED_ENTRY_SIZE)
+        {
+            return self.scan_buffered_with_entropy(filename, reader, writer, stats);
+        }
+
         // F-02 fix: stream directly from reader → scanner → writer
         // without buffering the full output. We use a CountingWriter
         // to track output bytes alongside the CountingReader for input.
@@ -733,6 +775,32 @@ impl ArchiveProcessor {
             .insert(filename.to_string(), scan_stats);
 
         Ok(())
+    }
+
+    /// Buffered scanner + entropy pass for one file entry (used when entropy
+    /// detection is configured and the entry's size hint fits the cap).
+    fn scan_buffered_with_entropy(
+        &self,
+        filename: &str,
+        reader: &mut dyn Read,
+        writer: &mut dyn Write,
+        stats: &mut ArchiveStats,
+    ) -> Result<()> {
+        let content = read_bounded(reader, STRUCTURED_ENTRY_SIZE, filename)?;
+        let (output, mut scan_stats) = self.scanner.scan_bytes(&content)?;
+        let output = self.apply_entropy(output, &mut scan_stats);
+        stats.scanner_fallback += 1;
+        stats.total_input_bytes += content.len() as u64;
+        stats.total_output_bytes += output.len() as u64;
+        stats
+            .file_methods
+            .insert(filename.to_string(), "scanner".to_string());
+        stats
+            .file_scan_stats
+            .insert(filename.to_string(), scan_stats);
+        writer
+            .write_all(&output)
+            .map_err(|e| SanitizeError::ArchiveError(format!("write entry '{filename}': {e}")))
     }
 
     /// Handle a nested archive entry: validate depth/size, buffer, recurse,
@@ -1615,6 +1683,42 @@ mod tests {
         .with_extension(".json")];
 
         ArchiveProcessor::new(registry, scanner, store, profiles)
+    }
+
+    // -- Entropy pass -------------------------------------------------------
+
+    #[test]
+    fn entropy_configs_apply_to_archive_entries() {
+        // `kind: entropy` rules and --entropy-threshold must work inside
+        // archives: a raw single-value secret file (no pattern match, no
+        // profile) previously passed through archives untouched because the
+        // entropy pass only ran in the CLI dispatch layer.
+        let shared_secret = "FLwnxzdPdfIwcrav7PpjWEoYEc55HAcl2Aad0w8rfSsUvYoJHOlqlngm5UzH1zKJ";
+        let input = build_test_tar(&[
+            ("run/shared-secret.txt", shared_secret.as_bytes()),
+            ("notes.txt", b"plain low entropy words only"),
+        ]);
+
+        let proc = make_archive_processor().with_entropy_configs(vec![crate::EntropyConfig {
+            min_length: 40,
+            charset: crate::EntropyCharset::Base64,
+            ..Default::default()
+        }]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&input[..], &mut output).unwrap();
+
+        let out = String::from_utf8_lossy(&output);
+        assert!(
+            !out.contains(shared_secret),
+            "high-entropy entry content must be replaced"
+        );
+        assert!(
+            out.contains("plain low entropy words only"),
+            "low-entropy entry must pass through"
+        );
+        let entry_stats = &stats.file_scan_stats["run/shared-secret.txt"];
+        assert_eq!(entry_stats.pattern_counts["high_entropy_token"], 1);
     }
 
     // -- Tar tests ----------------------------------------------------------

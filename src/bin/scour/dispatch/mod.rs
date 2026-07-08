@@ -65,14 +65,7 @@ pub(crate) struct FileProcessor<'a> {
     pub(crate) full_store_pass: bool,
 }
 
-fn merge_entropy_counts(stats: &mut ScanStats, label_counts: HashMap<String, u64>) {
-    let total: u64 = label_counts.values().sum();
-    stats.matches_found += total;
-    stats.replacements_applied += total;
-    for (label, count) in label_counts {
-        *stats.pattern_counts.entry(label).or_insert(0) += count;
-    }
-}
+use scour_secrets::entropy::merge_entropy_counts;
 
 /// Run entropy scanning on `bytes` in-place, merging label counts into `stats`.
 /// Returns the (potentially modified) bytes; does nothing when entropy configs
