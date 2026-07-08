@@ -222,9 +222,8 @@ pub(crate) fn format_replacement(
             format_digits_synth(hash, target, false)
         }
         Category::Ssn if randomized => format_digits_synth(hash, target, true),
-        Category::Phone | Category::CreditCard | Category::IpV4 => {
-            format_digits_lp(hash, original, target)
-        }
+        Category::Phone | Category::CreditCard => format_digits_lp(hash, original, target),
+        Category::IpV4 => format_ipv4_lp(hash, original, target),
         Category::IpV6 | Category::MacAddress | Category::Uuid | Category::ContainerId => {
             format_hex_digits_lp(hash, original, target)
         }
@@ -453,6 +452,40 @@ fn format_digits_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
         |_, b| (b'0' + b % 10) as char,
     )
     .unwrap_or_else(|| pad_or_truncate("", target, &hex_bytes(hash)))
+}
+
+/// Length-preserving IPv4 replacement.
+/// Each dot-separated group keeps its digit count but is drawn from the valid
+/// range for that width (0–9, 10–99, 100–255), so the output always parses as
+/// an address. Groups that aren't 1–3 plain digits (the detector shouldn't
+/// produce any) fall back to per-digit replacement.
+fn format_ipv4_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
+    let mut buf = String::with_capacity(target);
+    for (i, part) in original.split('.').enumerate() {
+        if i > 0 {
+            buf.push('.');
+        }
+        let all_digits = !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        let range = match (all_digits, part.len()) {
+            (true, 1) => Some((0u16, 9u16)),
+            (true, 2) => Some((10, 99)),
+            (true, 3) => Some((100, 255)),
+            _ => None,
+        };
+        if let Some((lo, hi)) = range {
+            let w = (u16::from(hash[(i * 2) % 32]) << 8) | u16::from(hash[(i * 2 + 1) % 32]);
+            buf.push_str(&(lo + w % (hi - lo + 1)).to_string());
+        } else {
+            for (j, ch) in part.chars().enumerate() {
+                if ch.is_ascii_digit() {
+                    buf.push((b'0' + hash[(i * 4 + j) % 32] % 10) as char);
+                } else {
+                    buf.push(ch);
+                }
+            }
+        }
+    }
+    buf
 }
 
 /// Length-preserving hex-digit replacement (for IPv6, UUID, MAC, container ID).
@@ -704,12 +737,29 @@ fn format_preserving_hex_lp(
 /// with deterministic hex. Under `randomized`, each variable segment is
 /// emitted with a band-derived length instead of being length-preserving.
 fn format_url_lp(hex: &[u8; 64], original: &str, target: usize, randomized: bool) -> String {
+    // The scheme is generic, not secret — keep `https://` from becoming
+    // `7381f://`. Only split when the prefix is a plausible RFC 3986 scheme.
+    let (scheme, rest) = match original.find("://") {
+        Some(p)
+            if original[..p]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) =>
+        {
+            original.split_at(p + 3)
+        }
+        _ => ("", original),
+    };
     let is_structural = |ch| "/:?=&#@.".contains(ch);
     if randomized {
-        return format_preserving_hex_rand(hex, original, is_structural);
+        return format!(
+            "{scheme}{}",
+            format_preserving_hex_rand(hex, rest, is_structural)
+        );
     }
-    format_preserving_hex_lp(hex, original, target, is_structural)
-        .unwrap_or_else(|| pad_or_truncate("", target, hex))
+    let body_target = target.saturating_sub(scheme.len());
+    let body = format_preserving_hex_lp(hex, rest, body_target, is_structural)
+        .unwrap_or_else(|| pad_or_truncate("", body_target, hex));
+    format!("{scheme}{body}")
 }
 
 /// AWS ARN replacement.
@@ -902,10 +952,16 @@ mod tests {
         let gen = HmacGenerator::new([0u8; 32]);
         let orig = "192.168.1.1";
         let out = gen.generate(&Category::IpV4, orig);
-        // Dots preserved, length preserved.
+        // Dots preserved, length preserved, every octet valid.
         let parts: Vec<&str> = out.split('.').collect();
         assert_eq!(parts.len(), 4);
         assert_eq!(out.len(), orig.len(), "ipv4 must preserve length");
+        for p in parts {
+            assert!(
+                p.parse::<u8>().is_ok(),
+                "octet {p} out of range in {out}"
+            );
+        }
     }
 
     #[test]
@@ -1190,10 +1246,23 @@ mod tests {
         let orig = "https://internal.corp.com/api/users?token=abc123";
         let out = gen.generate(&Category::Url, orig);
         assert_eq!(out.len(), orig.len(), "url must preserve length");
-        // Structural characters preserved.
-        assert!(out.contains("://"));
+        // Scheme and structural characters preserved.
+        assert!(out.starts_with("https://"), "scheme must survive: {out}");
         assert!(out.contains('?'));
         assert!(out.contains('='));
+        assert!(
+            !out.contains("internal") && !out.contains("corp"),
+            "host content must be replaced: {out}"
+        );
+    }
+
+    #[test]
+    fn url_without_scheme_still_replaced() {
+        let gen = HmacGenerator::new([5u8; 32]);
+        let orig = "internal.corp.com/api/users";
+        let out = gen.generate(&Category::Url, orig);
+        assert_eq!(out.len(), orig.len());
+        assert!(!out.contains("internal"), "host must be replaced: {out}");
     }
 
     #[test]
