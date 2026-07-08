@@ -5,8 +5,9 @@ use zeroize::Zeroizing;
 
 use scour_secrets::secrets::{entries_to_patterns, parse_category, SecretEntry};
 use scour_secrets::{
-    atomic_write, FieldNameSignal, HmacGenerator, LengthPolicy, MappingStore, RandomGenerator,
-    ReplacementGenerator, ScanConfig, ScanPattern, StreamScanner, DEFAULT_FIELD_SIGNAL_THRESHOLD,
+    atomic_write_private, FieldNameSignal, HmacGenerator, LengthPolicy, MappingStore,
+    RandomGenerator, ReplacementGenerator, ScanConfig, ScanPattern, StreamScanner,
+    DEFAULT_FIELD_SIGNAL_THRESHOLD,
 };
 
 /// Environment variable supplying the deterministic seed salt directly.
@@ -232,7 +233,7 @@ pub(crate) fn common_allow_patterns() -> Vec<String> {
 /// Render the default global secrets file (balanced patterns + allowlist) and
 /// write it to `path` atomically.
 ///
-/// Uses [`atomic_write`] (random-suffix temp + rename) so that concurrent
+/// Uses [`atomic_write_private`] (random-suffix temp + rename, 0600) so that concurrent
 /// first-runs each render the byte-identical default file and rename it into
 /// place — a parallel run never observes a half-written or empty file and falls
 /// through to running with zero patterns (an unsanitized passthrough). The
@@ -248,7 +249,9 @@ pub(crate) fn write_default_secrets(path: &Path) -> std::result::Result<(), Stri
     let yaml = serde_yaml_ng::to_string(&entries)
         .map_err(|e| format!("cannot serialize default secrets: {e}"))?;
     let header = "# Global scour-secrets secrets — balanced detection patterns + allowlist.\n# Auto-loaded on every plain run. Edit freely; deleted values take effect immediately.\n\n";
-    atomic_write(path, format!("{header}{yaml}").as_bytes()).map_err(|e| {
+    // Owner-only from the start: this file becomes the structured-handoff
+    // write-back target, so discovered values land in it on later runs.
+    atomic_write_private(path, format!("{header}{yaml}").as_bytes()).map_err(|e| {
         format!(
             "cannot write default secrets file {}: {e}\nPass --secrets-file or --app explicitly.",
             path.display()
