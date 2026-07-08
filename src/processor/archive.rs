@@ -1685,6 +1685,75 @@ mod tests {
         ArchiveProcessor::new(registry, scanner, store, profiles)
     }
 
+    // -- command_output discovery seeds other entries ------------------------
+
+    #[test]
+    fn command_output_discovery_scrubs_bare_occurrences_in_other_entries() {
+        // A hostname captured from a `> hostname --fqdn` block must also be
+        // scrubbed where it appears bare (no keyword context) in sibling
+        // entries. Mirrors the CLI's two-phase flow: discovery pre-pass
+        // populates the store, then the main pass runs with the discovered
+        // values seeded into the scanner as literals.
+        let gen = Arc::new(HmacGenerator::new([42u8; 32]));
+        let store = Arc::new(MappingStore::new(gen, None));
+        let base_scanner = Arc::new(
+            StreamScanner::new(vec![], Arc::clone(&store), ScanConfig::default()).unwrap(),
+        );
+        let registry = Arc::new(ProcessorRegistry::with_builtins());
+        let profiles = vec![FileTypeProfile::new(
+            "command_output",
+            vec![FieldRule::new("hostname*")
+                .with_category(Category::Hostname)
+                .with_min_length(2)],
+        )
+        .with_extension(".txt")
+        .with_include("diag.txt")];
+
+        let input = build_test_tar(&[
+            (
+                "diag.txt",
+                b"> hostname --fqdn\ndss-prod-01.corp.example.com\n" as &[u8],
+            ),
+            (
+                "backend.log",
+                b"connecting to dss-prod-01.corp.example.com:10001 failed\n",
+            ),
+        ]);
+
+        // Phase 1: discovery populates the store from profile-matched entries.
+        let discovery = ArchiveProcessor::new(
+            Arc::clone(&registry),
+            Arc::clone(&base_scanner),
+            Arc::clone(&store),
+            profiles.clone(),
+        );
+        discovery.discover_profiles_tar(&input[..]).unwrap();
+
+        // Phase 2: main pass with discovered values seeded as literals.
+        let extra: Vec<ScanPattern> = store
+            .iter()
+            .map(|(category, original, _)| {
+                ScanPattern::from_literal(original.as_str(), category, "discovered").unwrap()
+            })
+            .collect();
+        assert!(!extra.is_empty(), "discovery must have found the hostname");
+        let augmented = Arc::new(base_scanner.with_extra_literals(extra).unwrap());
+        let proc = ArchiveProcessor::new(registry, augmented, store, profiles);
+
+        let mut output = Vec::new();
+        proc.process_tar(&input[..], &mut output).unwrap();
+        let out = String::from_utf8_lossy(&output);
+
+        assert!(
+            !out.contains("dss-prod-01.corp.example.com"),
+            "hostname must be gone from every entry: {out}"
+        );
+        assert!(
+            out.contains("connecting to ") && out.contains(":10001 failed"),
+            "log context preserved: {out}"
+        );
+    }
+
     // -- Entropy pass -------------------------------------------------------
 
     #[test]

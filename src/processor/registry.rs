@@ -50,6 +50,7 @@ impl ProcessorRegistry {
         reg.register(Arc::new(super::env_proc::EnvProcessor));
         reg.register(Arc::new(super::ini_proc::IniProcessor));
         reg.register(Arc::new(super::log_line::LogLineProcessor::new()));
+        reg.register(Arc::new(super::command_output::CommandOutputProcessor));
         reg
     }
 

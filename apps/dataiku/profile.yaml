@@ -166,6 +166,50 @@
       label: dku_dbserver_key
       min_length: 8
 
+# --- Instance diagnosis command dump (diag.txt) ---------------------------
+# `> command` + output blocks. hostname output is the machine's FQDN
+# (internal domain included — appears nowhere else in the bundle); printenv
+# is the full environment, which on real deployments carries proxy
+# credentials, cloud keys, and tokens. Discovered values are auto-seeded so
+# bare occurrences in sysctl.txt, stacks.txt, and *.log are scrubbed too.
+# /etc/hosts is deliberately not whole-block redacted (would nuke localhost
+# lines); its hostname alias is covered by the seeded literal.
+- processor: command_output
+  extensions: [".txt"]
+  include: ["diag.txt", "*/diag.txt"]
+  fields:
+    - pattern: "hostname*"
+      category: hostname
+      label: dku_diag_hostname
+      min_length: 2
+    - pattern: "printenv"
+      sub_processor: env
+      sub_fields:
+        - pattern: "HOSTNAME"
+          category: hostname
+          label: dku_env_hostname
+          min_length: 2
+        - pattern: "*PROXY*"
+          category: url
+          label: dku_env_proxy
+          min_length: 8
+        - pattern: "*PASSWORD*"
+          category: custom:password
+          label: dku_env_password
+          min_length: 1
+        - pattern: "*SECRET*"
+          category: auth_token
+          label: dku_env_secret
+          min_length: 8
+        - pattern: "*TOKEN*"
+          category: auth_token
+          label: dku_env_token
+          min_length: 8
+        - pattern: "*_KEY"
+          category: auth_token
+          label: dku_env_key
+          min_length: 8
+
 # --- Live sessions (run/user-sessions.json) ------------------------------
 # accessToken / identityToken are live bearer credentials for open UI/API
 # sessions; xsrfTokenSalt seeds the CSRF tokens. All are also echoed into

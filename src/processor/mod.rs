@@ -40,6 +40,7 @@
 #[cfg(feature = "archive")]
 pub mod archive;
 #[cfg(feature = "structured")]
+pub mod command_output;
 pub mod csv_proc;
 pub mod env_proc;
 pub mod ini_proc;
@@ -586,6 +587,65 @@ pub(crate) fn find_matching_rule<'a>(
         .fields
         .iter()
         .find(|rule| pattern_matches(&rule.pattern, key_path))
+}
+
+// ---------------------------------------------------------------------------
+// Sub-processor dispatch
+// ---------------------------------------------------------------------------
+
+/// Delegate `content` to the processor named in `rule.sub_processor`.
+///
+/// Builds a synthetic [`FileTypeProfile`] from the rule's `sub_fields` and
+/// calls the appropriate built-in processor directly. Returns the processed
+/// content as a `String`. Shared by parent processors that embed structured
+/// content (key_value heredocs, command_output blocks).
+pub(crate) fn process_sub_content(
+    content: &str,
+    rule: &FieldRule,
+    store: &MappingStore,
+) -> Result<String> {
+    use env_proc::EnvProcessor;
+    use ini_proc::IniProcessor;
+    use json_proc::JsonProcessor;
+    use log_line::LogLineProcessor;
+    use toml_proc::TomlProcessor;
+    use yaml_proc::YamlProcessor;
+
+    let name = rule
+        .sub_processor
+        .as_deref()
+        .ok_or_else(|| SanitizeError::InvalidConfig("sub_processor not set".into()))?;
+
+    let sub_profile = FileTypeProfile {
+        processor: name.to_owned(),
+        extensions: Vec::new(),
+        include: Vec::new(),
+        exclude: Vec::new(),
+        fields: rule.sub_fields.clone(),
+        options: std::collections::HashMap::new(),
+        field_name_signals: Vec::new(),
+    };
+
+    let bytes = content.as_bytes();
+    let out = match name {
+        "yaml" => YamlProcessor.process(bytes, &sub_profile, store)?,
+        "json" => JsonProcessor.process(bytes, &sub_profile, store)?,
+        "toml" => TomlProcessor.process(bytes, &sub_profile, store)?,
+        "ini" => IniProcessor.process(bytes, &sub_profile, store)?,
+        "env" => EnvProcessor.process(bytes, &sub_profile, store)?,
+        "log_line" => LogLineProcessor::new().process(bytes, &sub_profile, store)?,
+        other => {
+            return Err(SanitizeError::InvalidConfig(format!(
+                "unknown sub_processor '{other}' — supported: yaml, json, toml, ini, env, log_line"
+            )))
+        }
+    };
+
+    String::from_utf8(out).map_err(|e| {
+        SanitizeError::IoError(std::io::Error::other(format!(
+            "sub-processor output is not UTF-8: {e}"
+        )))
+    })
 }
 
 // ---------------------------------------------------------------------------
