@@ -35,7 +35,8 @@ impl FileProcessor<'_> {
             )
             .with_max_depth(cli.max_archive_depth)
             .with_force_text(cli.force_text)
-            .with_filter(filter);
+            .with_filter(filter)
+            .with_entropy_configs(fp.entropy_configs.to_vec());
 
             let base_proc = if suppress_inner_parallelism {
                 base_proc.with_parallel_threshold(usize::MAX)

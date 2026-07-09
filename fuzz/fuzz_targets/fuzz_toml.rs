@@ -9,11 +9,11 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use scour::category::Category;
-use scour::generator::HmacGenerator;
-use scour::processor::toml_proc::TomlProcessor;
-use scour::processor::{FieldRule, FileTypeProfile, Processor, ProcessorRegistry};
-use scour::store::MappingStore;
+use scour_secrets::category::Category;
+use scour_secrets::generator::HmacGenerator;
+use scour_secrets::processor::toml_proc::TomlProcessor;
+use scour_secrets::processor::{FieldRule, FileTypeProfile, Processor, ProcessorRegistry};
+use scour_secrets::store::MappingStore;
 use std::sync::Arc;
 
 fuzz_target!(|data: &[u8]| {

@@ -1,70 +1,15 @@
+//! CLI-side entropy support: config parsing from secrets entries and the
+//! calibration histogram. The detection core (`EntropyConfig`,
+//! `entropy_scan_bytes`) lives in the library so the archive processor can
+//! run the same pass on archive entries.
+
 use scour_secrets::secrets::{parse_category, SecretEntry};
-use scour_secrets::{Category, MappingStore, ScanStats, StreamScanner};
-use std::collections::HashMap;
+use scour_secrets::{ScanStats, StreamScanner};
 use std::io;
-use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum EntropyCharset {
-    Alphanumeric,
-    Base64,
-    Hex,
-    Any,
-}
-
-impl EntropyCharset {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "base64" => Self::Base64,
-            "hex" => Self::Hex,
-            "any" => Self::Any,
-            _ => Self::Alphanumeric,
-        }
-    }
-
-    pub(crate) fn describe(&self) -> &'static str {
-        match self {
-            Self::Alphanumeric => "alphanumeric",
-            Self::Base64 => "base64",
-            Self::Hex => "hex",
-            Self::Any => "any printable",
-        }
-    }
-
-    pub(crate) fn matches_all(&self, token: &[u8]) -> bool {
-        token.iter().all(|&b| match self {
-            Self::Alphanumeric => b.is_ascii_alphanumeric(),
-            Self::Base64 => b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=',
-            Self::Hex => b.is_ascii_hexdigit(),
-            Self::Any => b.is_ascii_graphic(),
-        })
-    }
-}
-
-/// Configuration for one entropy-detection pass. Produced from `kind: entropy`
-/// secrets-file entries and from the `--entropy-threshold` CLI flag.
-#[derive(Debug, Clone)]
-pub(crate) struct EntropyConfig {
-    pub(crate) min_length: usize,
-    pub(crate) max_length: usize,
-    pub(crate) threshold: f64,
-    pub(crate) charset: EntropyCharset,
-    pub(crate) label: String,
-    pub(crate) category: Category,
-}
-
-impl Default for EntropyConfig {
-    fn default() -> Self {
-        Self {
-            min_length: 20,
-            max_length: 200,
-            threshold: 4.5,
-            charset: EntropyCharset::Alphanumeric,
-            label: "high_entropy_token".into(),
-            category: Category::AuthToken,
-        }
-    }
-}
+pub(crate) use scour_secrets::entropy::{
+    entropy_scan_bytes, shannon_entropy, EntropyCharset, EntropyConfig, ENTROPY_DELIMITERS,
+};
 
 /// Standard entropy thresholds used for calibration histograms.
 pub(crate) const HISTOGRAM_THRESHOLDS: [f64; 6] = [3.0, 3.5, 4.0, 4.5, 5.0, 5.5];
@@ -157,25 +102,6 @@ pub(crate) fn entropy_histogram_bytes(
     results
 }
 
-fn shannon_entropy(data: &[u8]) -> f64 {
-    if data.is_empty() {
-        return 0.0;
-    }
-    let mut counts = [0u32; 256];
-    for &b in data {
-        counts[b as usize] += 1;
-    }
-    let len = data.len() as f64;
-    counts
-        .iter()
-        .filter(|&&c| c > 0)
-        .map(|&c| {
-            let p = c as f64 / len;
-            -p * p.log2()
-        })
-        .sum()
-}
-
 /// Build `EntropyConfig`s from `kind: entropy` entries in the secrets file.
 pub(crate) fn entropy_configs_from_entries(entries: &[SecretEntry]) -> Vec<EntropyConfig> {
     entries
@@ -185,7 +111,7 @@ pub(crate) fn entropy_configs_from_entries(entries: &[SecretEntry]) -> Vec<Entro
             min_length: e.min_length.unwrap_or(20),
             max_length: e.max_length.unwrap_or(200),
             threshold: e.threshold.unwrap_or(4.5),
-            charset: EntropyCharset::from_str(e.charset.as_deref().unwrap_or("alphanumeric")),
+            charset: EntropyCharset::parse(e.charset.as_deref().unwrap_or("alphanumeric")),
             label: e
                 .label
                 .clone()
@@ -193,79 +119,6 @@ pub(crate) fn entropy_configs_from_entries(entries: &[SecretEntry]) -> Vec<Entro
             category: parse_category(&e.category),
         })
         .collect()
-}
-
-/// Byte values that delimit tokens for entropy analysis.
-const ENTROPY_DELIMITERS: &[u8] = b" \t\n\r\"'`=:,;()[]{}|<>@#\\/^~!?&%$*";
-
-/// Scan `input` for high-entropy tokens and replace them using `store`.
-/// Returns `(output_bytes, per_label_counts)`.
-///
-/// Runs AFTER the main scanner so tokens already replaced (now placeholders)
-/// won't double-fire — placeholders have low entropy by design.
-pub(crate) fn entropy_scan_bytes(
-    input: &[u8],
-    configs: &[EntropyConfig],
-    store: &Arc<MappingStore>,
-) -> (Vec<u8>, HashMap<String, u64>) {
-    if configs.is_empty() || input.is_empty() {
-        return (input.to_vec(), HashMap::new());
-    }
-
-    let mut output = Vec::with_capacity(input.len());
-    let mut label_counts: HashMap<String, u64> = HashMap::new();
-    let mut pos = 0;
-
-    while pos < input.len() {
-        let token_start = pos;
-        let token_end = input[pos..]
-            .iter()
-            .position(|b| ENTROPY_DELIMITERS.contains(b))
-            .map(|p| pos + p)
-            .unwrap_or(input.len());
-
-        let token = &input[token_start..token_end];
-
-        let replaced = if !token.is_empty() {
-            let hit = configs.iter().find(|cfg| {
-                token.len() >= cfg.min_length
-                    && token.len() <= cfg.max_length
-                    && cfg.charset.matches_all(token)
-                    && shannon_entropy(token) >= cfg.threshold
-            });
-
-            if let Some(cfg) = hit {
-                if let Ok(token_str) = std::str::from_utf8(token) {
-                    if let Ok(replacement) = store.get_or_insert(&cfg.category, token_str) {
-                        output.extend_from_slice(replacement.as_bytes());
-                    } else {
-                        output.extend_from_slice(token);
-                    }
-                    *label_counts.entry(cfg.label.clone()).or_insert(0) += 1;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        if !replaced {
-            output.extend_from_slice(token);
-        }
-
-        if token_end < input.len() {
-            output.push(input[token_end]);
-            pos = token_end + 1;
-        } else {
-            pos = token_end;
-        }
-    }
-
-    (output, label_counts)
 }
 
 pub(crate) fn scanner_fallback(
@@ -362,15 +215,15 @@ mod tests {
 
     #[test]
     fn charset_from_str_all_variants() {
-        assert_eq!(EntropyCharset::from_str("base64"), EntropyCharset::Base64);
-        assert_eq!(EntropyCharset::from_str("hex"), EntropyCharset::Hex);
-        assert_eq!(EntropyCharset::from_str("any"), EntropyCharset::Any);
+        assert_eq!(EntropyCharset::parse("base64"), EntropyCharset::Base64);
+        assert_eq!(EntropyCharset::parse("hex"), EntropyCharset::Hex);
+        assert_eq!(EntropyCharset::parse("any"), EntropyCharset::Any);
         assert_eq!(
-            EntropyCharset::from_str("alphanumeric"),
+            EntropyCharset::parse("alphanumeric"),
             EntropyCharset::Alphanumeric
         );
         assert_eq!(
-            EntropyCharset::from_str("unknown"),
+            EntropyCharset::parse("unknown"),
             EntropyCharset::Alphanumeric,
             "unrecognised values default to alphanumeric"
         );

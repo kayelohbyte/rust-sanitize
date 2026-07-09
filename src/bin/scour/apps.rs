@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 //
 // User-defined apps follow the same two-file convention in a directory
 // specified by the SCOUR_SECRETS_APPS_DIR environment variable, falling back to
-// ~/.config/sanitize/apps  (XDG-compatible).
+// ~/.config/scour-secrets/apps  (XDG-compatible).
 //
 // The first YAML comment line (# ...) in either file is shown as the
 // description in  `scour-secrets apps`.
@@ -214,19 +214,14 @@ pub(crate) fn builtin_app_names() -> Vec<&'static str> {
 /// Resolve the user-defined apps directory.
 ///
 /// Checks `SCOUR_SECRETS_APPS_DIR` first, then falls back to
-/// `~/.config/sanitize/apps` (XDG base directory convention).
+/// `~/.config/scour-secrets/apps` (XDG base directory convention).
 pub(crate) fn user_apps_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("SCOUR_SECRETS_APPS_DIR") {
         if !dir.is_empty() {
             return Some(PathBuf::from(dir));
         }
     }
-    std::env::var("HOME").ok().map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("scour")
-            .join("apps")
-    })
+    Some(crate::hooks::sanitize_config_dir().join("apps"))
 }
 
 /// Parse a YAML file as `T`, returning a clear error on failure.
@@ -319,7 +314,7 @@ pub(crate) fn ensure_user_app_copy(name: &str) -> Option<PathBuf> {
 /// Load an app bundle by name.
 ///
 /// Resolution order:
-///   1. User apps directory (`SCOUR_SECRETS_APPS_DIR` or `~/.config/sanitize/apps/<name>/`)
+///   1. User apps directory (`SCOUR_SECRETS_APPS_DIR` or `~/.config/scour-secrets/apps/<name>/`)
 ///   2. Built-in apps embedded in the binary
 pub(crate) fn load_app_bundle(name: &str) -> Result<AppBundle, String> {
     // 1. User-defined app takes precedence over built-in.

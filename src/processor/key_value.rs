@@ -63,11 +63,10 @@ use crate::error::{Result, SanitizeError};
 use crate::processor::limits::DEFAULT_INPUT_SIZE;
 use crate::processor::profile::FieldRule;
 use crate::processor::{
-    find_field_signal, find_matching_rule, replace_by_signal, replace_value, FileTypeProfile,
-    Processor,
+    find_field_signal, find_matching_rule, process_sub_content, replace_by_signal, replace_value,
+    FileTypeProfile, Processor,
 };
 use crate::store::MappingStore;
-use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Per-file configuration (constant across all lines in one processing call)
@@ -528,60 +527,6 @@ fn try_sanitize_kv_body(body: &str, cfg: &KvConfig<'_>) -> Result<Option<String>
     }
 
     Ok(None)
-}
-
-// ---------------------------------------------------------------------------
-// Sub-processor dispatch
-// ---------------------------------------------------------------------------
-
-/// Delegate `content` to the processor named in `rule.sub_processor`.
-///
-/// Builds a synthetic [`FileTypeProfile`] from the rule's `sub_fields` and
-/// calls the appropriate built-in processor directly. Returns the processed
-/// content as a `String`.
-fn process_sub_content(content: &str, rule: &FieldRule, store: &MappingStore) -> Result<String> {
-    use super::env_proc::EnvProcessor;
-    use super::ini_proc::IniProcessor;
-    use super::json_proc::JsonProcessor;
-    use super::log_line::LogLineProcessor;
-    use super::toml_proc::TomlProcessor;
-    use super::yaml_proc::YamlProcessor;
-
-    let name = rule
-        .sub_processor
-        .as_deref()
-        .ok_or_else(|| SanitizeError::InvalidConfig("sub_processor not set".into()))?;
-
-    let sub_profile = FileTypeProfile {
-        processor: name.to_owned(),
-        extensions: Vec::new(),
-        include: Vec::new(),
-        exclude: Vec::new(),
-        fields: rule.sub_fields.clone(),
-        options: HashMap::new(),
-        field_name_signals: Vec::new(),
-    };
-
-    let bytes = content.as_bytes();
-    let out = match name {
-        "yaml" => YamlProcessor.process(bytes, &sub_profile, store)?,
-        "json" => JsonProcessor.process(bytes, &sub_profile, store)?,
-        "toml" => TomlProcessor.process(bytes, &sub_profile, store)?,
-        "ini" => IniProcessor.process(bytes, &sub_profile, store)?,
-        "env" => EnvProcessor.process(bytes, &sub_profile, store)?,
-        "log_line" => LogLineProcessor::new().process(bytes, &sub_profile, store)?,
-        other => {
-            return Err(SanitizeError::InvalidConfig(format!(
-                "unknown sub_processor '{other}' — supported: yaml, json, toml, ini, env, log_line"
-            )))
-        }
-    };
-
-    String::from_utf8(out).map_err(|e| {
-        SanitizeError::IoError(std::io::Error::other(format!(
-            "sub-processor output is not UTF-8: {e}"
-        )))
-    })
 }
 
 // ---------------------------------------------------------------------------

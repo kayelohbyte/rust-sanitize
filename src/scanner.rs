@@ -238,6 +238,14 @@ pub struct ScanPattern {
     /// unbounded pattern can run before the streaming scanner's over-long
     /// redaction takes over.
     pub max_length: usize,
+    /// Require word boundaries (non-`[A-Za-z0-9_]` neighbours) around a
+    /// literal match. Set for name-category literals: a seeded login like
+    /// `admin` must not rewrite `administrators`, `adminProperties`, or path
+    /// segments like `dssadmin` — matches inside larger words also bypass the
+    /// allowlist, which only sees the matched span. Tokens/passwords stay
+    /// substring-matched: a real secret embedded in a longer string must
+    /// still be caught.
+    word_boundary: bool,
 }
 
 impl std::fmt::Debug for ScanPattern {
@@ -249,6 +257,7 @@ impl std::fmt::Debug for ScanPattern {
             .field("literal", &self.literal.as_deref())
             .field("min_length", &self.min_length)
             .field("max_length", &self.max_length)
+            .field("word_boundary", &self.word_boundary)
             .finish()
     }
 }
@@ -262,6 +271,7 @@ impl Clone for ScanPattern {
             literal: self.literal.clone(),
             min_length: self.min_length,
             max_length: self.max_length,
+            word_boundary: self.word_boundary,
         }
     }
 }
@@ -321,6 +331,8 @@ impl ScanPattern {
             literal: None,
             min_length: 0,
             max_length: usize::MAX,
+            // Regex authors control their own boundaries (`\b` in the pattern).
+            word_boundary: false,
         })
     }
 
@@ -369,6 +381,7 @@ impl ScanPattern {
             .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
             .build()
             .map_err(compile_err)?;
+        let word_boundary = matches!(category, Category::Name);
         Ok(Self {
             regex,
             category,
@@ -376,6 +389,7 @@ impl ScanPattern {
             min_length: literal.len(),
             max_length: usize::MAX,
             literal: Some(literal.to_owned()),
+            word_boundary,
         })
     }
 
@@ -402,6 +416,18 @@ impl ScanPattern {
 // - regex::bytes::Regex is Send + Sync
 // - Category is Send + Sync (it's an enum of primitives + CompactString)
 // - String is Send + Sync
+
+/// Whether `window[start..end]` sits on word boundaries: the bytes adjacent
+/// to the span (when present) are not `[A-Za-z0-9_]`. Window edges count as
+/// boundaries — the chunk overlap re-scans boundary-adjacent spans with
+/// context, so a mid-stream edge is rare and errs toward redacting.
+#[inline]
+fn word_bounded(window: &[u8], start: usize, end: usize) -> bool {
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let before_ok = start == 0 || !is_word(window[start - 1]);
+    let after_ok = end >= window.len() || !is_word(window[end]);
+    before_ok && after_ok
+}
 
 // ---------------------------------------------------------------------------
 // Internal: raw match descriptor
@@ -1275,6 +1301,11 @@ impl StreamScanner {
                 if self.length_out_of_bounds(pattern_idx, mat.end() - mat.start()) {
                     continue;
                 }
+                if self.patterns[pattern_idx].word_boundary
+                    && !word_bounded(window, mat.start(), mat.end())
+                {
+                    continue;
+                }
                 scratch.all_matches.push(RawMatch {
                     start: mat.start(),
                     end: mat.end(),
@@ -1590,6 +1621,47 @@ mod tests {
             "ipv4",
         )
         .unwrap()
+    }
+
+    // ---- Word boundaries for name-category literals ----
+
+    #[test]
+    fn name_literal_requires_word_boundaries() {
+        // A seeded login like `admin` must redact standalone occurrences but
+        // never rewrite the inside of larger words, JSON keys, or path
+        // segments (admin → Quinn turned `administrators` into
+        // `Quinnistrators` and `dssadmin` into `dssQuinn`).
+        let pat = ScanPattern::from_literal("admin", Category::Name, "login").unwrap();
+        let scanner = test_scanner(vec![pat]);
+
+        let input = b"user=admin administrators adminProperties dssadmin (admin)";
+        let (out, stats) = scanner.scan_bytes(input).unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        assert_eq!(stats.matches_found, 2, "standalone occurrences only: {out}");
+        assert!(
+            !out.contains("user=admin"),
+            "standalone value replaced: {out}"
+        );
+        assert!(
+            out.contains("administrators") && out.contains("adminProperties"),
+            "larger words must survive: {out}"
+        );
+        assert!(out.contains("dssadmin"), "path segment must survive: {out}");
+        assert!(!out.contains("(admin)"), "delimited value replaced: {out}");
+    }
+
+    #[test]
+    fn token_literal_still_matches_inside_larger_strings() {
+        // Word boundaries are a name-category rule only — a real secret
+        // embedded in a URL or a longer token must still be caught.
+        let pat = ScanPattern::from_literal("sekrit12345", Category::AuthToken, "token").unwrap();
+        let scanner = test_scanner(vec![pat]);
+        let (out, stats) = scanner
+            .scan_bytes(b"https://api.example.com/?key=Xsekrit12345Y")
+            .unwrap();
+        assert_eq!(stats.matches_found, 1);
+        assert!(!String::from_utf8(out).unwrap().contains("sekrit12345"));
     }
 
     // ---- Fail-closed on invalid capture bounds ----

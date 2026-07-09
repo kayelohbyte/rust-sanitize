@@ -1023,16 +1023,16 @@ mod tests {
                 let input = format!("{a}.{b}.{c}.{d}");
                 let store = hmac_store();
                 let out = store.get_or_insert(&Category::IpV4, &input).unwrap();
-                // The strategy preserves dot positions and digit counts but does
-                // not clamp octet values to 0-255 (e.g. 114 → 987 is valid output).
-                // Invariant: 4 dot-separated groups, each containing only digits,
-                // each with the same digit count as the original octet.
+                // Invariant: 4 dot-separated groups, each with the same digit
+                // count as the original octet, and each a valid octet (0-255)
+                // so the output is always a parseable address.
                 let in_parts: Vec<&str> = input.split('.').collect();
                 let out_parts: Vec<&str> = out.split('.').collect();
                 prop_assert_eq!(out_parts.len(), 4);
                 for (inp, outp) in in_parts.iter().zip(out_parts.iter()) {
                     prop_assert_eq!(inp.len(), outp.len());
-                    prop_assert!(outp.chars().all(|c| c.is_ascii_digit()));
+                    let octet: Result<u8, _> = outp.parse();
+                    prop_assert!(octet.is_ok(), "invalid octet {outp} in {out}");
                 }
             }
 

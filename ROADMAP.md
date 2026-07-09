@@ -1,6 +1,6 @@
 # Roadmap
 
-> Status: **0.16.0** — pre-1.0, API stabilizing. This document is a guide to
+> Status: **0.17.0** — pre-1.0, API stabilizing. This document is a guide to
 > intent, not a commitment; priorities shift with feedback.
 
 ## Where things stand
@@ -34,6 +34,29 @@ These are the gates between here and a 1.0 that we're comfortable freezing:
 
 There is no fixed date. 1.0 ships when the CLI has settled under real use and
 the above are done.
+
+## Under consideration (pre-1.0 candidates)
+
+Scoped ideas that came out of real-bundle testing; likely next-minor material
+once their design questions are settled.
+
+- **`seed: true` on scanner regex entries.** Today only *profile-discovered*
+  field values are seeded into the scanner as literals; a scanner regex
+  capture matches only where its keyword context appears. An opt-in `seed`
+  flag would let a keyed pattern (e.g. `HOSTNAME=(...)`) discover a value once
+  and scrub its bare occurrences everywhere — the same two-pass guarantee the
+  profiles get, for formats no structured processor covers. Needs a discovery
+  pre-pass for scanner patterns, mirroring the existing profile pre-pass.
+- **Hostname replacement domain-suffix policy.** The hostname category
+  preserves everything after the first dot so replacements stay plausible
+  (`db01.corp.example.com` → `x9f2.corp.example.com`) — which deliberately
+  leaves internal domain names visible. Decide whether that stays the default,
+  becomes configurable, or splits into distinct hostname/FQDN categories, and
+  document the choice.
+- **Span-edit support for `command_output`.** The processor currently
+  implements only `process` (re-serialization); implementing
+  `process_to_edits` would give it the byte-exact span-editing fast path the
+  other structured editors use inside archives.
 
 ## Deliberately deferred (post-1.0)
 

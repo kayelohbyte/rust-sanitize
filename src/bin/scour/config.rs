@@ -338,6 +338,33 @@ pub(crate) fn run_show_config() -> Result<(), (String, i32)> {
         show_config_fields(&s, None);
     }
 
+    // ── app bundle copies ─────────────────────────────────────────────────────
+    println!();
+    if let Some(apps_dir) = crate::apps::user_apps_dir() {
+        print!("App copies: {}", apps_dir.display());
+        let provisioned: Vec<String> = std::fs::read_dir(&apps_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if provisioned.is_empty() {
+            println!(" (empty — populated on first --app use)");
+        } else {
+            let mut names = provisioned;
+            names.sort();
+            println!();
+            println!("  provisioned: {}", names.join(", "));
+        }
+        println!(
+            "  --app runs persist discovered values into <app>/secrets.yaml so later\n\
+             \x20 runs re-redact them; pass --no-structured-handoff to skip the write-back."
+        );
+    }
+
     // ── project config (.scour-secrets.yaml) ──────────────────────────────────────
     println!();
     if no_config {
