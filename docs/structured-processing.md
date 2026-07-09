@@ -31,11 +31,11 @@ Write a profile file describing which fields to sanitize, then pass it with `--p
 
 ```bash
 # --secrets-file is required when using --profile.
-# The file can be empty on the first run — scour populates it with discovered
+# The file can be empty on the first run — scour-secrets populates it with discovered
 # literals automatically so Phase 2 can match them in logs and other files.
 # (An encrypted secrets file works too: the write-back re-encrypts with the
 #  same password. Plaintext JSON/YAML/TOML files keep their own format.)
-scour config.yaml -s secrets.yaml --profile profile.yaml
+scour-secrets config.yaml -s secrets.yaml --profile profile.yaml
 ```
 
 Input:
@@ -92,7 +92,7 @@ Phase 2 — everything else (parallel)
 ```bash
 # config.yaml has password: hunter2
 # app.log contains "auth failed for hunter2"
-scour config.yaml app.log --profile profile.yaml -s secrets.yaml
+scour-secrets config.yaml app.log --profile profile.yaml -s secrets.yaml
 
 # Both files get the same replacement for "hunter2"
 ```
@@ -120,10 +120,10 @@ Deferring stdin until after discovery and the archive pre-pass is what makes thi
 ```bash
 # config.yaml is discovered first (Phase 1a), seeding e.g. password: hunter2
 # stdin is processed after, so "hunter2" is replaced in error.json too
-cat error.json | scour config.yaml -s secrets.yaml --profile profile.yaml
+cat error.json | scour-secrets config.yaml -s secrets.yaml --profile profile.yaml
 
 # Without --profile, stdin runs first (no deferral needed — no discovery happens)
-cat error.json | scour -s secrets.yaml
+cat error.json | scour-secrets -s secrets.yaml
 ```
 
 **Does command-line order matter?**
@@ -133,7 +133,7 @@ cat error.json | scour -s secrets.yaml
 
 ```bash
 # Phase 2 ordering never changes results — same replacements regardless of file order
-scour a.log b.log c.log -s secrets.yaml   # identical result to c.log b.log a.log
+scour-secrets a.log b.log c.log -s secrets.yaml   # identical result to c.log b.log a.log
 ```
 
 ---
@@ -586,7 +586,7 @@ SCOUR_SECRETS_PASSWORD=secret sanitize log-two.txt --deterministic -s secrets.ya
 ```bash
 # Structured pass targets known config fields.
 # Streaming scanner catches those same values in logs.
-scour config.yaml app.log --profile profile.yaml -s secrets.yaml
+scour-secrets config.yaml app.log --profile profile.yaml -s secrets.yaml
 ```
 
 ---

@@ -55,20 +55,22 @@ For **VS Code**: there is no built-in path deny mechanism. `.copilotignore` prev
 
 For **ChatGPT and Gemini**: no ambient filesystem access — control what you explicitly upload.
 
+Two controls work against **every** agent regardless of its built-in deny mechanism, because they are enforced by the OS rather than the tool: file-system permissions with a dedicated service user (next section), and running the agent inside a container with the daemon on the host ([Containerized Agent, Host-Side Daemon](#containerized-agent-host-side-daemon-mount-namespace-isolation)).
+
 ### File System Permissions (All Tools)
 
-OS-level permissions are the only control that works against every agent regardless of its built-in deny mechanism. The model: a dedicated service user owns the sensitive files and runs the daemon; your login user (and therefore every agent you launch) cannot open the files directly.
+OS-level permissions work against every agent regardless of its built-in deny mechanism. The model: a dedicated service user owns the sensitive files and runs the daemon; your login user (and therefore every agent you launch) cannot open the files directly. (The other tool-agnostic option is a container boundary — see [Containerized Agent, Host-Side Daemon](#containerized-agent-host-side-daemon-mount-namespace-isolation); the two compose well.)
 
 ```
        ┌──────────────────────────────────────────┐
        │  Sensitive files                         │
-       │  owner: scour-secrets-svc                     │
+       │  owner: scour-secrets-svc                │
        └─────────────┬────────────────────────────┘
                      │ read access (OS-enforced)
                      ▼
    ┌─────────────────────────────────────┐
-   │  scour-secrets-mcp daemon                │
-   │  runs as: scour-secrets-svc              │
+   │  scour-secrets-mcp daemon           │
+   │  runs as: scour-secrets-svc         │
    │  binds:   127.0.0.1 + bearer token  │
    └────────────────┬────────────────────┘
                     │ sanitized output only
@@ -95,16 +97,16 @@ Then pick one of two file-ownership models. Both put the daemon in the same posi
 Only the service user can read or write. Your login user — and therefore every agent — gets `Permission denied` at the OS level. Edits require an explicit `sudo` step, which is the point: there is no path by which a compromised agent shell can reach the file.
 
 ```bash
-sudo chown scour-secrets-svc:scour-secrets-svc /var/sanitize/secrets/secrets.yaml
-sudo chmod 0600 /var/sanitize/secrets/secrets.yaml
+sudo chown scour-secrets-svc:scour-secrets-svc /var/scour/secrets/secrets.yaml
+sudo chmod 0600 /var/scour/secrets/secrets.yaml
 ```
 
 Edit with `sudoedit` (preserves your `$EDITOR`, writes via a safe temp file):
 
 ```bash
-sudo -u scour-secrets-svc -e /var/sanitize/secrets/secrets.yaml
+sudo -u scour-secrets-svc -e /var/scour/secrets/secrets.yaml
 # or, for a one-off read:
-sudo -u scour-secrets-svc cat /var/sanitize/secrets/secrets.yaml
+sudo -u scour-secrets-svc cat /var/scour/secrets/secrets.yaml
 ```
 
 Pick this when the secrets are stable, edited rarely, and the consequences of agent exfiltration are severe (production tokens, customer-namespace secrets, audit-scoped credentials).
@@ -114,11 +116,11 @@ Pick this when the secrets are stable, edited rarely, and the consequences of ag
 Your login user joins a shared group and can edit the files with their normal editor. The daemon still runs as `scour-secrets-svc`; agents inherit your group membership and *can* read the files at the OS level, so this model relies on per-agent deny rules ([Blocking Direct File Reads by AI Tool](#blocking-direct-file-reads-by-ai-tool)) to enforce the boundary inside the agent.
 
 ```bash
-sudo groupadd sanitize-readers
-sudo usermod -aG sanitize-readers scour-secrets-svc
-sudo usermod -aG sanitize-readers $USER         # log out and back in for this to take effect
-sudo chown scour-secrets-svc:sanitize-readers /var/sanitize/secrets/secrets.yaml
-sudo chmod 0640 /var/sanitize/secrets/secrets.yaml
+sudo groupadd scour-readers
+sudo usermod -aG scour-readers scour-secrets-svc
+sudo usermod -aG scour-readers $USER         # log out and back in for this to take effect
+sudo chown scour-secrets-svc:scour-readers /var/scour/secrets/secrets.yaml
+sudo chmod 0640 /var/scour/secrets/secrets.yaml
 ```
 
 Pick this when you iterate on patterns/profiles frequently, are confident in your agent's deny mechanism (e.g. Claude Code `PreToolUse` hook, Codex TOML deny, OpenCode `permission.read`), and the threat model is "stop the agent from casually reading them" rather than "defend against a determined shell escape." VS Code Copilot users should **not** use this model — `.copilotignore` is not a security boundary; strict mode is the only effective control.
@@ -142,7 +144,7 @@ openssl rand -hex 32
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key>             <string>com.sanitize.mcp</string>
+  <key>Label</key>             <string>com.scour.mcp</string>
   <key>UserName</key>          <string>scour-secrets-svc</string>
   <key>ProgramArguments</key>
   <array>
@@ -152,7 +154,7 @@ openssl rand -hex 32
   <key>EnvironmentVariables</key>
   <dict>
     <key>SCOUR_SECRETS_BIN</key>             <string>/usr/local/bin/scour-secrets</string>
-    <key>SCOUR_SECRETS_SECRETS_DIR</key>     <string>/var/sanitize/secrets</string>
+    <key>SCOUR_SECRETS_SECRETS_DIR</key>     <string>/var/scour/secrets</string>
     <key>SCOUR_SECRETS_MCP_HTTP_TOKEN</key>  <string>YOUR_TOKEN_HERE</string>
   </dict>
   <key>RunAtLoad</key>         <true/>
@@ -176,7 +178,7 @@ Store secrets in a separate environment file rather than inline in the unit — 
 sudo mkdir -p /etc/scour-secrets-mcp
 sudo tee /etc/scour-secrets-mcp/env > /dev/null <<'EOF'
 SCOUR_SECRETS_BIN=/usr/local/bin/scour-secrets
-SCOUR_SECRETS_SECRETS_DIR=/var/sanitize/secrets
+SCOUR_SECRETS_SECRETS_DIR=/var/scour/secrets
 SCOUR_SECRETS_MCP_HTTP_TOKEN=YOUR_TOKEN_HERE
 EOF
 sudo chmod 0600 /etc/scour-secrets-mcp/env
@@ -225,13 +227,13 @@ sudo systemctl enable --now scour-secrets-mcp
 NSSM wraps any executable as a Windows service and handles env vars, stdout/stderr, and auto-restart.
 
 ```powershell
-nssm install scour-secrets-mcp "C:\Program Files\sanitize\scour-secrets-mcp.exe"
+nssm install scour-secrets-mcp "C:\Program Files\scour-secrets\scour-secrets-mcp.exe"
 nssm set scour-secrets-mcp AppParameters "--http"
 nssm set scour-secrets-mcp AppEnvironmentExtra `
-  "SCOUR_SECRETS_BIN=C:\Program Files\sanitize\sanitize.exe" `
-  "SCOUR_SECRETS_SECRETS_DIR=C:\ProgramData\sanitize\secrets" `
+  "SCOUR_SECRETS_BIN=C:\Program Files\scour-secrets\scour-secrets.exe" `
+  "SCOUR_SECRETS_SECRETS_DIR=C:\ProgramData\scour-secrets\secrets" `
   "SCOUR_SECRETS_MCP_HTTP_TOKEN=YOUR_TOKEN_HERE"
-nssm set scour-secrets-mcp AppStderr "C:\ProgramData\sanitize\logs\scour-secrets-mcp.log"
+nssm set scour-secrets-mcp AppStderr "C:\ProgramData\scour-secrets\logs\scour-secrets-mcp.log"
 nssm set scour-secrets-mcp Start SERVICE_AUTO_START
 nssm start scour-secrets-mcp
 ```
@@ -294,6 +296,99 @@ Refer to the [Codex permissions documentation](https://developers.openai.com/cod
 > - Service configuration files containing the token must be mode `0600` (shown above for macOS and Linux).
 > - **What the daemon logs:** only a startup message (`scour-secrets-mcp daemon ready on 127.0.0.1:<port>`) and unhandled error class names. It never logs request bodies, file paths, file content, or the `Authorization` header. The sanitize subprocess is audited separately — its output is always the redacted result, never raw secrets.
 
+### Containerized Agent, Host-Side Daemon (Mount-Namespace Isolation)
+
+The per-tool deny rules above all share a weakness: they are enforced *inside* the agent, and each tool does it differently (or not at all). Running the AI tool in a container inverts the model — instead of telling the agent which files it may not read, you build it a world in which the sensitive files do not exist. The kernel's mount namespace is the boundary, it applies identically to every agent, and there is nothing to configure per tool.
+
+The setup: the agent runs in a container whose bind mounts cover only the project workspace. `scour-secrets` and `scour-secrets-mcp` run **on the host** as a [persistent daemon](#running-as-a-persistent-daemon). Sensitive paths — the secrets store, `/var/log`, production configs — are simply never mounted into the container. The agent's only route to that data is the MCP HTTP endpoint, and the daemon only ever returns sanitized bytes.
+
+```
+Host                                        Container
+┌───────────────────────────────┐           ┌────────────────────────────────┐
+│  Sensitive files              │           │  AI agent (Claude Code, …)     │
+│  /var/scour/secrets/          │           │  sees: /workspace only         │
+│  /var/log/, /etc/gitlab/, …   │           │  sensitive paths: NOT MOUNTED  │
+│         │                     │           │  — no deny rule needed, the    │
+│         ▼ reads               │           │    paths don't exist here      │
+│  scour-secrets-mcp daemon     │   HTTP +  │            │                   │
+│  binds 127.0.0.1:6277         │◀─ bearer ─│            ▼                   │
+│  returns sanitized text only  │   token   │  MCP client → host gateway     │
+└───────────────────────────────┘           └────────────────────────────────┘
+```
+
+This is a natural fit for autonomous-agent workflows — e.g. running Claude Code with `--dangerously-skip-permissions` inside a devcontainer — where the container already exists to limit blast radius. The daemon gives that sandboxed agent a *sanitized* view of host data it could otherwise not see at all.
+
+**1. Start the daemon on the host** as described in [Running as a Persistent Daemon](#running-as-a-persistent-daemon). The service-user and `ReadOnlyPaths` hardening still apply and still matter (see the security notes below).
+
+**2. Give the container a route to the host daemon.** The daemon binds `127.0.0.1` only, which is the right default — keep it and pick the networking mode that reaches host loopback:
+
+- **Linux:** run the container with `--network=host`. The container shares the host's network namespace, so `127.0.0.1:6277` inside the container *is* the daemon. Avoid bridge networking + `--add-host=host.docker.internal:host-gateway` here: the gateway address reaches the host via the bridge interface, which a loopback-only daemon does not listen on — you would have to widen the daemon's bind address to use it.
+- **macOS / Windows (Docker Desktop):** use the special hostname `host.docker.internal`. Docker Desktop proxies it to the host's loopback, so the `127.0.0.1`-only binding works unchanged.
+
+```bash
+# Linux
+docker run -it --rm --network=host \
+  -v "$PWD":/workspace -w /workspace \
+  your-agent-image
+
+# macOS / Windows (Docker Desktop) — default bridge networking is fine
+docker run -it --rm \
+  -v "$PWD":/workspace -w /workspace \
+  your-agent-image
+```
+
+Or in a `devcontainer.json`:
+
+```jsonc
+{
+  "image": "your-agent-image",
+  "workspaceFolder": "/workspace",
+  "runArgs": ["--network=host"]   // Linux hosts; omit on Docker Desktop
+}
+```
+
+**3. Point the agent at the daemon** from inside the container — same config as any daemon client, with the host-gateway URL. Claude Code (`~/.claude/claude.json` inside the container):
+
+```json
+{
+  "mcpServers": {
+    "scour-secrets": {
+      "url": "http://host.docker.internal:6277/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN_HERE"
+      }
+    }
+  }
+}
+```
+
+With `--network=host` on Linux, use `http://127.0.0.1:6277/mcp` instead. Inject the token at runtime (environment variable, mounted secret, or a config file written by your container entrypoint) — never bake it into the image, where it persists in every layer and registry copy.
+
+**4. Use host paths in tool calls.** This is the one behavioral difference to know about: path-type parameters (`files`, `secrets_file`, `profile`) are resolved by the daemon **on the host filesystem**. The agent asks for `/var/log/gitlab/production_json.log` even though that path does not exist inside the container:
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["/var/log/gitlab/production_json.log"],
+  "app": ["gitlab"]
+}
+```
+
+The sanitized text comes back through the MCP response, so for most workflows no shared filesystem is needed. If you use reference-mode output (`llm_template` with large file sets, or workflows where the agent reads sanitized files with its own tools), bind-mount a scratch directory into the container **at the same path** it has on the host, and direct output there — the daemon writes sanitized files to the host directory and the agent reads them at an identical path:
+
+```bash
+docker run -it --rm --network=host \
+  -v "$PWD":/workspace -w /workspace \
+  -v /var/scour/work:/var/scour/work \
+  your-agent-image
+```
+
+> **Security notes:**
+> - **The token is still the access control.** Anything in the container holding the token can request a *sanitized* copy of any file the daemon's user can read. Sanitized is not the same as harmless — pattern gaps happen. Keep the daemon scoped with the [service-user model](#file-system-permissions-all-tools) and systemd `ReadOnlyPaths` so the reachable set is only what you intend to share.
+> - **Don't undo the boundary with mounts.** Bind-mounting the secrets store or log directories into the container "for convenience" defeats the entire model. The only shared mount should be the project workspace and, optionally, the sanitized-output scratch directory.
+> - **Loopback caveat on shared hosts:** with `--network=host` (Linux) the container also reaches every other loopback service on the host, and on a multi-user machine any local user can attempt connections to the daemon port — the bearer token is what rejects them. On Docker Desktop, `host.docker.internal` is reachable from *every* container on the machine; the token is likewise the gate.
+> - The [single-session limit](#running-as-a-persistent-daemon) applies as usual: one active MCP session at a time, with the service manager restarting the daemon between clean sessions.
+
 ### OpenCode: Block Direct Reads with `permission.read`
 
 OpenCode has a built-in `permission.read` system that supports path-pattern deny rules. Add entries to `opencode.json` in your project root (or `~/.config/opencode/opencode.json` for global scope):
@@ -312,7 +407,7 @@ OpenCode has a built-in `permission.read` system that supports path-pattern deny
 
 Rules are evaluated by pattern match with **last match winning** — place the catch-all `"*": "allow"` first, then specific deny patterns after. Supports `*` (any characters) and `?` (single character) wildcards.
 
-MCP tool calls pass file paths to the sanitize subprocess and are not subject to `permission.read` rules — the agent cannot read the raw file, but the scour-secrets tool processes it normally.
+MCP tool calls pass file paths to the sanitize subprocess and are not subject to `permission.read` rules — the agent cannot read the raw file, but the `sanitize` MCP tool processes it normally.
 
 ### Cursor: Block Direct Reads with Enforcement Hooks (Enterprise)
 
@@ -430,11 +525,11 @@ Avoid storing sensitive source files inside the project directory — editors an
 The `SCOUR_SECRETS_SECRETS_DIR` namespace layout enforces permission checks at load time: the `.password` file for each namespace must be `0600` or `0400` or the server will refuse to start. Apply the same ownership model to the parent directory so agents cannot enumerate namespaces:
 
 ```bash
-sudo chown -R scour-secrets-svc:scour-secrets-svc /var/sanitize/secrets/
-sudo chmod 0750 /var/sanitize/secrets/           # scour-secrets-svc can enter; agent user cannot
-sudo chmod 0700 /var/sanitize/secrets/acme-corp/ # namespace dirs: service user only
-sudo chmod 0600 /var/sanitize/secrets/acme-corp/secrets.yaml
-sudo chmod 0600 /var/sanitize/secrets/acme-corp/.password
+sudo chown -R scour-secrets-svc:scour-secrets-svc /var/scour/secrets/
+sudo chmod 0750 /var/scour/secrets/           # scour-secrets-svc can enter; agent user cannot
+sudo chmod 0700 /var/scour/secrets/acme-corp/ # namespace dirs: service user only
+sudo chmod 0600 /var/scour/secrets/acme-corp/secrets.yaml
+sudo chmod 0600 /var/scour/secrets/acme-corp/.password
 ```
 
 ---
@@ -627,13 +722,13 @@ require("avante").setup({
 
 | Tool | Description |
 |------|-------------|
-| `scour-secrets` | Sanitize inline text or files. Set `llm_template` to `'troubleshoot'`, `'review-config'`, or `'review-security'` for a fully-formatted LLM prompt. |
+| `sanitize` | Sanitize inline text or files. Set `llm_template` to `'troubleshoot'`, `'review-config'`, or `'review-security'` for a fully-formatted LLM prompt. |
 | `scan` | Scan for secrets and return a report without modifying content. |
 | `strip_config_values` | Strip values from key=value config files, preserving keys and structure. |
 | `test_allowlist` | Test which values match a set of allowlist patterns. |
 | `list_apps` | List all available app bundles (built-in + user-defined). |
-| `list_processors` | List all supported input format processors and the `format_flag` value to pass as the `format` parameter to `scour-secrets` or `scan`. Call when auto-detection fails (extensionless files, stdin, unfamiliar extensions). |
-| `list_templates` | List the built-in LLM prompt templates available via the `llm_template` parameter of the `scour-secrets` tool. |
+| `list_processors` | List all supported input format processors and the `format_flag` value to pass as the `format` parameter to `sanitize` or `scan`. Call when auto-detection fails (extensionless files, stdin, unfamiliar extensions). |
+| `list_templates` | List the built-in LLM prompt templates available via the `llm_template` parameter of the `sanitize` tool. |
 | `init` | Create a starter secrets file on disk from a preset template and return its contents. |
 | `build_secrets` | Build a tailored secrets file from specific patterns. Typical workflow: scan → identify gaps → build_secrets → sanitize. |
 | `test_pattern` | Test which values are matched by a secrets file, app bundle, or inline patterns. Returns per-value match results. |
@@ -1049,17 +1144,17 @@ Omit `preset` to create a file with only the entries you specify. Returns the wr
 { "tool": "init", "output_path": "patterns.yaml", "preset": "web" }
 ```
 
-Available presets: `balanced` (default — mirrors the built-in runtime detection set), `aggressive` (balanced + entropy/bearer patterns), `generic`, `web`, `k8s`, `database`, `aws`. Pass `overwrite: true` to replace an existing file. Once created, pass the path via `secrets_file` on subsequent `scour-secrets` or `scan` calls.
+Available presets: `balanced` (default — mirrors the built-in runtime detection set), `aggressive` (balanced + entropy/bearer patterns), `generic`, `web`, `k8s`, `database`, `aws`. Pass `overwrite: true` to replace an existing file. Once created, pass the path via `secrets_file` on subsequent `sanitize` or `scan` calls.
 
 ### Discover input formats and LLM templates
 
-`list_processors` returns every supported format processor and the `format_flag` value to pass as the `format` parameter to `scour-secrets` or `scan`. Useful when auto-detection fails — extensionless files, stdin input, or an unfamiliar extension.
+`list_processors` returns every supported format processor and the `format_flag` value to pass as the `format` parameter to `sanitize` or `scan`. Useful when auto-detection fails — extensionless files, stdin input, or an unfamiliar extension.
 
 ```json
 { "tool": "list_processors" }
 ```
 
-`list_templates` returns the built-in LLM prompt templates available via the `llm_template` parameter of `scour-secrets`.
+`list_templates` returns the built-in LLM prompt templates available via the `llm_template` parameter of `sanitize`.
 
 ```json
 { "tool": "list_templates" }
@@ -1084,7 +1179,7 @@ Set `SCOUR_SECRETS_SECRETS_DIR` to a directory and create one subdirectory per c
     .password
 ```
 
-Pass `namespace` in `scour-secrets` or `scan` tool calls. The server loads only that namespace's secrets, profile, password, and behavior defaults — keeping pattern sets and configuration isolated across tenants.
+Pass `namespace` in `sanitize` or `scan` tool calls. The server loads only that namespace's secrets, profile, password, and behavior defaults — keeping pattern sets and configuration isolated across tenants.
 
 ### Per-Namespace `settings.yaml`
 
