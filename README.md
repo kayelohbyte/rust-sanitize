@@ -384,7 +384,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model and mitigations.
 
 | Document | Description |
 |----------|-------------|
-| [MCP Reference](docs/mcp.md) | MCP server setup, all tool parameters, JSON examples, IDE configs (Cursor, Neovim, OpenCode), and namespace-based multi-tenant setup. |
+| [MCP Reference](docs/mcp.md) | MCP server setup, all tool parameters, JSON examples, IDE configs (Cursor, Neovim, OpenCode), containerized-agent isolation, and namespace-based multi-tenant setup. |
 | [CLI Reference](docs/cli-reference.md) | Full `scour-secrets` command reference including all flags, subcommands, secrets file format, and examples. |
 | [Structured Processing](docs/structured-processing.md) | `--profile` usage, field patterns, two-phase pipeline, format preservation, and processor options. |
 | [Supported Categories](docs/categories.md) | All 18 built-in replacement categories with strategies and examples, plus custom categories. |
