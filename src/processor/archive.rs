@@ -147,6 +147,28 @@ use crate::processor::limits::{
     PARALLEL_ZIP_DATA_SIZE, STRUCTURED_ENTRY_SIZE,
 };
 
+/// Gzip stream magic bytes (RFC 1952).
+const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
+
+/// Inner filename for a single-file gzip entry: `logs/app.log.1.gz` →
+/// `logs/app.log.1`. Returns `None` for non-`.gz` names and for `.tar.gz` /
+/// `.tgz`, which are whole archives handled by the nested-archive path.
+fn strip_gz_suffix(filename: &str) -> Option<&str> {
+    let lower = filename.to_ascii_lowercase();
+    if lower.strip_suffix(".tar.gz").is_some() || lower.strip_suffix(".tgz").is_some() {
+        return None;
+    }
+    let stem_len = lower.strip_suffix(".gz")?.len();
+    (stem_len > 0).then(|| &filename[..stem_len])
+}
+
+/// Archive formats that route to `sanitize_nested_archive`. Single-file gzip
+/// (`ArchiveFormat::Gz`) is excluded: the dedicated branch in `sanitize_entry`
+/// decompresses it under its inner name and honors `--force-text`.
+fn nested_archive_format(filename: &str) -> Option<ArchiveFormat> {
+    ArchiveFormat::from_path(filename).filter(|f| *f != ArchiveFormat::Gz)
+}
+
 /// Read up to `limit` bytes from `reader` into a `Vec<u8>`.
 ///
 /// Returns an error if the reader yields more than `limit` bytes, preventing
@@ -299,6 +321,8 @@ pub enum ArchiveFormat {
     Tar,
     /// Gzip-compressed `.tar.gz` / `.tgz` archive.
     TarGz,
+    /// Standalone single-file gzip stream (`.gz` that is not `.tar.gz` / `.tgz`).
+    Gz,
 }
 
 impl ArchiveFormat {
@@ -323,6 +347,8 @@ impl ArchiveFormat {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
         {
             Some(Self::Zip)
+        } else if strip_gz_suffix(&lower).is_some() {
+            Some(Self::Gz)
         } else {
             None
         }
@@ -672,7 +698,7 @@ impl ArchiveProcessor {
         depth: u32,
     ) -> Result<()> {
         // --- Nested archive detection ---
-        if let Some(nested_fmt) = ArchiveFormat::from_path(filename) {
+        if let Some(nested_fmt) = nested_archive_format(filename) {
             return self.sanitize_nested_archive(
                 filename,
                 reader,
@@ -682,6 +708,24 @@ impl ArchiveProcessor {
                 nested_fmt,
                 depth,
             );
+        }
+
+        // --- Single-file gzip entries (.tar.gz/.tgz matched above) ---
+        // Compressed logs (`db-migrate.log.1.gz`) are decompressed before
+        // scanning and recompressed after. `--force-text` keeps the raw
+        // byte-scan behavior.
+        if !self.force_text {
+            if let Some(inner_name) = strip_gz_suffix(filename) {
+                return self.sanitize_gz_entry(
+                    filename,
+                    inner_name,
+                    reader,
+                    writer,
+                    stats,
+                    entry_size_hint,
+                    depth,
+                );
+            }
         }
 
         // --- Structured / scanner processing ---
@@ -735,6 +779,9 @@ impl ArchiveProcessor {
                     let extra: Vec<ScanPattern> = self
                         .store
                         .iter_since(pre_snapshot)
+                        .filter(|(_, original, _)| {
+                            original.len() >= crate::scanner::MIN_DISCOVERED_LITERAL_LEN
+                        })
                         .filter_map(|(category, original, _)| {
                             // Label by category, never the value (labels surface
                             // in report/findings/summary output — no secrets).
@@ -796,8 +843,19 @@ impl ArchiveProcessor {
         }
 
         // F-02 fix: stream directly from reader → scanner → writer
-        // without buffering the full output. We use a CountingWriter
-        // to track output bytes alongside the CountingReader for input.
+        // without buffering the full output.
+        self.scan_streaming(filename, reader, writer, stats)
+    }
+
+    /// Stream one entry through the scanner without buffering the full
+    /// output: reader → scanner → writer, with input/output byte counting.
+    fn scan_streaming(
+        &self,
+        filename: &str,
+        reader: &mut dyn Read,
+        writer: &mut dyn Write,
+        stats: &mut ArchiveStats,
+    ) -> Result<()> {
         let mut counting_r = CountingReader::new(reader);
         let mut counting_w = CountingWriter::new(writer);
         let scan_stats = self.scanner.scan_reader(&mut counting_r, &mut counting_w)?;
@@ -812,6 +870,96 @@ impl ArchiveProcessor {
             .file_scan_stats
             .insert(filename.to_string(), scan_stats);
 
+        Ok(())
+    }
+
+    /// Sanitize a single-file gzip entry (`app.log.1.gz` — not `.tar.gz`,
+    /// which the nested-archive path handles): decompress, sanitize the inner
+    /// content under its real name so profiles and nested-archive detection
+    /// still apply, and recompress.
+    ///
+    /// Running the byte-level scanner over compressed data — the previous
+    /// behavior, kept for `--force-text` — can never match real plaintext but
+    /// *can* false-positive on short literal patterns, corrupting the gzip
+    /// stream. Entries that are too large to buffer or do not decode as gzip
+    /// fall back to the raw streaming scanner: a broken stream must not leak
+    /// plaintext hiding behind a gzip magic prefix.
+    #[allow(clippy::too_many_arguments)]
+    fn sanitize_gz_entry(
+        &self,
+        filename: &str,
+        inner_name: &str,
+        reader: &mut dyn Read,
+        writer: &mut dyn Write,
+        stats: &mut ArchiveStats,
+        entry_size_hint: Option<u64>,
+        depth: u32,
+    ) -> Result<()> {
+        // Buffer the compressed bytes ourselves (not via read_bounded) so the
+        // raw content is still available for the streaming fallback when the
+        // entry is oversized or not actually gzip.
+        let mut compressed = Vec::new();
+        let oversized_hint = entry_size_hint.is_some_and(|sz| sz > STRUCTURED_ENTRY_SIZE);
+        if !oversized_hint {
+            reader
+                .take(STRUCTURED_ENTRY_SIZE + 1)
+                .read_to_end(&mut compressed)
+                .map_err(|e| {
+                    SanitizeError::ArchiveError(format!("read entry '{filename}': {e}"))
+                })?;
+        }
+        if oversized_hint || compressed.len() as u64 > STRUCTURED_ENTRY_SIZE {
+            let mut chained = io::Cursor::new(compressed).chain(reader);
+            return self.scan_streaming(filename, &mut chained, writer, stats);
+        }
+
+        // Bounded decode guards against decompression bombs; a decode failure
+        // (bad magic, truncated stream, over-cap expansion) takes the raw
+        // scanner fallback.
+        let decoded = if compressed.starts_with(GZIP_MAGIC) {
+            let mut dec = flate2::read::GzDecoder::new(&compressed[..]);
+            read_bounded(&mut dec, STRUCTURED_ENTRY_SIZE, filename).ok()
+        } else {
+            None
+        };
+        let Some(decoded) = decoded else {
+            return self.scan_streaming(filename, &mut &compressed[..], writer, stats);
+        };
+
+        if depth >= self.max_depth {
+            return Err(SanitizeError::RecursionDepthExceeded(format!(
+                "compressed entry '{}' at depth {} exceeds maximum nesting depth of {}",
+                filename, depth, self.max_depth,
+            )));
+        }
+
+        stats.total_input_bytes += compressed.len() as u64;
+
+        let mut enc = flate2::write::GzEncoder::new(&mut *writer, flate2::Compression::fast());
+        let inner_len = decoded.len() as u64;
+        self.sanitize_entry(
+            inner_name,
+            &mut &decoded[..],
+            &mut enc,
+            stats,
+            Some(inner_len),
+            depth + 1,
+        )?;
+        enc.finish().map_err(|e| {
+            SanitizeError::ArchiveError(format!("recompress entry '{filename}': {e}"))
+        })?;
+
+        // Re-key the inner file's records under the on-archive entry name.
+        let inner_method = stats
+            .file_methods
+            .remove(inner_name)
+            .unwrap_or_else(|| "scanner".to_string());
+        stats
+            .file_methods
+            .insert(filename.to_string(), format!("gzip:{inner_method}"));
+        if let Some(ss) = stats.file_scan_stats.remove(inner_name) {
+            stats.file_scan_stats.insert(filename.to_string(), ss);
+        }
         Ok(())
     }
 
@@ -893,6 +1041,9 @@ impl ArchiveProcessor {
                 output_buf = writer.into_inner();
                 s
             }
+            ArchiveFormat::Gz => unreachable!(
+                "single-file gzip entries are routed to sanitize_gz_entry by sanitize_entry"
+            ),
         };
 
         stats.nested_archives += 1;
@@ -902,6 +1053,7 @@ impl ArchiveProcessor {
             ArchiveFormat::Tar => "tar",
             ArchiveFormat::TarGz => "tar.gz",
             ArchiveFormat::Zip => "zip",
+            ArchiveFormat::Gz => "gz",
         };
         stats
             .file_methods
@@ -1014,6 +1166,86 @@ impl ArchiveProcessor {
             }
         }
         Ok(())
+    }
+
+    /// Run the structured processor on a profile-matched standalone `.gz`
+    /// file's decompressed content, recording replacements into the store.
+    /// Output is discarded; the file is not modified.
+    ///
+    /// `name` should be the file's base name — the inner name derived from it
+    /// (`config.json.gz` → `config.json`) drives profile matching exactly like
+    /// a `.gz` entry inside an archive. Content that does not decode as gzip
+    /// is skipped; the processing pass takes the raw-scanner fallback for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read.
+    pub fn discover_profiles_gz<R: Read>(&self, name: &str, reader: R) -> Result<()> {
+        if self.profiles.is_empty() {
+            return Ok(());
+        }
+        let Some(inner_name) = strip_gz_suffix(name) else {
+            return Ok(());
+        };
+        let Some(profile) = self.find_profile(inner_name) else {
+            return Ok(());
+        };
+        let mut dec = flate2::read::GzDecoder::new(reader);
+        let content = match read_bounded(&mut dec, STRUCTURED_ENTRY_SIZE, name) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(name = %name, error = %e, "discovery: skipping undecodable or oversized gzip file");
+                return Ok(());
+            }
+        };
+        if let Err(e) = self.registry.process(&content, profile, &self.store) {
+            tracing::warn!(name = %name, error = %e, "discovery: structured processor failed; partial mappings may persist");
+        }
+        Ok(())
+    }
+
+    // Standalone single-file gzip processing
+    // -----------------------------------------------------------------------
+
+    /// Process a standalone single-file gzip stream (`config.json.gz` — not
+    /// `.tar.gz`, which [`Self::process_tar_gz`] handles), giving it the same
+    /// treatment `.gz` entries inside archives receive: decompress (bounded,
+    /// magic-checked), sanitize under the inner name so structured processors
+    /// and profiles apply, and recompress. Content that is not valid gzip
+    /// takes the raw streaming-scanner fallback; with `force_text` the raw
+    /// byte scanner runs over the compressed stream unchanged.
+    ///
+    /// `name` should be the file's base name — it determines the inner name
+    /// (`config.json.gz` → `config.json`) used for format detection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SanitizeError::ArchiveError`] on I/O failures.
+    pub fn process_gz<R: Read, W: Write>(
+        &self,
+        name: &str,
+        mut reader: R,
+        mut writer: W,
+    ) -> Result<ArchiveStats> {
+        let mut stats = ArchiveStats::default();
+        match strip_gz_suffix(name) {
+            Some(inner_name) if !self.force_text => {
+                self.sanitize_gz_entry(
+                    name,
+                    inner_name,
+                    &mut reader,
+                    &mut writer,
+                    &mut stats,
+                    None,
+                    0,
+                )?;
+            }
+            _ => {
+                self.scan_streaming(name, &mut reader, &mut writer, &mut stats)?;
+            }
+        }
+        stats.files_processed += 1;
+        Ok(stats)
     }
 
     // Tar processing
@@ -1602,6 +1834,10 @@ impl ArchiveProcessor {
             ArchiveFormat::Zip => self.process_zip(reader, writer),
             ArchiveFormat::Tar => self.process_tar(reader, writer),
             ArchiveFormat::TarGz => self.process_tar_gz(reader, writer),
+            // No file name is available here, so the inner name cannot drive
+            // structured-format detection — prefer `process_gz` with the real
+            // file name for standalone gzip inputs.
+            ArchiveFormat::Gz => self.process_gz("input.gz", reader, writer),
         }
     }
 }
@@ -1888,6 +2124,201 @@ mod tests {
         }
     }
 
+    // -- Single-file gzip entries --------------------------------------------
+
+    fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn read_tar_entry(output: &[u8], name: &str) -> Vec<u8> {
+        let mut archive = tar::Archive::new(output);
+        for entry in archive.entries().unwrap() {
+            let mut e = entry.unwrap();
+            if e.path().unwrap().to_string_lossy() == name {
+                let mut buf = Vec::new();
+                e.read_to_end(&mut buf).unwrap();
+                return buf;
+            }
+        }
+        panic!("entry '{name}' not found in output tar");
+    }
+
+    #[test]
+    fn gz_entry_is_decompressed_scanned_and_recompressed() {
+        // Regression (GitLab SOS eval): a rotated log like
+        // `db-migrate.log.1.gz` must be sanitized as its decompressed content
+        // and remain valid gzip afterwards — byte-level scanning of the
+        // compressed stream corrupts it and can never match real plaintext.
+        let proc = make_archive_processor();
+        let inner = b"job start\ntoken=SUPERSECRET\njob end\n";
+        let input = build_test_tar(&[("logs/db-migrate.log.1.gz", &gzip_bytes(inner)[..])]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&input[..], &mut output).unwrap();
+
+        let entry = read_tar_entry(&output, "logs/db-migrate.log.1.gz");
+        let mut dec = flate2::read::GzDecoder::new(&entry[..]);
+        let mut text = String::new();
+        dec.read_to_string(&mut text)
+            .expect("output entry must still be valid gzip");
+        assert!(
+            !text.contains("SUPERSECRET"),
+            "secret must be redacted inside the gzip: {text}"
+        );
+        assert!(
+            text.contains("job start") && text.contains("job end"),
+            "surrounding context preserved: {text}"
+        );
+        assert_eq!(
+            stats.file_methods.get("logs/db-migrate.log.1.gz").unwrap(),
+            "gzip:scanner"
+        );
+    }
+
+    #[test]
+    fn gz_entry_with_structured_inner_name_uses_processor() {
+        // `config.json.gz` must get the same structured treatment as
+        // `config.json`: the profile matches on the decompressed inner name.
+        let proc = make_archive_processor();
+        let inner = br#"{"email": "bob@example.org"}"#;
+        let input = build_test_tar(&[("config.json.gz", &gzip_bytes(inner)[..])]);
+
+        let mut output = Vec::new();
+        let stats = proc.process_tar(&input[..], &mut output).unwrap();
+
+        let entry = read_tar_entry(&output, "config.json.gz");
+        let mut dec = flate2::read::GzDecoder::new(&entry[..]);
+        let mut text = String::new();
+        dec.read_to_string(&mut text).unwrap();
+        assert!(!text.contains("bob@example.org"), "field redacted: {text}");
+        assert_eq!(
+            stats.file_methods.get("config.json.gz").unwrap(),
+            "gzip:structured+scan:json"
+        );
+    }
+
+    #[test]
+    fn gz_named_entry_that_is_not_gzip_falls_back_to_scanner() {
+        // Plaintext (or a corrupt stream) behind a .gz name must still be
+        // scanned, never passed through unexamined.
+        let proc = make_archive_processor();
+        let input = build_test_tar(&[("fake.log.gz", b"call alice@corp.com now" as &[u8])]);
+
+        let mut output = Vec::new();
+        proc.process_tar(&input[..], &mut output).unwrap();
+
+        let entry = read_tar_entry(&output, "fake.log.gz");
+        let text = String::from_utf8_lossy(&entry);
+        assert!(
+            !text.contains("alice@corp.com"),
+            "fallback scan must redact the raw bytes: {text}"
+        );
+    }
+
+    #[test]
+    fn standalone_gz_file_gets_structured_treatment() {
+        // A `config.json.gz` passed directly as an input must get the same
+        // treatment as a `.gz` entry inside an archive: decompress, sanitize
+        // under the inner name (structured JSON here), recompress.
+        let proc = make_archive_processor();
+        let inner = br#"{"email": "bob@example.org"}"#;
+        let input = gzip_bytes(inner);
+
+        let mut output = Vec::new();
+        let stats = proc
+            .process_gz("config.json.gz", &input[..], &mut output)
+            .unwrap();
+
+        let mut dec = flate2::read::GzDecoder::new(&output[..]);
+        let mut text = String::new();
+        dec.read_to_string(&mut text)
+            .expect("output must still be valid gzip");
+        assert!(!text.contains("bob@example.org"), "field redacted: {text}");
+        assert_eq!(
+            stats.file_methods.get("config.json.gz").unwrap(),
+            "gzip:structured+scan:json"
+        );
+        assert_eq!(stats.files_processed, 1);
+    }
+
+    #[test]
+    fn standalone_gz_that_is_not_gzip_falls_back_to_scanner() {
+        // Plaintext behind a top-level .gz name must still be scanned raw,
+        // never passed through unexamined.
+        let proc = make_archive_processor();
+        let mut output = Vec::new();
+        proc.process_gz(
+            "fake.log.gz",
+            b"call alice@corp.com now" as &[u8],
+            &mut output,
+        )
+        .unwrap();
+
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            !text.contains("alice@corp.com"),
+            "fallback scan must redact the raw bytes: {text}"
+        );
+    }
+
+    #[test]
+    fn standalone_gz_force_text_scans_compressed_bytes() {
+        // --force-text keeps the old behavior: the raw byte scanner runs over
+        // the compressed stream. With no matching patterns the output is the
+        // input, byte for byte.
+        let proc = make_archive_processor().with_force_text(true);
+        let input = gzip_bytes(b"nothing sensitive here");
+
+        let mut output = Vec::new();
+        proc.process_gz("data.txt.gz", &input[..], &mut output)
+            .unwrap();
+        assert_eq!(output, input, "force-text must not touch the gzip stream");
+    }
+
+    #[test]
+    fn archive_format_detects_standalone_gz() {
+        assert_eq!(
+            ArchiveFormat::from_path("x.log.gz"),
+            Some(ArchiveFormat::Gz)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path("x.tar.gz"),
+            Some(ArchiveFormat::TarGz)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path("x.tgz"),
+            Some(ArchiveFormat::TarGz)
+        );
+        assert_eq!(ArchiveFormat::from_path(".gz"), None);
+        assert_eq!(ArchiveFormat::from_path("plain.txt"), None);
+    }
+
+    #[test]
+    fn short_discovered_values_are_not_propagated_as_literals() {
+        // Regression (GitLab SOS eval): a structured field holding a trivial
+        // value ("ok", "2", "/") must not become a scan literal — as one it
+        // rewrites every occurrence of those bytes in the entry, mangling
+        // keys, digits, and timestamps.
+        let proc = make_archive_processor();
+        let json = br#"{"note": "ok", "tokens": "many-values-here"}"#;
+        let input = build_test_tar(&[("config.json", json as &[u8])]);
+
+        let mut output = Vec::new();
+        proc.process_tar(&input[..], &mut output).unwrap();
+
+        let text = String::from_utf8_lossy(&output).to_string();
+        assert!(
+            text.contains(r#""tokens""#),
+            "the 'tokens' key must not be mangled by an 'ok' literal: {text}"
+        );
+        assert!(
+            !text.contains("many-values-here"),
+            "the long field value is still redacted: {text}"
+        );
+    }
+
     /// Regression: structured entries inside archives must preserve comments,
     /// key order, and whitespace (byte-level), redacting only field values —
     /// not re-serialize the parsed tree. Uses a scanner with NO pre-loaded
@@ -2026,7 +2457,7 @@ mod tests {
         // Regression: GitLab SOS bundles nest files under a >100-byte
         // top-level directory; Header::set_path fails on such names.
         let long_dir = format!(
-            "gitlabsos.sr-env-01b6d583-omnibus_20260626-144506_{}",
+            "gitlabsos.sr-env-0a1b2c3d-omnibus_20260101-000000_{}",
             "gitaly-nginx-prometheus-psql-puma-redis-sidekiq"
         );
         let long_path = format!("{long_dir}/mpstat");
