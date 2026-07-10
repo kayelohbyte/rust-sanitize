@@ -31,7 +31,8 @@ pub enum Category {
     IpV6,
     /// MAC addresses → preserve `:` or `-` separators, replace hex digits
     MacAddress,
-    /// Hostname / FQDN → preserve domain suffix, hex prefix
+    /// Hostname / FQDN → preserve at most the final two domain labels, hex
+    /// prefix; IP-shaped values keep their canonical IP formatting instead
     Hostname,
     /// Docker / container hex IDs → replace hex digits
     ContainerId,
