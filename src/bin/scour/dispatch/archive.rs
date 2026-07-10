@@ -1,6 +1,15 @@
-//! Archive (zip / tar / tar.gz) dispatch for `FileProcessor`.
+//! Archive (zip / tar / tar.gz / standalone gz) dispatch for `FileProcessor`.
 
 use super::*;
+
+/// Base name for a standalone `.gz` input — it drives the inner-name
+/// derivation (`config.json.gz` → `config.json`) in [`ArchiveProcessor::process_gz`].
+fn gz_file_name(input: &Path) -> String {
+    input
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "input.gz".to_string())
+}
 
 impl FileProcessor<'_> {
     /// Process an archive file. Returns `true` if entries were processed.
@@ -104,6 +113,15 @@ impl FileProcessor<'_> {
                             .process_zip(&mut reader, &mut null_out)
                             .map_err(|e| format!("archive error: {e}"))?
                     }
+                    ArchiveFormat::Gz => {
+                        let reader = BufReader::new(
+                            fs::File::open(input)
+                                .map_err(|e| format!("failed to open archive: {e}"))?,
+                        );
+                        archive_proc
+                            .process_gz(&gz_file_name(input), reader, io::sink())
+                            .map_err(|e| format!("archive error: {e}"))?
+                    }
                     other => {
                         return Err(format!("unsupported archive format: {other:?}"));
                     }
@@ -167,6 +185,23 @@ impl FileProcessor<'_> {
                         .map_err(|e| format!("failed to create output: {e}"))?;
                     let stats = archive_proc
                         .process_zip(&mut reader, &mut atomic_writer)
+                        .map_err(|e| format!("archive processing error: {e}"))?;
+                    if crate::is_interrupted() {
+                        return Err("interrupted — partial output discarded".into());
+                    }
+                    atomic_writer
+                        .finish()
+                        .map_err(|e| format!("failed to finalize output: {e}"))?;
+                    stats
+                }
+                ArchiveFormat::Gz => {
+                    let reader = BufReader::new(
+                        fs::File::open(input).map_err(|e| format!("failed to open input: {e}"))?,
+                    );
+                    let mut atomic_writer = AtomicFileWriter::new(output_path)
+                        .map_err(|e| format!("failed to create output: {e}"))?;
+                    let stats = archive_proc
+                        .process_gz(&gz_file_name(input), reader, &mut atomic_writer)
                         .map_err(|e| format!("archive processing error: {e}"))?;
                     if crate::is_interrupted() {
                         return Err("interrupted — partial output discarded".into());
