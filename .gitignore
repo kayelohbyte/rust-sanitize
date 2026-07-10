@@ -41,3 +41,6 @@ deno.lock
 /fuzz/target/
 /fuzz/corpus/
 /fuzz/artifacts/
+
+# Local support-bundle test inputs/outputs (filenames can carry real hostnames)
+gitlabsos*.tar.gz

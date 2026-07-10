@@ -69,7 +69,7 @@ All public types are re-exported from the crate root (`scour_secrets::*`) for co
 |-----------------|-------------|
 | `Processor` | Trait: `fn name()`, `fn can_handle(content, profile)`, `fn process(content, profile, store)`. Must be `Send + Sync`. Optionally implement `process_to_edits(content, profile, store) -> Option<Vec<Replacement>>` for span-based, byte-exact format-preserving editing (the path the CLI prefers; falls back to `process` when unavailable), and/or `supports_streaming() -> bool` + `process_stream(reader, writer, profile, store)` for bounded-memory incremental processing. |
 | `Replacement` | A byte-range edit on the original source (`start`, `end`, `value`) produced by `Processor::process_to_edits`. Applied non-overlapping to splice sanitized tokens in place, leaving surrounding bytes — quotes, comments, whitespace, escaping — byte-for-byte untouched. |
-| `ProcessorRegistry` | Maps processor names to `Arc<dyn Processor>`. `ProcessorRegistry::with_builtins()` pre-loads all eleven built-in processors: `key_value`, `json`, `jsonl`, `yaml`, `xml`, `csv`, `toml`, `env`, `ini`, `log`, `command_output`. |
+| `ProcessorRegistry` | Maps processor names to `Arc<dyn Processor>`. `ProcessorRegistry::with_builtins()` pre-loads all twelve built-in processors: `key_value`, `json`, `jsonl`, `yaml`, `xml`, `csv`, `toml`, `env`, `ini`, `log`, `command_output`, `columns`. |
 | `FileTypeProfile` | Associates a processor name, file extensions, include/exclude globs, field rules, and free-form options. |
 | `FieldRule` | Specifies a single field to sanitize. Fields: `pattern` (required), `category` (default `custom:field`), `label` (optional), `min_length` (optional — values shorter than this are passed through unchanged, useful with broad glob patterns like `*token*` to skip short non-secret values such as `"false"` or `"0"`), `sub_processor` (optional — name of processor to use when the field's value is an embedded structured document), `sub_fields` (optional — field rules applied by `sub_processor`). |
 
@@ -77,7 +77,7 @@ All public types are re-exported from the crate root (`scour_secrets::*`) for co
 
 | Type / Function | Description |
 |-----------------|-------------|
-| `ArchiveProcessor` | Processes `.tar`, `.tar.gz`, and `.zip` archives entry-by-entry. Routes entries to structured processors or the streaming scanner. Recursively processes nested archives up to a configurable depth. |
+| `ArchiveProcessor` | Processes `.tar`, `.tar.gz`, `.zip`, and standalone single-file `.gz` inputs entry-by-entry. Routes entries to structured processors or the streaming scanner. Recursively processes nested archives up to a configurable depth. |
 | `ArchiveProcessor::new(registry, scanner, store, profiles)` | Create from a `ProcessorRegistry`, `StreamScanner`, `MappingStore`, and file-type profiles. |
 | `ArchiveProcessor::with_max_depth(depth)` | Builder method: set the maximum nesting depth for recursive archive processing (clamped to `MAX_ALLOWED_ARCHIVE_DEPTH`). |
 | `ArchiveProcessor::with_parallel_threshold(threshold)` | Builder method: set the minimum file-entry count required to enable parallel entry sanitization. Default: `4`. Set to `usize::MAX` to disable entry-level parallelism (e.g. when outer file-level parallelism already saturates the thread budget). |
@@ -161,7 +161,7 @@ When `--extract-context` is used, each file entry in the report's `files` array 
   "replacements": 3,
   "bytes_processed": 10240,
   "bytes_output": 10240,
-  "pattern_counts": { "kael_email": 2, "api_key": 1 },
+  "pattern_counts": { "jdoe_email": 2, "api_key": 1 },
   "method": "scanner",
   "log_context": {
     "total_lines": 1500,

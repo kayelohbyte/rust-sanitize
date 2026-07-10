@@ -333,6 +333,9 @@
 
 # --- Sidekiq JSON log ---
 # "args" is scrubbed entirely — job arguments can contain arbitrary secrets.
+# min_length keeps trivial args (single digits, "default", queue names) out
+# of the store: as discovered literals they rewrite unrelated digits and
+# words across the whole bundle. Real credentials are ≥8 chars.
 # GitLabSOS stores this log as the extensionless runit file
 # var/log/gitlab/sidekiq/current ('""' passes any name; the include list
 # gates). kubeSOS stores it as sidekiq_<container>.log.
@@ -348,6 +351,7 @@
     - pattern: "args"
       category: auth_token
       label: sidekiq_log_args
+      min_length: 8
     - pattern: "meta.user"
       category: name
       label: sidekiq_log_meta_user
@@ -381,6 +385,8 @@
     - pattern: "uri"
       category: url
       label: workhorse_log_uri
+      # keep "/" health-check probes as-is
+      min_length: 2
 
 # --- Gitaly log ---
 # grpc.request.glProjectPath contains the group/project path.
@@ -423,6 +429,42 @@
     - pattern: "original_command"
       category: name
       label: shell_log_original_command
+
+# --- OS-level captures (GitLabSOS top-level files) ---
+# gitlabsos copies bare command outputs (hostname, uname, sysctl_a, ps,
+# top_cpu, top_res, dmesg, syslog, …). kernel.hostname seeds the short-form
+# hostname into the store, so the phase-2 scanner scrubs it from every file
+# that carries it bare (hostname, uname, dmesg, syslog, mail.log,
+# gitlab_system_status, gitlabsos.log, prometheus). kernel.domainname covers
+# NIS domains — its idle value "(none)" is allowlisted in secrets.yaml.
+- processor: key-value
+  extensions: [""]
+  include: ["sysctl_a", "*/sysctl_a"]
+  options:
+    delimiter: "="
+  fields:
+    - pattern: "kernel.hostname"
+      category: hostname
+      label: os_kernel_hostname
+      min_length: 2
+    - pattern: "kernel.domainname"
+      category: hostname
+      label: os_kernel_domainname
+      min_length: 2
+
+# --- Process listings (ps, top_cpu, top_res) ---
+# The USER column carries OS usernames; the discovered names propagate to
+# bare occurrences elsewhere (syslog "sshd: <user>", mail.log). min_length 4
+# skips service stubs ("git", "-") and top-preamble tokens; allowlisted
+# accounts (root, nobody, …) pass through via the store's allowlist.
+- processor: columns
+  extensions: [""]
+  include: ["ps", "*/ps", "top_cpu", "*/top_cpu", "top_res", "*/top_res"]
+  fields:
+    - pattern: "USER"
+      category: name
+      label: os_ps_user
+      min_length: 4
 
 # --- kubectl describe dumps (kubeSOS: describe_pods, describe_deployments, …) ---
 # `kubectl describe` prints literal values for plain (non-secretRef) env vars

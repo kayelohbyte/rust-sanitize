@@ -39,6 +39,7 @@
 
 #[cfg(feature = "archive")]
 pub mod archive;
+pub mod columns;
 pub mod command_output;
 #[cfg(feature = "structured")]
 pub mod csv_proc;

@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-10
+
+### Fixed
+
+- **Trivial discovered values no longer corrupt the scanner pass.** The
+  phase-1→phase-2 handoff applied *every* store entry as a global scan
+  literal, so a structured field holding `"2"`, `"/"`, or `"default"` (e.g.
+  Sidekiq job args) rewrote unrelated timestamps, paths, and protocol strings
+  across the whole run. The `MIN_DISCOVERED_LITERAL_LEN` (≥4) gate that
+  already guarded the secrets-file write-back now also applies to the
+  augmented scanner and the archive per-entry literal delta, and is exported
+  from the library.
+- **Single-file gzip archive entries (`*.log.1.gz`) are decompressed,
+  sanitized under their inner name, and recompressed.** Previously they fell
+  through to the byte-level scanner over compressed data, which corrupted the
+  gzip stream on any literal match and could never catch real plaintext.
+  Entries that are not valid gzip still take the raw scanner fallback;
+  `--force-text` keeps the old behavior.
+- **Standalone `.gz` inputs get the same treatment.** A `config.json.gz`
+  passed directly on the command line (or via the MCP `files` param) was
+  skipped as a binary file; it is now decompressed, sanitized under its inner
+  name (structured processors and profiles apply), recompressed, and written
+  as `config.json.sanitized.gz`. New `ArchiveFormat::Gz` variant with
+  `ArchiveProcessor::process_gz` / `discover_profiles_gz`; profile discovery
+  (phase 1) also runs on standalone `.gz` inputs.
+- **Hostname replacements keep at most the final two domain labels** (e.g.
+  `env-x.gcp.tenant.net` → `<hex>.tenant.net`) instead of everything after
+  the first dot. IP-shaped values in hostname-categorized fields — including
+  `host:port` forms like `203.0.113.121:80` — route to the canonical IP
+  formatters instead of leaking three of four octets, and a dotted value
+  ending in an all-numeric label (a partial or mangled IP; real TLDs are
+  alphabetic) is replaced entirely rather than keeping its tail.
+- **The structured-handoff write-back preserves YAML comments**: existing
+  secrets-file bytes are kept verbatim and new discovered entries are
+  appended, instead of re-serializing (and stripping every comment from) the
+  whole document. JSON/TOML and encrypted files re-serialize as before.
+- **The run header no longer claims "built-in patterns only" when `--app` is
+  active** without a secrets file (multi-app mode, `--no-structured-handoff`).
+- **Upstream redaction masks pass through unrecorded.** A matched value that
+  is already a mask — three or more repetitions of `*`, `•`, or `#`, as in
+  GitLab's `password: ******` log lines — is no longer replaced with a
+  realistic-looking token (which made upstream masking read as a leaked
+  secret) and no longer persisted to the secrets file, where it would have
+  rewritten every future mask as a fake credential.
+
+### Added
+
+- **`columns` processor** for whitespace-aligned, fixed-header command output
+  (`ps aux`, `top -b`): field rules match header column names and replace the
+  matching column in each data row, with span-edit support.
+- **The gitlab app covers OS-level GitLabSOS files**: `sysctl_a`
+  (`kernel.hostname` / `kernel.domainname`) seeds the short-form hostname so
+  it is scrubbed from `hostname`, `uname`, `dmesg`, `syslog`, and the other
+  files that carry it bare; `ps` / `top_cpu` / `top_res` USER columns are
+  sanitized via the new `columns` processor. Sidekiq `args` gained
+  `min_length: 8`, the workhorse `uri` rule keeps bare `/` health checks, and
+  the allowlist now covers GitLab's own redaction markers (`[FILTERED]`,
+  `[REDACTED]`, `REDACTED*`) plus ambient values (`root`, `git`, `default`,
+  `nobody`, `(none)`) that must never propagate as literals.
+
+### Changed
+
+- **MCP: structured handoff now follows CLI defaults.** The server no longer
+  forces `--no-structured-handoff` on every `sanitize` call — discovered
+  literals persist into the write-back target when one exists (`secrets_file`,
+  `namespace`, or a single `app`), exactly as the CLI does. A new
+  `no_structured_handoff` parameter suppresses the write-back per call, and a
+  `profile` without any write-back target auto-suppresses instead of erroring.
+  `scan` remains read-only and never writes back.
+- **MCP: sanitized archives and `llm_template` file outputs survive the
+  call.** In inline mode (no `output_file`/`output_dir`) archive outputs were
+  sanitized into the server's temp dir and deleted with it, and `llm_template`
+  prompts referenced those deleted paths. Both now default to writing next to
+  the input file, with the full path reported in the result.
+
+### Fixed (MCP test infrastructure)
+
+- **`mcp_client.ts` buffers partial stdout lines.** JSON-RPC responses larger
+  than one pipe chunk (~64 KB) were split mid-line, failed to parse, and were
+  silently dropped — the caller hung forever, indistinguishable from a server
+  hang. The test suite also now isolates every spawned server with a
+  throwaway `SCOUR_SECRETS_APPS_DIR` so app materialization and handoff
+  write-back never touch the developer's real `~/.config`.
+
 ## [0.18.0] - 2026-07-09
 
 ### Changed
@@ -1247,7 +1331,8 @@ contract and MSRV policy.
 - **290+ tests** including unit, integration, property-based (proptest), and
   4 fuzz targets.
 
-[Unreleased]: https://github.com/kayelohbyte/scour-secrets/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/kayelohbyte/scour-secrets/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/kayelohbyte/scour-secrets/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/kayelohbyte/scour-secrets/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/kayelohbyte/scour-secrets/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/kayelohbyte/scour-secrets/compare/v0.15.0...v0.16.0

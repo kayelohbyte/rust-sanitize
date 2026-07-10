@@ -818,6 +818,8 @@ Set `llm_template` to skip raw sanitized text and get a structured prompt ready 
 
 Returns a pre-structured incident-triage prompt with the sanitized content embedded. All built-in templates instruct the LLM to ask clarifying questions rather than guessing at redacted values.
 
+With `files` input the prompt references the sanitized files by path. They are written to `output_dir` when given, otherwise next to the first input file — so the referenced paths remain readable after the call returns.
+
 Use `"review-config"` for configuration review:
 
 ```json
@@ -864,7 +866,23 @@ Combine with `extract_context` to surface notable error and warning events insid
 }
 ```
 
-Archives are extracted, sanitized entry-by-entry, and re-packaged. Archive results carry `binary: true` and `size` instead of inline `content`.
+Archives are extracted, sanitized entry-by-entry, and re-packaged. Archive results carry `binary: true` and `size` instead of inline `content`, and the re-packaged archive is written next to its input (or into `output_dir` when given) with its full path reported in `output`.
+
+### Structured handoff (write-back of discovered literals)
+
+Like the CLI, `sanitize` persists literals discovered by the structured/profile pass back into the write-back target so later runs (and the streaming scanner pass) can find them elsewhere: the explicit `secrets_file`, the namespace's secrets file, or the materialized app copy when a single `app` is used. Set `no_structured_handoff: true` for a call that must not mutate any pattern file:
+
+```json
+{
+  "tool": "sanitize",
+  "files": ["server.log"],
+  "secrets_file": "patterns.yaml",
+  "profile": "fields.yaml",
+  "no_structured_handoff": true
+}
+```
+
+When a `profile` is supplied without any write-back target, handoff is suppressed automatically instead of failing the call — the profile pass still sanitizes structured fields, but discoveries are not persisted anywhere.
 
 ### App bundles
 

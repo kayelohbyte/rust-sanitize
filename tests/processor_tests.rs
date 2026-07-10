@@ -44,7 +44,7 @@ fn make_store() -> Arc<MappingStore> {
 #[test]
 fn registry_has_all_builtins() {
     let reg = ProcessorRegistry::with_builtins();
-    assert_eq!(reg.len(), 12); // 11 processors + key-value alias for key_value
+    assert_eq!(reg.len(), 13); // 12 processors + key-value alias for key_value
     assert!(reg.get("key_value").is_some());
     assert!(reg.get("key-value").is_some());
     assert!(reg.get("json").is_some());
@@ -57,6 +57,7 @@ fn registry_has_all_builtins() {
     assert!(reg.get("ini").is_some());
     assert!(reg.get("log").is_some());
     assert!(reg.get("command_output").is_some());
+    assert!(reg.get("columns").is_some());
 }
 
 #[test]
@@ -564,7 +565,7 @@ fn custom_processor_registration() {
     let mut reg = ProcessorRegistry::with_builtins();
     reg.register(Arc::new(DummyProcessor));
 
-    assert_eq!(reg.len(), 13); // 12 entries (11 processors + key-value alias) + dummy
+    assert_eq!(reg.len(), 14); // 13 entries (12 processors + key-value alias) + dummy
     assert!(reg.get("dummy").is_some());
 
     let profile = FileTypeProfile::new("dummy", vec![]);

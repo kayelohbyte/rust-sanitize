@@ -28,11 +28,20 @@ export class McpSession {
   constructor(child: Deno.ChildProcess) {
     this.child = child;
     this.writer = child.stdin.getWriter();
+    let pending = "";
     const lineStream = child.stdout
       .pipeThrough(new TextDecoderStream())
       .pipeThrough(new TransformStream<string, string>({
         transform(chunk, ctrl) {
-          for (const l of chunk.split("\n")) if (l.trim()) ctrl.enqueue(l.trim());
+          // Buffer partial lines: a JSON-RPC response larger than one pipe
+          // chunk arrives split, and each fragment would fail to parse.
+          pending += chunk;
+          const lines = pending.split("\n");
+          pending = lines.pop()!;
+          for (const l of lines) if (l.trim()) ctrl.enqueue(l.trim());
+        },
+        flush(ctrl) {
+          if (pending.trim()) ctrl.enqueue(pending.trim());
         },
       }));
     this.reader = lineStream.getReader();

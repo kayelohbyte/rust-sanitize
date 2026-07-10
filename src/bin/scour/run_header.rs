@@ -49,6 +49,12 @@ pub(crate) fn print_run_header(cli: &Cli, snap: &CliConfigSnapshot, json_logs: b
             let ann = if !snap.had_secrets { "  [config]" } else { "" };
             eprintln!("  secrets:  {}{}", p.display(), ann);
         }
+        // App bundles carry their own patterns even without a secrets file
+        // (multi-app mode, --no-structured-handoff); saying "built-in
+        // patterns only" here misreads as the app patterns not loading.
+        None if !cli.app.is_empty() => {
+            eprintln!("  secrets:  (no file — app + built-in patterns)");
+        }
         None => {
             eprintln!("  secrets:  (none — built-in patterns only)");
         }

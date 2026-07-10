@@ -228,7 +228,27 @@ pub(crate) fn format_replacement(
             format_hex_digits_lp(hash, original, target)
         }
         Category::Ssn => format_ssn_lp(hash, original, target),
-        Category::Hostname => format_hostname_lp(&hex, original, target),
+        // A hostname-categorized field sometimes holds an IP or `host:port`
+        // (e.g. a workhorse `host:` that resolves either way). The hostname
+        // formatter would keep everything after the first label — most of
+        // the octets — so IP-shaped values route to the canonical IP
+        // formatters instead, with any trailing `:port` kept verbatim.
+        Category::Hostname => {
+            let (host, port) = split_host_port(original);
+            let host_target = target.saturating_sub(port.len());
+            let replaced = if host.parse::<std::net::Ipv4Addr>().is_ok() {
+                format_ipv4_lp(hash, host, host_target)
+            } else if host.parse::<std::net::Ipv6Addr>().is_ok() {
+                format_hex_digits_lp(hash, host, host_target)
+            } else {
+                format_hostname_lp(&hex, host, host_target)
+            };
+            if port.is_empty() {
+                replaced
+            } else {
+                format!("{replaced}{port}")
+            }
+        }
         Category::Jwt => format_jwt_lp(hash, original, target),
         Category::FilePath => format_filepath_lp(&hex, original, target, randomized),
         Category::WindowsSid => format_windows_sid_lp(hash, original, target),
@@ -295,8 +315,17 @@ fn randomized_target(category: &Category, hash: &[u8; 32], original: &str) -> Op
             let domain = original.rfind('@').map_or("x.co", |p| &original[p + 1..]);
             Some(band_pick(hash, 0, EMAIL_USER_BAND.0, EMAIL_USER_BAND.1) + 1 + domain.len())
         }
+        // IP-shaped hostname values (optionally `:port`) keep their canonical IP shape.
+        Category::Hostname
+            if split_host_port(original)
+                .0
+                .parse::<std::net::IpAddr>()
+                .is_ok() =>
+        {
+            None
+        }
         Category::Hostname => {
-            let suffix = original.find('.').map_or("", |p| &original[p..]);
+            let suffix = hostname_kept_suffix(original);
             Some(band_pick(hash, 0, HOSTNAME_PREFIX_BAND.0, HOSTNAME_PREFIX_BAND.1) + suffix.len())
         }
         // Variable-segment categories synthesize per-segment lengths in their own
@@ -536,11 +565,47 @@ fn format_ssn_lp(hash: &[u8; 32], original: &str, target: usize) -> String {
     buf
 }
 
+/// Split a trailing `:<digits>` port from a hostname-categorized value
+/// (`"203.0.113.121:80"` → `("203.0.113.121", ":80")`). Ports are structural
+/// and non-identifying, and left attached they defeat the IP-shape detection.
+fn split_host_port(original: &str) -> (&str, &str) {
+    if let Some(colon) = original.rfind(':') {
+        let port = &original[colon + 1..];
+        if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            return (&original[..colon], &original[colon..]);
+        }
+    }
+    (original, "")
+}
+
+/// The verbatim-kept tail of a hostname replacement: at most the final two
+/// labels (`env-0a1b2c3d.gcp.vendorsandbox.net` → `.vendorsandbox.net`).
+/// Intermediate labels are often themselves identifying (a tenant,
+/// environment, or region), so only the "org + TLD" tail survives. Two-label
+/// names keep just the final label; single-label names keep nothing.
+///
+/// A tail whose final label is all-numeric is never kept: real TLDs are
+/// alphabetic, so a numeric tail is a mangled or partial IP (`c3.0.113.121`)
+/// and keeping it would leak octets.
+fn hostname_kept_suffix(original: &str) -> &str {
+    let Some(last_dot) = original.rfind('.') else {
+        return "";
+    };
+    let last_label = &original[last_dot + 1..];
+    if !last_label.is_empty() && last_label.bytes().all(|b| b.is_ascii_digit()) {
+        return "";
+    }
+    match original[..last_dot].rfind('.') {
+        Some(prev_dot) => &original[prev_dot..],
+        None => &original[last_dot..],
+    }
+}
+
 /// Length-preserving hostname replacement.
-/// Preserves the suffix (everything from the first `.` onward) and
-/// fills the prefix with deterministic hex characters to match `target`.
+/// Preserves the kept tail (see [`hostname_kept_suffix`]) and fills the
+/// replaced portion with deterministic hex characters to match `target`.
 fn format_hostname_lp(hex: &[u8; 64], original: &str, target: usize) -> String {
-    let suffix = original.find('.').map_or("", |p| &original[p..]);
+    let suffix = hostname_kept_suffix(original);
     let prefix_len = target.saturating_sub(suffix.len());
     if prefix_len == 0 {
         return pad_or_truncate("", target, hex);
@@ -992,6 +1057,94 @@ mod tests {
         let out = gen.generate(&Category::Hostname, orig);
         assert!(out.ends_with(".internal"), "hostname must preserve suffix");
         assert_eq!(out.len(), orig.len(), "hostname must preserve length");
+    }
+
+    #[test]
+    fn hostname_keeps_at_most_the_final_two_labels() {
+        // Regression (GitLab SOS eval): keeping everything after the first
+        // dot left `gcp.vendorsandbox.net` — the identifying part — intact.
+        let gen = HmacGenerator::new([5u8; 32]);
+        let orig = "env-0a1b2c3d.gcp.vendorsandbox.net";
+        let out = gen.generate(&Category::Hostname, orig);
+        assert!(
+            out.ends_with(".vendorsandbox.net"),
+            "org+TLD tail preserved: {out}"
+        );
+        assert!(
+            !out.contains("env-0a1b2c3d") && !out.contains(".gcp."),
+            "leading and intermediate labels replaced: {out}"
+        );
+        assert_eq!(out.len(), orig.len(), "hostname must preserve length");
+    }
+
+    #[test]
+    fn hostname_categorized_ip_replaces_every_octet() {
+        // Regression (GitLab SOS eval): a hostname-categorized field holding
+        // an IP must not go through the hostname formatter, which kept three
+        // of four octets (`203.0.113.121` → `5e.0.113.121`).
+        let gen = HmacGenerator::new([5u8; 32]);
+        let orig = "203.0.113.121";
+        let out = gen.generate(&Category::Hostname, orig);
+        assert!(
+            !out.ends_with(".0.113.121"),
+            "trailing octets must not pass through verbatim: {out}"
+        );
+        for (i, p) in out.split('.').enumerate() {
+            assert!(p.parse::<u8>().is_ok(), "octet {p} out of range in {out}");
+            assert_ne!(
+                p,
+                orig.split('.').nth(i).unwrap(),
+                "octet {i} survived: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostname_categorized_ip_with_port_keeps_only_the_port() {
+        // Real workhorse logs carry `host: "203.0.113.121:80"` — the port
+        // must not defeat the IP-shape detection and let octets through.
+        let gen = HmacGenerator::new([5u8; 32]);
+        let out = gen.generate(&Category::Hostname, "203.0.113.121:80");
+        assert!(out.ends_with(":80"), "port kept verbatim: {out}");
+        assert!(
+            !out.contains(".74.121"),
+            "no original octets may survive: {out}"
+        );
+        let host = out.strip_suffix(":80").unwrap();
+        for p in host.split('.') {
+            assert!(p.parse::<u8>().is_ok(), "octet {p} out of range in {out}");
+        }
+    }
+
+    #[test]
+    fn hostname_with_numeric_tail_keeps_nothing() {
+        // A dotted value that is not a valid IP but ends in numeric labels
+        // (a mangled or partial IP like `c3.0.113.121`) must be replaced
+        // entirely — numeric labels are never a real domain tail.
+        let gen = HmacGenerator::new([5u8; 32]);
+        let out = gen.generate(&Category::Hostname, "c3.0.113.121:80");
+        assert!(
+            !out.contains("196") && !out.contains(".74.") && !out.contains("121"),
+            "no octet fragment may survive: {out}"
+        );
+        assert!(out.ends_with(":80"), "port kept verbatim: {out}");
+    }
+
+    #[test]
+    fn hostname_with_port_keeps_domain_tail_and_port() {
+        let gen = HmacGenerator::new([5u8; 32]);
+        let out = gen.generate(
+            &Category::Hostname,
+            "env-0a1b2c3d.gcp.vendorsandbox.net:8080",
+        );
+        assert!(
+            out.ends_with(".vendorsandbox.net:8080"),
+            "org+TLD tail and port preserved: {out}"
+        );
+        assert!(
+            !out.contains("env-0a1b2c3d") && !out.contains(".gcp."),
+            "identifying labels replaced: {out}"
+        );
     }
 
     #[test]

@@ -373,6 +373,15 @@ pub(crate) fn run_sanitize(
                 ArchiveFormat::Tar => discovery.discover_profiles_tar(file),
                 ArchiveFormat::TarGz => discovery.discover_profiles_tar_gz(file),
                 ArchiveFormat::Zip => discovery.discover_profiles_zip(file),
+                ArchiveFormat::Gz => {
+                    // The base name drives profile matching (config.json.gz →
+                    // config.json), same as a .gz entry inside an archive.
+                    let name = input
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    discovery.discover_profiles_gz(&name, file)
+                }
                 other => {
                     return Err((format!("unsupported archive format: {other:?}"), 1));
                 }
