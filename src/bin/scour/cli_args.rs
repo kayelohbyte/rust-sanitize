@@ -818,88 +818,46 @@ pub(crate) struct AppsArgs {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum AppsSubCommand {
-    /// Install a custom app bundle from local YAML files.
+    /// Refresh local copies of built-in app bundles from this binary.
     ///
-    /// Copies the supplied profile and/or secrets files into the user apps
-    /// directory so the bundle is available via `--app <name>`.
+    /// The first `--app <name>` run materializes the built-in bundle into the
+    /// apps directory; from then on those files are the app. This command
+    /// brings them back in sync with the version shipped in the binary:
+    /// `profile.yaml` is replaced when it differs, and shipped `secrets.yaml`
+    /// entries missing locally are appended — discovered literals and
+    /// user-added entries are preserved.
+    ///
+    /// Without --yes, prints what would change and exits non-zero.
+    /// User-defined apps (no built-in counterpart) are managed directly in
+    /// the apps directory and are not touched.
     #[command(after_help = "\
 EXAMPLES:\n  \
-  scour-secrets apps add elastic --profile elastic.profile.yaml --secrets-file elastic.secrets.yaml\n  \
-  scour-secrets apps add myapp --profile myapp.profile.yaml\n  \
-  scour-secrets apps add myapp --secrets-file myapp.secrets.yaml --overwrite")]
-    Add(AppsAddArgs),
-
-    /// Remove a custom app bundle from the user apps directory.
-    ///
-    /// Built-in bundles cannot be removed.
-    #[command(after_help = "\
-EXAMPLES:\n  \
-  scour-secrets apps remove elastic --yes\n  \
-  scour-secrets apps remove myapp -y")]
-    Remove(AppsRemoveArgs),
-
-    /// Copy a built-in app bundle to the user apps directory for editing.
-    ///
-    /// For built-in apps, copies profile.yaml and/or secrets.yaml into
-    /// `~/.config/scour-secrets/apps/<name>/` so they can be customised. The local
-    /// copy takes precedence over the built-in automatically — no extra flags
-    /// needed. For user-defined apps the existing directory path is printed.
-    ///
-    /// To revert to the built-in, run `scour-secrets apps remove <name> --yes`.
-    #[command(after_help = "\
-EXAMPLES:\n  \
-  scour-secrets apps edit rails\n  \
-  scour-secrets apps edit kubernetes\n  \
-  scour-secrets apps edit gitlab")]
-    Edit(AppsEditArgs),
+  scour-secrets apps update gitlab --yes\n  \
+  scour-secrets apps update --all           # dry-run: show pending changes\n  \
+  scour-secrets apps update --all --yes")]
+    Update(AppsUpdateArgs),
 
     /// Print the user apps directory path.
     ///
-    /// Custom app bundles are stored here. You can also drop directories
-    /// manually instead of using `scour-secrets apps add`.
+    /// Apps are plain YAML (profile.yaml + secrets.yaml), one directory per
+    /// app. Create, edit, or delete them here directly; a directory whose
+    /// name matches a built-in app takes precedence over the built-in.
     Dir,
 }
 
 #[derive(Parser, Debug)]
-pub(crate) struct AppsAddArgs {
-    /// Name for the new app bundle (used with `--app <name>`).
-    ///
-    /// Only letters, digits, hyphens, and underscores are allowed.
+pub(crate) struct AppsUpdateArgs {
+    /// Names of the app bundles to update.
     #[arg(value_name = "NAME")]
-    pub(crate) name: String,
+    pub(crate) names: Vec<String>,
 
-    /// Path to a profile YAML file (`Vec<FileTypeProfile>`).
-    #[arg(long, value_name = "FILE")]
-    pub(crate) profile: Option<PathBuf>,
+    /// Update every built-in app that has a local copy.
+    #[arg(long, conflicts_with = "names")]
+    pub(crate) all: bool,
 
-    /// Path to a secrets YAML file (`Vec<SecretEntry>`).
-    #[arg(long, value_name = "FILE")]
-    pub(crate) secrets_file: Option<PathBuf>,
-
-    /// Overwrite an existing custom app bundle with the same name.
-    #[arg(long)]
-    pub(crate) overwrite: bool,
-}
-
-#[derive(Parser, Debug)]
-pub(crate) struct AppsRemoveArgs {
-    /// Name of the custom app bundle to remove.
-    #[arg(value_name = "NAME")]
-    pub(crate) name: String,
-
-    /// Confirm removal without an interactive prompt.
+    /// Apply the changes (without this flag, prints a dry-run summary).
     #[arg(long, short = 'y')]
     pub(crate) yes: bool,
-}
-
-#[derive(Parser, Debug)]
-pub(crate) struct AppsEditArgs {
-    /// Name of the app bundle to edit.
-    ///
-    /// For built-in apps this copies the files to the user apps directory.
-    /// For user-defined apps this prints the existing directory path.
-    #[arg(value_name = "NAME")]
-    pub(crate) name: String,
 }
 
 // ─── install-hook types ───────────────────────────────────────────────────────

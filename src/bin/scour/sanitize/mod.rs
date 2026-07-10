@@ -18,7 +18,7 @@ use scour_secrets::{
     ProcessorRegistry, ReportBuilder, ReportMetadata, ScanConfig, ScanPattern, StreamScanner,
 };
 
-use crate::apps::{ensure_user_app_copy, load_app_bundle};
+use crate::apps::{app_update_available, ensure_user_app_copy, load_app_bundle};
 use crate::cli_args::{
     Cli, ReportFormat, DEFAULT_MAX_STRUCTURED_FILE_SIZE, DEFAULT_PROGRESS_INTERVAL_MS,
 };
@@ -98,17 +98,27 @@ pub(crate) fn run_sanitize(
         }
     }
 
-    if !cli.app.is_empty() && !cli.no_structured_handoff {
-        for app_name in &cli.app {
-            if let Some(secrets_path) = ensure_user_app_copy(app_name) {
-                if cli.app.len() == 1 && cli.secrets_file.is_none() {
-                    info!(
-                        app = %app_name,
-                        path = %secrets_path.display(),
-                        "using local app secrets as write-back target"
-                    );
-                    cli.secrets_file = Some(secrets_path);
-                }
+    // Materialize each app's bundle into the apps directory (first use) and
+    // load from there; falls back to the embedded bundle when the directory
+    // can't be created. The local profile.yaml never being machine-mutated is
+    // what makes the staleness check meaningful.
+    for app_name in &cli.app {
+        if let Some(secrets_path) = ensure_user_app_copy(app_name) {
+            if app_update_available(app_name) {
+                warn!(
+                    app = %app_name,
+                    "local app copy differs from the bundle shipped with this binary — \
+                     run `scour-secrets apps update {app_name}` to refresh \
+                     (ignore if you customized it)"
+                );
+            }
+            if !cli.no_structured_handoff && cli.app.len() == 1 && cli.secrets_file.is_none() {
+                info!(
+                    app = %app_name,
+                    path = %secrets_path.display(),
+                    "using local app secrets as write-back target"
+                );
+                cli.secrets_file = Some(secrets_path);
             }
         }
     }

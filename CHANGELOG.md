@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **App bundles are user-managed files with an explicit update path.** The
+  first `--app <name>` run materializes the built-in bundle into the apps
+  directory (`SCOUR_SECRETS_APPS_DIR` or `~/.config/scour-secrets/apps`);
+  from then on those files are the app — edit them in place, and the
+  structured handoff appends discovered literals to the app's `secrets.yaml`
+  as before. When the local `profile.yaml` differs from the bundle shipped in
+  the binary (a newer release, or a local edit), runs print a one-line
+  warning pointing at the new **`apps update`** command, which replaces
+  `profile.yaml` and union-updates `secrets.yaml` (shipped entries missing
+  locally are appended; discovered literals and user-added entries are
+  preserved). Without `--yes` it prints a dry-run summary. `scour-secrets
+  apps` marks local copies and available updates.
+- **Removed `apps add`, `apps edit`, and `apps remove`.** Apps are plain YAML
+  directories — create, edit, or delete them directly in the apps directory
+  (`apps dir` prints the path; layout documented in docs/cli-reference.md).
+  `apps edit`'s job is covered by the automatic first-use materialization,
+  and `apps update <name>` also materializes a copy when none exists.
+
+### Added
+
+- **The gitlab app now covers the artifact shapes of real GitLab support
+  bundles** (GitLabSOS and kubeSOS), closing gaps found by comparing against
+  gitlab-scrubber and the kubeSOS collector:
+  - GitLabSOS runit logs: the gitaly/sidekiq/workhorse stanzas match the
+    extensionless `var/log/gitlab/<service>/current` paths (previously only
+    `*.log` names, which never occur in a GitLabSOS tarball). Non-JSON
+    (timestamp-prefixed) lines pass through via `skip_invalid` instead of
+    failing the file.
+  - New Rails log stanzas: `api_json.log`, `application_json.log`, and
+    `product_usage_data.log` (whole `payload` Snowplow blob scrubbed). The
+    `params` array `value` member is scrubbed in both `production_json.log`
+    and `api_json.log`; the `key` member (a metadata label) is preserved.
+  - kubeSOS artifacts: `helm get values` dumps (`all_values*.yaml`,
+    `user_supplied_values*.yaml`), multi-document `helm_manifest.yaml`
+    (Secret `data`/`stringData`, literal container env values), pod logs in
+    `<app>_<container>.log` naming, and credential-looking env values in
+    extensionless `kubectl describe` dumps (`describe_pods`, …).
+  - `/etc/gitlab/gitlab-secrets.json` (the Omnibus master secret store) is
+    scrubbed wholesale.
+  - `.gitlab-ci.yml` job-level `variables:` blocks are matched in addition to
+    the top-level block.
+
+### Fixed
+
+- **`--app` integration tests are hermetic.** `tests/app_bundle_tests.rs` now
+  points `SCOUR_SECRETS_APPS_DIR` at an empty directory; previously a
+  user-level bundle in `~/.config/scour-secrets/apps/<name>` silently shadowed
+  the built-in bundle under test.
+
 ## [0.17.0] - 2026-07-08
 
 ### Added

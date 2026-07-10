@@ -1,10 +1,21 @@
-# GitLab — gitlab.rb Omnibus config, .gitlab-ci.yml CI/CD variables, Helm chart values
+# GitLab — gitlab.rb Omnibus config, .gitlab-ci.yml CI/CD variables, Helm chart
+# values, and the two support-bundle formats GitLab tooling produces:
+#   - GitLabSOS tarballs (Omnibus): runit logs at var/log/gitlab/<service>/current,
+#     gitlab-rails/*.log NDJSON logs, etc/gitlab/gitlab.rb
+#   - kubeSOS tarballs (cloud-native chart): helm values dumps
+#     (all_values*.yaml, user_supplied_values*.yaml, helm_manifest.yaml),
+#     kubectl describe output, and <app>_<container>.log pod logs
+# GitLabSOS bundles also carry nginx logs and etc/fstab — combine with the
+# nginx and fstab apps (--app gitlab --app nginx --app fstab) for full coverage.
 
 # --- Omnibus gitlab.rb (Ruby key = 'value' DSL) ---
-# Sensitive key substrings mirror gitlab-scrubber/internal/scrubber/unstructured/gitlab_rb.go
-# sensitiveKeyPatterns: authorization, aws_access_key, accesskey, secretkey,
-# accountkey, key_base, secret, _key, bind_dn, _fingerprint, token, _dsn
-# Plus "password" (handled more aggressively in the scrubber).
+# Sensitive key substrings are a superset of
+# gitlab-scrubber/internal/scrubber/unstructured/gitlab_rb.go sensitiveKeyPatterns:
+# authorization, aws_access_key, app_id, tenant_id, client_id, accesskey,
+# secretkey, accountkey, gitlab_application_id, key_base, secret, _key, bucket,
+# bind_dn, accountname, _account_name, _fingerprint, token — plus "password"
+# (handled more aggressively in the scrubber) and "_dsn" (kept here even though
+# the scrubber dropped it; Sentry DSNs embed an auth key).
 - processor: key-value
   extensions: [".rb"]
   include: ["gitlab.rb", "*/gitlab.rb"]
@@ -84,14 +95,22 @@
     - "gitlab-ci.yml"
     - "*/.gitlab-ci.yml"
   fields:
+    # Top-level variables: block
     - pattern: "variables.*"
       category: auth_token
       label: ci_variable
+    # Job-level variables: blocks (<job>.variables.FOO)
+    - pattern: "*.variables.*"
+      category: auth_token
+      label: ci_job_variable
 
 # --- GitLab Helm chart values (gitlab-specific deep paths) ---
 # Note: broad *.password / *.token patterns intentionally catch inlined credentials
 # in user override files. K8s secret reference fields (secret: name, key: name)
 # are also matched — redacting object names is acceptable in this context.
+# The user_supplied_values*/all_values* names are the `helm get values` dumps
+# kubeSOS writes (including per-revision all_values_rev_<n>.yaml) — the
+# --all form inlines every credential the chart knows about.
 - processor: yaml
   extensions: [".yml", ".yaml"]
   include:
@@ -99,6 +118,10 @@
     - "values-*.yaml"
     - "gitlab-values.yaml"
     - "gitlab-values-*.yaml"
+    - "user_supplied_values.yaml"
+    - "user_supplied_values_rev_*.yaml"
+    - "all_values.yaml"
+    - "all_values_rev_*.yaml"
   fields:
     # Generic credential fields (catches inlined passwords/tokens anywhere)
     - pattern: "*.password"
@@ -151,16 +174,61 @@
       category: auth_token
       label: gitlab_helm_registry_secret_key
 
+# --- Rendered chart manifests (helm get manifest > helm_manifest.yaml, kubeSOS) ---
+# Multi-document YAML; can embed Secret objects and literal container env values.
+- processor: yaml
+  extensions: [".yml", ".yaml"]
+  include: ["helm_manifest.yaml"]
+  fields:
+    - pattern: "data.*"
+      category: auth_token
+      label: gitlab_manifest_secret_data
+    - pattern: "stringData.*"
+      category: auth_token
+      label: gitlab_manifest_secret_string_data
+    - pattern: "spec.template.spec.containers.env.value"
+      category: auth_token
+      label: gitlab_manifest_env_value
+      min_length: 8
+    - pattern: "spec.template.spec.initContainers.env.value"
+      category: auth_token
+      label: gitlab_manifest_init_env_value
+      min_length: 8
+
+# --- Omnibus master secret store (/etc/gitlab/gitlab-secrets.json) ---
+# Every leaf is secret material (secret_key_base, db_key_base, component
+# tokens, PEM keys). min_length skips structural short values.
+- processor: json
+  extensions: [".json"]
+  include: ["gitlab-secrets.json"]
+  fields:
+    - pattern: "*"
+      category: auth_token
+      label: gitlab_secrets_json
+      min_length: 8
+
 # --- GitLab Rails production JSON log (production_json.log) ---
 # Sensitive fields per gitlab-scrubber structured/field_extractors.go:
 # keys containing "user"/"author", "ip", "email", project path fields.
+# webservice_webservice*.log is the kubeSOS pod-log name for the Rails
+# container (kubectl logs <app>_<container>.log naming).
+# skip_invalid: log streams interleave plain-text lines with NDJSON; those
+# lines fall through to the scanner pass instead of failing the file.
 - processor: jsonl
   extensions: [".log"]
   include:
     - "production_json.log"
-    - "*/production_json.log"
-    - "log/production_json.log"
+    - "webservice_webservice*.log"
+  options:
+    skip_invalid: "true"
   fields:
+    # Request params array ({"key": ..., "value": ...}) — values carry
+    # user-submitted data (project paths, tokens, emails). The "key" member is
+    # a metadata label and is deliberately not matched.
+    - pattern: "params.value"
+      category: auth_token
+      label: rails_log_params_value
+      min_length: 4
     - pattern: "username"
       category: name
       label: rails_log_username
@@ -186,14 +254,96 @@
       category: name
       label: rails_log_meta_root_namespace
 
-# --- Sidekiq JSON log (sidekiq.log) ---
-# "args" is scrubbed entirely — job arguments can contain arbitrary secrets.
+# --- GitLab Rails API JSON log (api_json.log) ---
+# Same NDJSON shape as production_json.log, with the same params array.
 - processor: jsonl
   extensions: [".log"]
   include:
+    - "api_json.log"
+  options:
+    skip_invalid: "true"
+  fields:
+    - pattern: "params.value"
+      category: auth_token
+      label: api_log_params_value
+      min_length: 4
+    - pattern: "username"
+      category: name
+      label: api_log_username
+    - pattern: "remote_ip"
+      category: ipv4
+      label: api_log_remote_ip
+    - pattern: "meta.user"
+      category: name
+      label: api_log_meta_user
+    - pattern: "meta.remote_ip"
+      category: ipv4
+      label: api_log_meta_remote_ip
+    - pattern: "meta.project"
+      category: name
+      label: api_log_meta_project
+    - pattern: "meta.namespace"
+      category: name
+      label: api_log_meta_namespace
+    - pattern: "meta.root_namespace"
+      category: name
+      label: api_log_meta_root_namespace
+
+# --- GitLab Rails application JSON log (application_json.log) ---
+- processor: jsonl
+  extensions: [".log"]
+  include:
+    - "application_json.log"
+  options:
+    skip_invalid: "true"
+  fields:
+    - pattern: "username"
+      category: name
+      label: app_log_username
+    - pattern: "meta.user"
+      category: name
+      label: app_log_meta_user
+    - pattern: "meta.remote_ip"
+      category: ipv4
+      label: app_log_meta_remote_ip
+    - pattern: "meta.project"
+      category: name
+      label: app_log_meta_project
+    - pattern: "meta.namespace"
+      category: name
+      label: app_log_meta_namespace
+    - pattern: "meta.root_namespace"
+      category: name
+      label: app_log_meta_root_namespace
+
+# --- Product usage data log (product_usage_data.log) ---
+# The payload field is an opaque Snowplow event blob whose base64-encoded
+# context embeds hostnames and hashed user IDs — scrub it entirely
+# (mirrors gitlab-scrubber's [SCRUBBED] override).
+- processor: jsonl
+  extensions: [".log"]
+  include:
+    - "product_usage_data.log"
+  options:
+    skip_invalid: "true"
+  fields:
+    - pattern: "payload"
+      category: auth_token
+      label: product_usage_payload
+
+# --- Sidekiq JSON log ---
+# "args" is scrubbed entirely — job arguments can contain arbitrary secrets.
+# GitLabSOS stores this log as the extensionless runit file
+# var/log/gitlab/sidekiq/current ('""' passes any name; the include list
+# gates). kubeSOS stores it as sidekiq_<container>.log.
+- processor: jsonl
+  extensions: [""]
+  include:
     - "sidekiq.log"
-    - "*/sidekiq.log"
-    - "log/sidekiq.log"
+    - "sidekiq_*.log"
+    - "**/sidekiq/current"
+  options:
+    skip_invalid: "true"
   fields:
     - pattern: "args"
       category: auth_token
@@ -208,14 +358,19 @@
       category: ipv4
       label: sidekiq_log_meta_remote_ip
 
-# --- GitLab Workhorse log (gitlab-workhorse.log / workhorse.log) ---
+# --- GitLab Workhorse log ---
+# GitLabSOS: var/log/gitlab/gitlab-workhorse/current (extensionless runit).
+# kubeSOS: webservice_workhorse.log (workhorse runs as a container in the
+# webservice pod).
 - processor: jsonl
-  extensions: [".log"]
+  extensions: [""]
   include:
     - "gitlab-workhorse.log"
     - "workhorse.log"
-    - "*/gitlab-workhorse.log"
-    - "log/workhorse.log"
+    - "*_workhorse*.log"
+    - "**/gitlab-workhorse/current"
+  options:
+    skip_invalid: "true"
   fields:
     - pattern: "remote_addr"
       category: ipv4
@@ -227,15 +382,18 @@
       category: url
       label: workhorse_log_uri
 
-# --- Gitaly log (gitaly.log) ---
+# --- Gitaly log ---
 # grpc.request.glProjectPath contains the group/project path.
 # grpc.request.repoPath is a content-addressed hash path — not user data, skip.
+# GitLabSOS: var/log/gitlab/gitaly/current. kubeSOS: gitaly_gitaly.log.
 - processor: jsonl
-  extensions: [".log"]
+  extensions: [""]
   include:
     - "gitaly.log"
-    - "*/gitaly.log"
-    - "log/gitaly.log"
+    - "gitaly_*.log"
+    - "**/gitaly/current"
+  options:
+    skip_invalid: "true"
   fields:
     - pattern: "grpc.request.glProjectPath"
       category: name
@@ -246,13 +404,15 @@
 
 # --- GitLab Shell log (gitlab-shell.log / gitlab_shell.log) ---
 # originalCommand leaks group/project.git from git-upload-pack / git-receive-pack calls.
+# gitlab-shell_*.log is the kubeSOS pod-log name.
 - processor: jsonl
   extensions: [".log"]
   include:
     - "gitlab-shell.log"
     - "gitlab_shell.log"
-    - "*/gitlab-shell.log"
-    - "log/gitlab-shell.log"
+    - "gitlab-shell_*.log"
+  options:
+    skip_invalid: "true"
   fields:
     - pattern: "username"
       category: name
@@ -263,3 +423,33 @@
     - pattern: "original_command"
       category: name
       label: shell_log_original_command
+
+# --- kubectl describe dumps (kubeSOS: describe_pods, describe_deployments, …) ---
+# `kubectl describe` prints literal values for plain (non-secretRef) env vars
+# under Environment:. Extensionless "KEY:  value" lines; only credential-looking
+# keys are matched, and min_length skips enum-like short values.
+- processor: key-value
+  extensions: [""]
+  include:
+    - "describe_pods"
+    - "describe_deployments"
+    - "describe_statefulsets"
+  options:
+    delimiter: ":"
+  fields:
+    - pattern: "*password*"
+      category: custom:password
+      label: kubectl_describe_password
+      min_length: 8
+    - pattern: "*secret*"
+      category: auth_token
+      label: kubectl_describe_secret
+      min_length: 8
+    - pattern: "*token*"
+      category: auth_token
+      label: kubectl_describe_token
+      min_length: 8
+    - pattern: "*_key*"
+      category: auth_token
+      label: kubectl_describe_key
+      min_length: 8
