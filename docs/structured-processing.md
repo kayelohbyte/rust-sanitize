@@ -189,7 +189,7 @@ A profile file is a YAML or JSON array of profile entries. Each entry selects a 
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `processor` | Yes | — | Processor name: `"json"`, `"yaml"`, `"xml"`, `"csv"`, `"key_value"`, `"toml"`, `"env"`, `"ini"`, `"log"`, `"jsonl"`, `"command_output"`. |
+| `processor` | Yes | — | Processor name: `"json"`, `"yaml"`, `"xml"`, `"csv"`, `"key_value"`, `"toml"`, `"env"`, `"ini"`, `"log"`, `"jsonl"`, `"command_output"`, `"columns"`. |
 | `extensions` | Yes | `[]` | File extensions this profile applies to (e.g. `[".json"]`). An empty list matches nothing. |
 | `include` | No | `[]` | If non-empty, only files whose name matches at least one glob are processed. |
 | `exclude` | No | `[]` | Files whose name matches any glob are excluded from structured processing. |
@@ -530,6 +530,41 @@ other profile discovery, so a hostname captured from `hostname --fqdn` is also
 scrubbed where it appears bare in sibling files (`uname -a` lines, logs,
 sysctl output).
 
+### Columns (`"columns"`)
+
+Handles whitespace-aligned, fixed-header command output — `ps aux`, `top -b`,
+and similar listings that support bundles capture verbatim. Field patterns are
+glob-matched against **header column names**; in every data row under the
+header, the token at each matched column is replaced with the rule's category.
+
+- The first line containing a rule-matched token becomes the header and fixes
+  the column positions; a later matching line re-keys them (repeated `top -b`
+  iterations).
+- Lines before the first header and lines with fewer tokens than the header
+  (`top` preamble, wrapped output) pass through unchanged.
+- Set `min_length` deliberately: it is the practical guard that keeps short
+  preamble tokens (`-`, counts) and service accounts (`git`) untouched.
+
+```yaml
+- processor: columns
+  extensions: [""]
+  include: ["ps", "top_cpu"]
+  fields:
+    - pattern: "USER"
+      category: name
+      min_length: 4
+```
+
+```
+USER         PID COMMAND            USER         PID COMMAND
+root           1 /sbin/init     →   root           1 /sbin/init
+jdoeworth   1234 sshd: jdoe         Oakley As   1234 sshd: jdoe
+```
+
+Discovered usernames propagate like any other profile discovery, so a name
+caught in the `ps` USER column is also scrubbed from `syslog`/`sshd` lines
+that mention it bare.
+
 ---
 
 ## Deterministic Mode + Profile: Saving Discovered Values
@@ -642,5 +677,7 @@ let profile = FileTypeProfile::new("json", vec![
 ## Nested Archives
 
 When processing archives with `--profile`, structured matching applies to individual entries inside the archive. A YAML config file inside a `.tar.gz` is processed structurally, and values it discovers are propagated to other entries in the same archive and to other files in the same run.
+
+Single-file gzip streams get the same treatment whether they appear as an entry inside an archive or as a direct input: `config.json.gz` is decompressed (bounded, magic-checked), sanitized under its inner name — so the JSON processor and profile rules apply — and recompressed. Content behind a `.gz` name that is not valid gzip takes the raw streaming-scanner fallback, and `--force-text` keeps the raw byte-scan over the compressed stream.
 
 Recursion is bounded by `--max-archive-depth` (default: 3, max: 10).

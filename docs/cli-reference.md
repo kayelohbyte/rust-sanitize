@@ -910,6 +910,7 @@ When no `--output` is given, the output location depends on the input type:
 |------------|----------------|
 | Plain / structured file (`foo.txt`, `a.json`) | `<stem>-sanitized.<ext>` next to the source — e.g. `foo-sanitized.txt` |
 | Archive (`data.tar`, `data.tar.gz`, `archive.zip`) | `<stem>.sanitized.<ext>` next to the source — e.g. `data.sanitized.tar.gz` |
+| Standalone gzip (`config.json.gz`) | `<inner-name>.sanitized.gz` next to the source — e.g. `config.json.sanitized.gz`; content is sanitized under its inner name (`config.json`) |
 | **Directory** (`logs/`, `/etc/nginx/`) | **`<dirname>-sanitized/` peer directory** — tree structure is mirrored inside it. E.g. `scour-secrets logs/` → `logs-sanitized/` with all relative paths preserved. |
 | Stdin (no file path) | stdout |
 
@@ -1450,7 +1451,7 @@ scour-secrets server.log -s patterns.yaml --report report.json \
   "replacements": 3,
   "bytes_processed": 10240,
   "bytes_output": 10240,
-  "pattern_counts": { "kael_email": 2 },
+  "pattern_counts": { "jdoe_email": 2 },
   "method": "scanner",
   "log_context": {
     "total_lines": 1500,
