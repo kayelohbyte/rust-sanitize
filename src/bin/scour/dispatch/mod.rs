@@ -29,14 +29,7 @@ use crate::progress::{with_progress_scope, SharedProgressReporter};
 /// and the sanitized output is directed to stdout.
 pub(crate) const MAX_CONTEXT_BUFFER_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
-/// Minimum length for a structured-field-discovered value to be reused as a
-/// literal — both as an in-run scanner pattern and as a persisted secrets-file
-/// entry. Values shorter than this (e.g. a `v` or `id`) match too much
-/// unrelated text: as a scanner literal they corrupt the current run, and once
-/// written to the secrets file they poison *every* future run. The two paths
-/// (in-memory scanner build and on-disk write-back) must share this threshold
-/// so a value never gets persisted that the scanner itself would reject.
-pub(crate) const MIN_DISCOVERED_LITERAL_LEN: usize = 4;
+pub(crate) use scour_secrets::MIN_DISCOVERED_LITERAL_LEN;
 
 /// Shared per-run collector for `--llm`: (label, sanitized_bytes) pairs in input order.
 pub(crate) type LlmCollector = Arc<Mutex<Vec<LlmEntry>>>;
@@ -473,6 +466,22 @@ pub(crate) fn load_profiles(path: &Path) -> Result<Vec<FileTypeProfile>, String>
     Ok(profiles)
 }
 
+/// Whether a YAML document's first content line opens a flow sequence
+/// (`[...]`). Appending block-sequence items to such a file would corrupt it,
+/// so those files are re-serialized instead.
+fn yaml_is_flow_sequence(raw: &[u8]) -> bool {
+    raw.split(|&b| b == b'\n')
+        .map(|line| {
+            let start = line
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .unwrap_or(line.len());
+            &line[start..]
+        })
+        .find(|l| !l.is_empty() && l[0] != b'#')
+        .is_some_and(|l| l[0] == b'[')
+}
+
 /// Append store-discovered literal values to the secrets file at `path`,
 /// preserving the file's on-disk form:
 ///
@@ -480,9 +489,11 @@ pub(crate) fn load_profiles(path: &Path) -> Result<Vec<FileTypeProfile>, String>
 ///   parse → merge → serialize → re-encrypt (fresh salt + nonce) → atomic
 ///   write. Plaintext exists only in zeroizing memory; the file on disk is
 ///   never downgraded to plaintext.
-/// - **Plaintext file**: parse and re-serialize in the file's own format
+/// - **Plaintext file**: a YAML file keeps its existing bytes verbatim —
+///   comments included — and gets the new entries appended as sequence items;
+///   JSON / TOML files are parsed and re-serialized in their own format
 ///   (extension-derived `format`, falling back to content detection, then
-///   YAML for new files) — a `.json` or `.toml` secrets file keeps its format.
+///   YAML for new files).
 pub(crate) fn save_discovered_secrets(
     store: &Arc<MappingStore>,
     path: &Path,
@@ -558,22 +569,43 @@ pub(crate) fn save_discovered_secrets(
         return Ok(0);
     }
 
-    let mut all_entries: Vec<SecretEntry> = existing;
-    all_entries.extend(new_entries);
-
-    let serialized = Zeroizing::new(
-        serialize_secrets(&all_entries, effective_format)
-            .map_err(|e| format!("failed to serialize discovered secrets: {e}"))?,
-    );
-
     let output: Zeroizing<Vec<u8>> = if was_encrypted || encrypted_now {
+        let mut all_entries: Vec<SecretEntry> = existing;
+        all_entries.extend(new_entries);
+        let serialized = Zeroizing::new(
+            serialize_secrets(&all_entries, effective_format)
+                .map_err(|e| format!("failed to serialize discovered secrets: {e}"))?,
+        );
         let pw = password.expect("checked above: encrypted path requires a password");
         Zeroizing::new(
             encrypt_secrets(&serialized, pw)
                 .map_err(|e| format!("failed to re-encrypt {}: {e}", path.display()))?,
         )
+    } else if effective_format == SecretsFormat::Yaml
+        && raw.as_deref().is_some_and(|r| !yaml_is_flow_sequence(r))
+    {
+        // Comment-preserving append: app bundles and hand-written secrets
+        // files are comment-heavy documentation, and a re-serialize would
+        // strip all of it. A YAML top-level block sequence accepts appended
+        // items, so keep the existing bytes verbatim and add only the new
+        // entries. (Flow-style `[...]` files take the re-serialize path.)
+        let new_yaml = Zeroizing::new(
+            serialize_secrets(&new_entries, SecretsFormat::Yaml)
+                .map_err(|e| format!("failed to serialize discovered secrets: {e}"))?,
+        );
+        let mut buf = Zeroizing::new(raw.as_deref().map(|r| r.to_vec()).unwrap_or_default());
+        if !buf.is_empty() && !buf.ends_with(b"\n") {
+            buf.push(b'\n');
+        }
+        buf.extend_from_slice(&new_yaml);
+        buf
     } else {
-        serialized
+        let mut all_entries: Vec<SecretEntry> = existing;
+        all_entries.extend(new_entries);
+        Zeroizing::new(
+            serialize_secrets(&all_entries, effective_format)
+                .map_err(|e| format!("failed to serialize discovered secrets: {e}"))?,
+        )
     };
 
     atomic_write_private(path, &output)
@@ -758,6 +790,53 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("first_secret"));
         assert!(content.contains("second_secret"));
+    }
+
+    #[test]
+    fn save_discovered_secrets_preserves_yaml_comments() {
+        // The write-back must not strip comments: app bundle secrets files
+        // are comment-heavy documentation, and the handoff rewrites them on
+        // every --app run. New entries are appended; existing bytes stay.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.yaml");
+        let original = "# Header comment — must survive the write-back\n\
+                        - pattern: existing_secret\n\
+                        \x20 kind: literal\n\
+                        \x20 category: auth_token\n\
+                        \x20 label: existing # inline comment\n";
+        fs::write(&path, original).unwrap();
+
+        let store = store_with_entry("freshly_discovered");
+        let n = save_discovered_secrets(&store, &path, None, false, None).unwrap();
+        assert_eq!(n, 1);
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.starts_with(original),
+            "existing bytes (comments included) must be untouched: {content}"
+        );
+        assert!(content.contains("freshly_discovered"));
+        // And the appended result must still parse as a secrets file.
+        let entries = parse_secrets(content.as_bytes(), None).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn save_discovered_secrets_reserializes_flow_yaml() {
+        // A flow-style `[...]` document can't take appended block items;
+        // it falls back to the re-serialize path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.yaml");
+        fs::write(&path, "[]\n").unwrap();
+
+        let store = store_with_entry("freshly_discovered");
+        let n = save_discovered_secrets(&store, &path, None, false, None).unwrap();
+        assert_eq!(n, 1);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let entries = parse_secrets(content.as_bytes(), None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pattern, "freshly_discovered");
     }
 
     #[test]
