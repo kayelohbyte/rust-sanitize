@@ -957,7 +957,7 @@ mod tests {
         // This is a structural guarantee; verify that deserializing
         // back produces the same data without secret leakage.
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed["files"][0]["path"].as_str() == Some("config.yaml"));
+        assert_eq!(parsed["files"][0]["path"].as_str(), Some("config.yaml"));
         // No field named "secret", "original", or "value" at any level.
         let flat = json.to_lowercase();
         assert!(!flat.contains("\"original\""));

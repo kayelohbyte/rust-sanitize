@@ -125,10 +125,7 @@ pub(crate) fn find_project_config_from(dir: &Path) -> Option<PathBuf> {
         if candidate.is_file() {
             return Some(candidate);
         }
-        match current.parent() {
-            Some(p) => current = p.to_path_buf(),
-            None => return None,
-        }
+        current = current.parent()?.to_path_buf();
     }
 }
 
