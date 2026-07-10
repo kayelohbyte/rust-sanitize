@@ -1,6 +1,9 @@
-use crate::cli_args::{AppsAddArgs, AppsArgs, AppsEditArgs, AppsRemoveArgs, AppsSubCommand};
+use crate::cli_args::{AppsArgs, AppsSubCommand, AppsUpdateArgs};
+use scour_secrets::atomic_write_private;
 use scour_secrets::processor::FileTypeProfile;
-use scour_secrets::secrets::SecretEntry;
+use scour_secrets::secrets::{
+    looks_encrypted, parse_secrets, serialize_secrets, SecretEntry, SecretsFormat,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,13 +11,18 @@ use std::path::{Path, PathBuf};
 // Built-in app bundles
 // ---------------------------------------------------------------------------
 //
-// Each app lives in  src/bin/apps/<name>/
+// Each app ships embedded in the binary from  apps/<name>/
 //   secrets.yaml  — Vec<SecretEntry>  (optional; omit when the app has none)
 //   profile.yaml  — Vec<FileTypeProfile> (optional)
 //
-// User-defined apps follow the same two-file convention in a directory
-// specified by the SCOUR_SECRETS_APPS_DIR environment variable, falling back to
-// ~/.config/scour-secrets/apps  (XDG-compatible).
+// On first `--app <name>` use the bundle is materialized into the apps
+// directory (SCOUR_SECRETS_APPS_DIR, falling back to
+// ~/.config/scour-secrets/apps — XDG-compatible) and from then on the files
+// there are the single source of truth for the app: users edit them in place,
+// the structured handoff appends discovered literals to the app's
+// secrets.yaml, and `scour-secrets apps update` refreshes them from the
+// binary. User-defined apps follow the same two-file convention in the same
+// directory.
 //
 // The first YAML comment line (# ...) in either file is shown as the
 // description in  `scour-secrets apps`.
@@ -97,7 +105,7 @@ pub(crate) const BUILTIN_APPS: &[BuiltinApp] = &[
     },
     BuiltinApp {
         name: "gitlab",
-        description: "GitLab — CI/CD logs, runner output, .gitlab-ci.yml variables",
+        description: "GitLab — gitlab.rb, .gitlab-ci.yml, Helm values, GitLabSOS/kubeSOS support bundles",
         secrets_yaml: Some(include_str!("../../../apps/gitlab/secrets.yaml")),
         profile_yaml: Some(include_str!("../../../apps/gitlab/profile.yaml")),
     },
@@ -394,9 +402,7 @@ pub(crate) fn validate_app_name(name: &str) -> Result<(), String> {
 pub(crate) fn run_apps(args: &AppsArgs) -> Result<(), (String, i32)> {
     match &args.command {
         None => run_apps_list(),
-        Some(AppsSubCommand::Add(a)) => run_apps_add(a),
-        Some(AppsSubCommand::Remove(a)) => run_apps_remove(a),
-        Some(AppsSubCommand::Edit(a)) => run_apps_edit(a),
+        Some(AppsSubCommand::Update(a)) => run_apps_update(a),
         Some(AppsSubCommand::Dir) => run_apps_dir(),
     }
 }
@@ -420,10 +426,12 @@ fn run_apps_list() -> Result<(), (String, i32)> {
     println!("Built-in app bundles (use with --app <name>):\n");
     for app in BUILTIN_APPS {
         if overridden.contains(app.name) {
-            println!(
-                "  {:<18} {} (overridden by user copy)",
-                app.name, app.description
-            );
+            let marker = if app_update_available(app.name) {
+                " (local copy — update available: scour-secrets apps update)"
+            } else {
+                " (local copy)"
+            };
+            println!("  {:<18} {}{}", app.name, app.description, marker);
         } else {
             println!("  {:<18} {}", app.name, app.description);
         }
@@ -437,6 +445,8 @@ fn run_apps_list() -> Result<(), (String, i32)> {
 
     if let Some(ref dir) = apps_dir {
         if dir.is_dir() {
+            // Materialized copies of built-ins are listed above with a
+            // "(local copy)" marker — only genuinely user-defined apps here.
             let mut user_apps: Vec<(String, String)> = fs::read_dir(dir)
                 .map(|entries| {
                     entries
@@ -447,6 +457,7 @@ fn run_apps_list() -> Result<(), (String, i32)> {
                             let desc = read_app_description(&e.path());
                             (name, desc)
                         })
+                        .filter(|(name, _)| !BUILTIN_APPS.iter().any(|a| a.name == name))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -466,216 +477,228 @@ fn run_apps_list() -> Result<(), (String, i32)> {
     }
 
     println!("\nCombine multiple apps:  scour-secrets file.zip --app gitlab,nginx,postgresql");
-    println!(
-        "Manage custom apps:     scour-secrets apps edit <name>        # copy built-in for editing"
-    );
-    println!(
-        "                        scour-secrets apps add <name> --profile p.yaml --secrets s.yaml"
-    );
-    println!("                        scour-secrets apps remove <name> --yes");
-    println!("                        scour-secrets apps dir");
+    println!("Refresh local copies:   scour-secrets apps update [<name>...|--all]");
+    println!("Apps directory:         scour-secrets apps dir");
+    println!("\nApps are plain YAML (profile.yaml + secrets.yaml) in the apps directory —");
+    println!("create, edit, or delete them there directly. Layout: docs/cli-reference.md;");
+    println!("YAML format: docs/structured-processing.md.");
     Ok(())
 }
 
-fn run_apps_add(args: &AppsAddArgs) -> Result<(), (String, i32)> {
-    validate_app_name(&args.name).map_err(|e| (e, 1))?;
-
-    if args.profile.is_none() && args.secrets_file.is_none() {
-        return Err((
-            "at least one of --profile or --secrets-file must be provided".into(),
-            1,
-        ));
+/// True when `name` is a built-in app with a materialized local copy whose
+/// `profile.yaml` differs from the embedded one — either a newer bundle
+/// shipped with this binary, or the user customized the copy. The check is
+/// deliberately limited to `profile.yaml`: the app's `secrets.yaml` is
+/// mutated by the structured handoff on every run, so its content can never
+/// signal staleness.
+pub(crate) fn app_update_available(name: &str) -> bool {
+    let Some(entry) = BUILTIN_APPS.iter().find(|a| a.name == name) else {
+        return false;
+    };
+    let Some(embedded) = entry.profile_yaml else {
+        return false;
+    };
+    let Some(apps_dir) = user_apps_dir() else {
+        return false;
+    };
+    let app_dir = apps_dir.join(name);
+    if !app_dir.is_dir() {
+        return false;
     }
+    match fs::read(app_dir.join("profile.yaml")) {
+        Ok(local) => local != embedded.as_bytes(),
+        // Local copy exists but its profile.yaml is missing: stale.
+        Err(_) => true,
+    }
+}
 
+/// Canonical identity for a secrets entry: the serde round-trip of the parsed
+/// entry, so shipped and local entries compare after identical normalization
+/// (comments and formatting never participate).
+fn entry_identity(entry: &SecretEntry) -> String {
+    serde_yaml_ng::to_string(entry).unwrap_or_default()
+}
+
+/// Refresh materialized copies of built-in app bundles.
+///
+/// Per app: `profile.yaml` is replaced with the embedded version when it
+/// differs; for `secrets.yaml` the shipped entries missing from the local
+/// file are appended, so discovered literals and user-added entries are
+/// preserved (entries the user deleted from the shipped set do reappear).
+/// An app with no local copy yet is materialized fresh.
+fn run_apps_update(args: &AppsUpdateArgs) -> Result<(), (String, i32)> {
     let apps_dir = user_apps_dir().ok_or_else(|| {
         (
-            "cannot determine user apps directory: HOME is not set".into(),
+            "cannot determine user apps directory: HOME is not set".to_string(),
             1,
         )
     })?;
 
-    let target_dir = apps_dir.join(&args.name);
-
-    if target_dir.exists() && !args.overwrite {
+    let names: Vec<String> = if args.all {
+        // --all refreshes existing local copies only; apps never used have no
+        // copy to update (the embedded bundle is current by definition).
+        BUILTIN_APPS
+            .iter()
+            .map(|a| a.name.to_string())
+            .filter(|n| apps_dir.join(n).is_dir())
+            .collect()
+    } else if args.names.is_empty() {
         return Err((
-            format!(
-                "app '{}' already exists at {}.\nUse --overwrite to replace it.",
-                args.name,
-                target_dir.display()
-            ),
+            "specify one or more app names, or --all to refresh every local copy".into(),
             1,
         ));
-    }
+    } else {
+        args.names.clone()
+    };
 
-    // Validate files parse correctly before touching the filesystem.
-    if let Some(ref path) = args.profile {
-        let _profiles: Vec<FileTypeProfile> =
-            parse_yaml_file(path).map_err(|e| (format!("--profile: {e}"), 1))?;
-    }
-    if let Some(ref path) = args.secrets_file {
-        let _secrets: Vec<SecretEntry> =
-            parse_yaml_file(path).map_err(|e| (format!("--secrets-file: {e}"), 1))?;
-    }
-
-    fs::create_dir_all(&target_dir)
-        .map_err(|e| (format!("failed to create {}: {e}", target_dir.display()), 1))?;
-
-    if let Some(ref src) = args.profile {
-        let dst = target_dir.join("profile.yaml");
-        fs::copy(src, &dst).map_err(|e| {
-            (
-                format!("failed to copy profile to {}: {e}", dst.display()),
-                1,
-            )
-        })?;
-    }
-    if let Some(ref src) = args.secrets_file {
-        let dst = target_dir.join("secrets.yaml");
-        fs::copy(src, &dst).map_err(|e| {
-            (
-                format!("failed to copy secrets to {}: {e}", dst.display()),
-                1,
-            )
-        })?;
-    }
-
-    println!("Installed app '{}' → {}", args.name, target_dir.display());
-    if args.profile.is_some() {
-        println!("  profile.yaml  ✓");
-    }
-    if args.secrets_file.is_some() {
-        println!("  secrets.yaml  ✓");
-    }
-    println!("\nUse it with:  scour-secrets <file> --app {}", args.name);
-    Ok(())
-}
-
-fn run_apps_remove(args: &AppsRemoveArgs) -> Result<(), (String, i32)> {
-    validate_app_name(&args.name).map_err(|e| (e, 1))?;
-
-    let apps_dir = user_apps_dir().ok_or_else(|| {
-        (
-            "cannot determine user apps directory: HOME is not set".into(),
-            1,
-        )
-    })?;
-
-    let target_dir = apps_dir.join(&args.name);
-
-    // Only a user copy (in the apps dir) can be removed.  Refuse when the
-    // name is a built-in AND there is no user copy to revert.
-    if !target_dir.is_dir() {
-        if BUILTIN_APPS.iter().any(|a| a.name == args.name.as_str()) {
-            return Err((
-                format!(
-                    "'{}' is a built-in app — nothing to remove.\n\
-                     Use `scour-secrets apps edit {}` first to create a local copy.",
-                    args.name, args.name
-                ),
-                1,
-            ));
-        }
-        return Err((
-            format!(
-                "no custom app '{}' found at {}",
-                args.name,
-                target_dir.display()
-            ),
-            1,
-        ));
-    }
-
-    if !args.yes {
-        return Err((
-            format!(
-                "this will permanently delete {}\nRe-run with --yes to confirm.",
-                target_dir.display()
-            ),
-            1,
-        ));
-    }
-
-    fs::remove_dir_all(&target_dir)
-        .map_err(|e| (format!("failed to remove {}: {e}", target_dir.display()), 1))?;
-
-    let is_builtin = BUILTIN_APPS.iter().any(|a| a.name == args.name.as_str());
-    println!("Removed app '{}'  ({})", args.name, target_dir.display());
-    if is_builtin {
-        println!("Built-in '{}' is now active again.", args.name);
-    }
-    Ok(())
-}
-
-fn run_apps_edit(args: &AppsEditArgs) -> Result<(), (String, i32)> {
-    validate_app_name(&args.name).map_err(|e| (e, 1))?;
-
-    let apps_dir = user_apps_dir().ok_or_else(|| {
-        (
-            "cannot determine user apps directory: HOME is not set".into(),
-            1,
-        )
-    })?;
-
-    let target_dir = apps_dir.join(&args.name);
-
-    // Already a user-defined app — just show the path.
-    if target_dir.is_dir() {
-        println!("'{}' is already in your user apps directory:", args.name);
-        println!("  {}", target_dir.display());
-        for file in &["profile.yaml", "secrets.yaml"] {
-            let p = target_dir.join(file);
-            if p.exists() {
-                println!("  {}", p.display());
-            }
-        }
-        println!("\nEdits here already override the built-in.");
-        println!("To revert:  scour-secrets apps remove {} --yes", args.name);
+    if names.is_empty() {
+        println!("No local app copies to update in {}", apps_dir.display());
         return Ok(());
     }
 
-    // Must be a built-in.
-    let entry = BUILTIN_APPS
-        .iter()
-        .find(|a| a.name == args.name.as_str())
-        .ok_or_else(|| {
+    let mut pending = 0usize;
+
+    for name in &names {
+        validate_app_name(name).map_err(|e| (e, 1))?;
+        let Some(entry) = BUILTIN_APPS.iter().find(|a| a.name == name.as_str()) else {
+            return Err((
+                format!(
+                    "'{name}' is not a built-in app — user-defined apps are managed \
+                     directly in {} (edit or delete the files there)",
+                    apps_dir.display()
+                ),
+                1,
+            ));
+        };
+
+        let app_dir = apps_dir.join(name);
+
+        // No local copy yet: materialize a fresh one.
+        if !app_dir.is_dir() {
+            if !args.yes {
+                println!(
+                    "{name}: no local copy — would install one at {}",
+                    app_dir.display()
+                );
+                pending += 1;
+                continue;
+            }
+            fs::create_dir_all(&app_dir)
+                .map_err(|e| (format!("failed to create {}: {e}", app_dir.display()), 1))?;
+            if let Some(yaml) = entry.profile_yaml {
+                fs::write(app_dir.join("profile.yaml"), yaml)
+                    .map_err(|e| (format!("failed to write profile.yaml: {e}"), 1))?;
+            }
+            if let Some(yaml) = entry.secrets_yaml {
+                fs::write(app_dir.join("secrets.yaml"), yaml)
+                    .map_err(|e| (format!("failed to write secrets.yaml: {e}"), 1))?;
+            }
+            println!("{name}: installed local copy at {}", app_dir.display());
+            continue;
+        }
+
+        // profile.yaml: full replacement when it differs from the embedded one.
+        let profile_stale = app_update_available(name);
+
+        // secrets.yaml: union-append shipped entries the local file lacks.
+        // Skipped (with a warning) when the local file is encrypted.
+        let secrets_path = app_dir.join("secrets.yaml");
+        let mut missing: Vec<SecretEntry> = Vec::new();
+        let mut local_entries: Vec<SecretEntry> = Vec::new();
+        let mut secrets_skipped = false;
+        if let Some(shipped_yaml) = entry.secrets_yaml {
+            let local_raw = fs::read(&secrets_path).unwrap_or_default();
+            if looks_encrypted(&local_raw) {
+                eprintln!(
+                    "warning: {} is encrypted — secrets entries not updated",
+                    secrets_path.display()
+                );
+                secrets_skipped = true;
+            } else {
+                local_entries = if local_raw.is_empty() {
+                    vec![]
+                } else {
+                    parse_secrets(&local_raw, None).map_err(|e| {
+                        (
+                            format!("failed to parse {}: {e}", secrets_path.display()),
+                            1,
+                        )
+                    })?
+                };
+                let shipped: Vec<SecretEntry> =
+                    serde_yaml_ng::from_str(shipped_yaml).map_err(|e| {
+                        (
+                            format!("failed to parse built-in secrets for '{name}': {e}"),
+                            1,
+                        )
+                    })?;
+                let have: std::collections::HashSet<String> =
+                    local_entries.iter().map(entry_identity).collect();
+                missing = shipped
+                    .into_iter()
+                    .filter(|e| !have.contains(&entry_identity(e)))
+                    .collect();
+            }
+        }
+
+        if !profile_stale && missing.is_empty() {
+            println!("{name}: up to date");
+            continue;
+        }
+
+        if !args.yes {
+            if profile_stale {
+                println!(
+                    "{name}: profile.yaml differs from the shipped version — would replace it"
+                );
+            }
+            if !missing.is_empty() {
+                println!(
+                    "{name}: would append {} shipped secrets entr{} missing locally",
+                    missing.len(),
+                    if missing.len() == 1 { "y" } else { "ies" }
+                );
+            }
+            pending += 1;
+            continue;
+        }
+
+        if profile_stale {
+            if let Some(yaml) = entry.profile_yaml {
+                fs::write(app_dir.join("profile.yaml"), yaml)
+                    .map_err(|e| (format!("failed to write profile.yaml: {e}"), 1))?;
+                println!("{name}: profile.yaml updated");
+            }
+        }
+        if !missing.is_empty() && !secrets_skipped {
+            let added = missing.len();
+            local_entries.extend(missing);
+            let serialized = serialize_secrets(&local_entries, SecretsFormat::Yaml)
+                .map_err(|e| (format!("failed to serialize secrets: {e}"), 1))?;
+            atomic_write_private(&secrets_path, &serialized).map_err(|e| {
+                (
+                    format!("failed to write {}: {e}", secrets_path.display()),
+                    1,
+                )
+            })?;
+            println!(
+                "{name}: appended {added} shipped secrets entr{}",
+                if added == 1 { "y" } else { "ies" }
+            );
+        }
+    }
+
+    if pending > 0 {
+        return Err((
             format!(
-                "unknown app '{}'. Built-in apps: {}.",
-                args.name,
-                builtin_app_names().join(", ")
-            )
-        })
-        .map_err(|e| (e, 1))?;
-
-    fs::create_dir_all(&target_dir)
-        .map_err(|e| (format!("failed to create {}: {e}", target_dir.display()), 1))?;
-
-    let mut wrote: Vec<PathBuf> = vec![];
-
-    if let Some(yaml) = entry.profile_yaml {
-        let dst = target_dir.join("profile.yaml");
-        fs::write(&dst, yaml)
-            .map_err(|e| (format!("failed to write {}: {e}", dst.display()), 1))?;
-        wrote.push(dst);
+                "{pending} app{} pending — re-run with --yes to apply. \
+                 Local customizations to profile.yaml are overwritten; \
+                 secrets.yaml entries (including discovered literals) are preserved.",
+                if pending == 1 { "" } else { "s" }
+            ),
+            1,
+        ));
     }
-    if let Some(yaml) = entry.secrets_yaml {
-        let dst = target_dir.join("secrets.yaml");
-        fs::write(&dst, yaml)
-            .map_err(|e| (format!("failed to write {}: {e}", dst.display()), 1))?;
-        wrote.push(dst);
-    }
-
-    println!(
-        "Copied built-in '{}' to your user apps directory:",
-        args.name
-    );
-    for path in &wrote {
-        println!("  {}", path.display());
-    }
-    println!(
-        "\nEdits here override the built-in — use --app {} as usual.",
-        args.name
-    );
-    println!("To revert:  scour-secrets apps remove {} --yes", args.name);
 
     Ok(())
 }

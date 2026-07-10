@@ -1,4 +1,8 @@
-//! Integration tests for `scour-secrets apps` subcommands: list, add, remove, dir.
+//! Integration tests for `scour-secrets apps` subcommands: list, update, dir.
+//!
+//! Apps are plain YAML directories managed by the user; the CLI surface is
+//! list (default), `update` (refresh local copies of built-in bundles from
+//! the binary), and `dir` (print the apps directory path).
 
 use std::fs;
 use std::process::Command;
@@ -32,14 +36,6 @@ fn write_profile(dir: &std::path::Path, filename: &str) {
     .unwrap();
 }
 
-fn write_secrets(dir: &std::path::Path, filename: &str) {
-    fs::write(
-        dir.join(filename),
-        b"- pattern: \"test-secret\"\n  kind: literal\n  category: \"custom:secret\"\n  label: test\n",
-    )
-    .unwrap();
-}
-
 // ---------------------------------------------------------------------------
 // apps list
 // ---------------------------------------------------------------------------
@@ -68,6 +64,24 @@ fn apps_list_shows_user_defined_app() {
     assert!(s.contains("myapp"), "expected myapp in: {s}");
 }
 
+/// A local copy of a built-in whose profile.yaml differs from the shipped
+/// bundle is flagged in the list output.
+#[test]
+fn apps_list_marks_stale_local_copy() {
+    let dir = tempdir().unwrap();
+    let app_dir = dir.path().join("gitlab");
+    fs::create_dir_all(&app_dir).unwrap();
+    write_profile(&app_dir, "profile.yaml"); // differs from shipped
+
+    let out = run_with_apps_dir(&["apps"], dir.path().to_str().unwrap());
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let s = stdout(&out);
+    assert!(
+        s.contains("update available"),
+        "expected staleness marker in: {s}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // apps dir
 // ---------------------------------------------------------------------------
@@ -85,351 +99,185 @@ fn apps_dir_prints_path() {
 }
 
 // ---------------------------------------------------------------------------
-// apps add — happy paths
+// apps update
 // ---------------------------------------------------------------------------
 
 #[test]
-fn apps_add_profile_only() {
+fn apps_update_requires_names_or_all() {
     let dir = tempdir().unwrap();
-    let src = dir.path().join("myapp.profile.yaml");
-    write_profile(dir.path(), "myapp.profile.yaml");
-
-    let apps_dir = dir.path().join("apps");
-    let out = run_with_apps_dir(
-        &["apps", "add", "myapp", "--profile", src.to_str().unwrap()],
-        apps_dir.to_str().unwrap(),
-    );
-    assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert!(apps_dir.join("myapp").join("profile.yaml").exists());
-    assert!(!apps_dir.join("myapp").join("secrets.yaml").exists());
-    assert!(stdout(&out).contains("myapp"), "got: {}", stdout(&out));
-}
-
-#[test]
-fn apps_add_secrets_only() {
-    let dir = tempdir().unwrap();
-    let src = dir.path().join("myapp.secrets.yaml");
-    write_secrets(dir.path(), "myapp.secrets.yaml");
-
-    let apps_dir = dir.path().join("apps");
-    let out = run_with_apps_dir(
-        &[
-            "apps",
-            "add",
-            "myapp",
-            "--secrets-file",
-            src.to_str().unwrap(),
-        ],
-        apps_dir.to_str().unwrap(),
-    );
-    assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert!(apps_dir.join("myapp").join("secrets.yaml").exists());
-    assert!(!apps_dir.join("myapp").join("profile.yaml").exists());
-}
-
-#[test]
-fn apps_add_both_files() {
-    let dir = tempdir().unwrap();
-    write_profile(dir.path(), "p.yaml");
-    write_secrets(dir.path(), "s.yaml");
-
-    let apps_dir = dir.path().join("apps");
-    let out = run_with_apps_dir(
-        &[
-            "apps",
-            "add",
-            "elastic",
-            "--profile",
-            dir.path().join("p.yaml").to_str().unwrap(),
-            "--secrets-file",
-            dir.path().join("s.yaml").to_str().unwrap(),
-        ],
-        apps_dir.to_str().unwrap(),
-    );
-    assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert!(apps_dir.join("elastic").join("profile.yaml").exists());
-    assert!(apps_dir.join("elastic").join("secrets.yaml").exists());
-}
-
-#[test]
-fn apps_add_shows_in_list_after_install() {
-    let dir = tempdir().unwrap();
-    write_profile(dir.path(), "p.yaml");
-    let apps_dir = dir.path().join("apps");
-
-    run_with_apps_dir(
-        &[
-            "apps",
-            "add",
-            "newapp",
-            "--profile",
-            dir.path().join("p.yaml").to_str().unwrap(),
-        ],
-        apps_dir.to_str().unwrap(),
-    );
-
-    let list_out = run_with_apps_dir(&["apps"], apps_dir.to_str().unwrap());
+    let out = run_with_apps_dir(&["apps", "update"], dir.path().to_str().unwrap());
+    assert!(!out.status.success(), "expected non-zero exit");
     assert!(
-        stdout(&list_out).contains("newapp"),
-        "got: {}",
-        stdout(&list_out)
+        stderr(&out).contains("--all"),
+        "expected usage hint; got: {}",
+        stderr(&out)
     );
 }
 
-// ---------------------------------------------------------------------------
-// apps add — overwrite
-// ---------------------------------------------------------------------------
-
+/// User-defined apps have no shipped counterpart to update from.
 #[test]
-fn apps_add_fails_if_exists_without_overwrite() {
+fn apps_update_rejects_user_defined_app() {
     let dir = tempdir().unwrap();
-    write_profile(dir.path(), "p.yaml");
-    let apps_dir = dir.path().join("apps");
-    let profile_src = dir.path().join("p.yaml");
-
-    // First install succeeds.
-    let out1 = run_with_apps_dir(
-        &[
-            "apps",
-            "add",
-            "myapp",
-            "--profile",
-            profile_src.to_str().unwrap(),
-        ],
-        apps_dir.to_str().unwrap(),
-    );
-    assert!(out1.status.success());
-
-    // Second install without --overwrite fails.
-    let out2 = run_with_apps_dir(
-        &[
-            "apps",
-            "add",
-            "myapp",
-            "--profile",
-            profile_src.to_str().unwrap(),
-        ],
-        apps_dir.to_str().unwrap(),
-    );
-    assert!(!out2.status.success());
-    assert!(
-        stderr(&out2).contains("already exists") || stderr(&out2).contains("--overwrite"),
-        "got: {}",
-        stderr(&out2)
-    );
-}
-
-#[test]
-fn apps_add_overwrite_succeeds() {
-    let dir = tempdir().unwrap();
-    write_profile(dir.path(), "p.yaml");
-    let apps_dir = dir.path().join("apps");
-    let profile_src = dir.path().join("p.yaml");
-
-    run_with_apps_dir(
-        &[
-            "apps",
-            "add",
-            "myapp",
-            "--profile",
-            profile_src.to_str().unwrap(),
-        ],
-        apps_dir.to_str().unwrap(),
-    );
+    let app_dir = dir.path().join("myapp");
+    fs::create_dir_all(&app_dir).unwrap();
+    write_profile(&app_dir, "profile.yaml");
 
     let out = run_with_apps_dir(
-        &[
-            "apps",
-            "add",
-            "myapp",
-            "--profile",
-            profile_src.to_str().unwrap(),
-            "--overwrite",
-        ],
-        apps_dir.to_str().unwrap(),
+        &["apps", "update", "myapp", "--yes"],
+        dir.path().to_str().unwrap(),
     );
-    assert!(out.status.success(), "stderr: {}", stderr(&out));
-}
-
-// ---------------------------------------------------------------------------
-// apps add — error cases
-// ---------------------------------------------------------------------------
-
-#[test]
-fn apps_add_requires_at_least_one_file() {
-    let dir = tempdir().unwrap();
-    let apps_dir = dir.path().join("apps");
-    let out = run_with_apps_dir(&["apps", "add", "myapp"], apps_dir.to_str().unwrap());
-    assert!(!out.status.success());
+    assert!(!out.status.success(), "expected non-zero exit");
     assert!(
-        stderr(&out).contains("--profile") || stderr(&out).contains("--secrets"),
+        stderr(&out).contains("not a built-in"),
         "got: {}",
         stderr(&out)
     );
 }
 
+/// `apps update <name> --yes` with no local copy materializes a fresh one.
 #[test]
-fn apps_add_invalid_name_rejected() {
+fn apps_update_materializes_missing_copy() {
     let dir = tempdir().unwrap();
-    write_profile(dir.path(), "p.yaml");
-    let apps_dir = dir.path().join("apps");
-    let profile_src = dir.path().join("p.yaml");
-
-    for bad_name in &["", "my app", "my/app", "../escape"] {
-        let out = run_with_apps_dir(
-            &[
-                "apps",
-                "add",
-                bad_name,
-                "--profile",
-                profile_src.to_str().unwrap(),
-            ],
-            apps_dir.to_str().unwrap(),
-        );
-        assert!(
-            !out.status.success(),
-            "expected failure for name '{bad_name}', got success"
-        );
-    }
-}
-
-#[test]
-fn apps_add_invalid_profile_yaml_rejected() {
-    let dir = tempdir().unwrap();
-    let bad = dir.path().join("bad.yaml");
-    fs::write(&bad, b"this is: not: valid: profile: yaml: [[[").unwrap();
-    let apps_dir = dir.path().join("apps");
-
     let out = run_with_apps_dir(
-        &["apps", "add", "myapp", "--profile", bad.to_str().unwrap()],
-        apps_dir.to_str().unwrap(),
-    );
-    assert!(!out.status.success());
-    // Directory must not be created when validation fails.
-    assert!(!apps_dir.join("myapp").exists());
-}
-
-#[test]
-fn apps_add_invalid_secrets_yaml_rejected() {
-    let dir = tempdir().unwrap();
-    let bad = dir.path().join("bad.yaml");
-    fs::write(&bad, b"not_an_array: true").unwrap();
-    let apps_dir = dir.path().join("apps");
-
-    let out = run_with_apps_dir(
-        &["apps", "add", "myapp", "--secrets", bad.to_str().unwrap()],
-        apps_dir.to_str().unwrap(),
-    );
-    assert!(!out.status.success());
-    assert!(!apps_dir.join("myapp").exists());
-}
-
-// ---------------------------------------------------------------------------
-// apps remove
-// ---------------------------------------------------------------------------
-
-#[test]
-fn apps_remove_requires_yes_flag() {
-    let dir = tempdir().unwrap();
-    write_profile(dir.path(), "p.yaml");
-    let apps_dir = dir.path().join("apps");
-
-    run_with_apps_dir(
-        &[
-            "apps",
-            "add",
-            "myapp",
-            "--profile",
-            dir.path().join("p.yaml").to_str().unwrap(),
-        ],
-        apps_dir.to_str().unwrap(),
-    );
-
-    let out = run_with_apps_dir(&["apps", "remove", "myapp"], apps_dir.to_str().unwrap());
-    assert!(!out.status.success());
-    assert!(
-        stderr(&out).contains("--yes") || stderr(&out).contains("-y"),
-        "got: {}",
-        stderr(&out)
-    );
-    // App must still exist.
-    assert!(apps_dir.join("myapp").exists());
-}
-
-#[test]
-fn apps_remove_with_yes_deletes_app() {
-    let dir = tempdir().unwrap();
-    write_profile(dir.path(), "p.yaml");
-    let apps_dir = dir.path().join("apps");
-
-    run_with_apps_dir(
-        &[
-            "apps",
-            "add",
-            "myapp",
-            "--profile",
-            dir.path().join("p.yaml").to_str().unwrap(),
-        ],
-        apps_dir.to_str().unwrap(),
-    );
-
-    let out = run_with_apps_dir(
-        &["apps", "remove", "myapp", "--yes"],
-        apps_dir.to_str().unwrap(),
+        &["apps", "update", "gitlab", "--yes"],
+        dir.path().to_str().unwrap(),
     );
     assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert!(!apps_dir.join("myapp").exists());
-}
-
-#[test]
-fn apps_remove_nonexistent_is_error() {
-    let dir = tempdir().unwrap();
-    let apps_dir = dir.path().join("apps");
-    let out = run_with_apps_dir(
-        &["apps", "remove", "doesnotexist", "--yes"],
-        apps_dir.to_str().unwrap(),
-    );
-    assert!(!out.status.success());
-}
-
-#[test]
-fn apps_remove_builtin_is_rejected() {
-    let dir = tempdir().unwrap();
-    let apps_dir = dir.path().join("apps");
-    let out = run_with_apps_dir(
-        &["apps", "remove", "gitlab", "--yes"],
-        apps_dir.to_str().unwrap(),
-    );
-    assert!(!out.status.success());
-    assert!(stderr(&out).contains("built-in"), "got: {}", stderr(&out));
-}
-
-#[test]
-fn apps_remove_and_gone_from_list() {
-    let dir = tempdir().unwrap();
-    write_profile(dir.path(), "p.yaml");
-    let apps_dir = dir.path().join("apps");
-    let profile_src = dir.path().join("p.yaml");
-
-    run_with_apps_dir(
-        &[
-            "apps",
-            "add",
-            "tempapp",
-            "--profile",
-            profile_src.to_str().unwrap(),
-        ],
-        apps_dir.to_str().unwrap(),
-    );
-    run_with_apps_dir(
-        &["apps", "remove", "tempapp", "--yes"],
-        apps_dir.to_str().unwrap(),
-    );
-
-    let list_out = run_with_apps_dir(&["apps"], apps_dir.to_str().unwrap());
+    assert!(dir.path().join("gitlab/profile.yaml").is_file());
+    assert!(dir.path().join("gitlab/secrets.yaml").is_file());
     assert!(
-        !stdout(&list_out).contains("tempapp"),
+        stdout(&out).contains("installed local copy"),
         "got: {}",
-        stdout(&list_out)
+        stdout(&out)
+    );
+}
+
+/// A freshly materialized copy is up to date; a second update is a no-op.
+#[test]
+fn apps_update_up_to_date_is_noop() {
+    let dir = tempdir().unwrap();
+    run_with_apps_dir(
+        &["apps", "update", "gitlab", "--yes"],
+        dir.path().to_str().unwrap(),
+    );
+    let out = run_with_apps_dir(
+        &["apps", "update", "gitlab", "--yes"],
+        dir.path().to_str().unwrap(),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("up to date"), "got: {}", stdout(&out));
+}
+
+/// Without --yes a stale copy produces a dry-run summary and non-zero exit;
+/// the files are not touched.
+#[test]
+fn apps_update_dry_run_without_yes() {
+    let dir = tempdir().unwrap();
+    run_with_apps_dir(
+        &["apps", "update", "gitlab", "--yes"],
+        dir.path().to_str().unwrap(),
+    );
+    let profile = dir.path().join("gitlab/profile.yaml");
+    write_profile(profile.parent().unwrap(), "profile.yaml");
+    let modified = fs::read(&profile).unwrap();
+
+    let out = run_with_apps_dir(&["apps", "update", "gitlab"], dir.path().to_str().unwrap());
+    assert!(!out.status.success(), "dry run must exit non-zero");
+    assert!(
+        stdout(&out).contains("would replace"),
+        "got: {}",
+        stdout(&out)
+    );
+    assert_eq!(
+        fs::read(&profile).unwrap(),
+        modified,
+        "dry run must not modify files"
+    );
+}
+
+/// With --yes a stale profile.yaml is replaced with the shipped version.
+#[test]
+fn apps_update_replaces_stale_profile() {
+    let dir = tempdir().unwrap();
+    run_with_apps_dir(
+        &["apps", "update", "gitlab", "--yes"],
+        dir.path().to_str().unwrap(),
+    );
+    let profile = dir.path().join("gitlab/profile.yaml");
+    let shipped = fs::read(&profile).unwrap();
+    write_profile(profile.parent().unwrap(), "profile.yaml");
+
+    let out = run_with_apps_dir(
+        &["apps", "update", "gitlab", "--yes"],
+        dir.path().to_str().unwrap(),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(
+        fs::read(&profile).unwrap(),
+        shipped,
+        "profile.yaml must match the shipped bundle after update"
+    );
+}
+
+/// secrets.yaml is a union update: locally added entries (e.g. discovered
+/// literals from the structured handoff) survive, and shipped entries missing
+/// locally are appended.
+#[test]
+fn apps_update_preserves_local_secrets_and_appends_shipped() {
+    let dir = tempdir().unwrap();
+    run_with_apps_dir(
+        &["apps", "update", "gitlab", "--yes"],
+        dir.path().to_str().unwrap(),
+    );
+    let secrets = dir.path().join("gitlab/secrets.yaml");
+
+    // Replace the local secrets with a single user/discovered entry, dropping
+    // every shipped one.
+    fs::write(
+        &secrets,
+        "- pattern: \"discovered-hostname.corp\"\n  kind: literal\n  category: hostname\n  label: discovered\n",
+    )
+    .unwrap();
+
+    let out = run_with_apps_dir(
+        &["apps", "update", "gitlab", "--yes"],
+        dir.path().to_str().unwrap(),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("appended"), "got: {}", stdout(&out));
+
+    let content = fs::read_to_string(&secrets).unwrap();
+    assert!(
+        content.contains("discovered-hostname.corp"),
+        "local entry must survive the update; got:\n{content}"
+    );
+    assert!(
+        content.contains("glpat-"),
+        "shipped entries must be appended; got:\n{content}"
+    );
+}
+
+/// `--all` refreshes only apps with an existing local copy.
+#[test]
+fn apps_update_all_touches_existing_copies_only() {
+    let dir = tempdir().unwrap();
+    run_with_apps_dir(
+        &["apps", "update", "gitlab", "--yes"],
+        dir.path().to_str().unwrap(),
+    );
+
+    let out = run_with_apps_dir(
+        &["apps", "update", "--all", "--yes"],
+        dir.path().to_str().unwrap(),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("gitlab: up to date"),
+        "got: {}",
+        stdout(&out)
+    );
+    assert!(
+        !dir.path().join("nginx").exists(),
+        "--all must not materialize apps that were never used"
     );
 }

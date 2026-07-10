@@ -29,6 +29,19 @@ fn write_cfg_input(dir: &std::path::Path, filename: &str) -> std::path::PathBuf 
     path
 }
 
+/// Fresh apps directory per invocation, for two reasons: a user-level bundle
+/// in ~/.config/scour-secrets/apps/<name> would otherwise shadow the built-in
+/// bundle under test, and `--app` materializes the bundle into this directory
+/// (and the handoff appends discovered literals to its secrets.yaml), so a
+/// shared directory would leak state between tests.
+fn isolated_apps_dir() -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    // Keep the directory alive for the process lifetime; the OS reclaims it.
+    std::mem::forget(dir);
+    path
+}
+
 /// Write a secrets JSON file with a single literal pattern.
 fn write_literal_secrets(dir: &std::path::Path, filename: &str, value: &str) -> std::path::PathBuf {
     let path = dir.join(filename);
@@ -66,6 +79,7 @@ fn app_bundle_replaces_known_pattern() {
             output.to_str().unwrap(),
         ])
         .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
         .output()
         .unwrap();
 
@@ -102,6 +116,7 @@ fn app_bundle_combined_with_secrets_file() {
             output.to_str().unwrap(),
         ])
         .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
         .output()
         .unwrap();
 
@@ -130,6 +145,7 @@ fn app_bundle_unknown_name_fails() {
             output.to_str().unwrap(),
         ])
         .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
         .output()
         .unwrap();
 
@@ -203,6 +219,7 @@ fn no_structured_handoff_with_secrets_file_does_not_mutate_secrets_file() {
             output.to_str().unwrap(),
         ])
         .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
         .output()
         .unwrap();
 
@@ -252,6 +269,7 @@ fn allow_flag_passes_value_through_unchanged() {
         .stdout(Stdio::piped())
         .env("SCOUR_SECRETS_LOG", "error")
         .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
         .current_dir(dir.path())
         .spawn()
         .unwrap();
@@ -339,6 +357,7 @@ fn two_pass_profile_seeds_plain_text_scan() {
         ])
         .env("SCOUR_SECRETS_LOG", "error")
         .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
         .output()
         .unwrap();
 
@@ -431,6 +450,7 @@ fn duplicate_value_across_structured_files_redacted_in_both() {
             ])
             .env("SCOUR_SECRETS_LOG", "error")
             .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+            .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
             .output()
             .unwrap();
 
@@ -511,6 +531,7 @@ fn escaped_value_in_unmatched_field_redacted_cross_file() {
         ])
         .env("SCOUR_SECRETS_LOG", "error")
         .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
         .output()
         .unwrap();
     assert!(
@@ -609,6 +630,7 @@ fn cross_archive_duplicate_value_redacted_in_both_archives() {
         ])
         .env("SCOUR_SECRETS_LOG", "error")
         .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
         .output()
         .unwrap();
     assert!(
@@ -668,6 +690,7 @@ fn profile_custom_log_extension_is_structured() {
         ])
         .env("SCOUR_SECRETS_LOG", "error")
         .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
         .output()
         .unwrap();
     assert!(
@@ -714,6 +737,7 @@ fn structured_field_edits_are_counted_in_summary() {
         ])
         .env("SCOUR_SECRETS_LOG", "error")
         .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -792,6 +816,7 @@ fn encrypted_handoff_writes_back_reencrypted() {
         .env("SCOUR_SECRETS_PASSWORD", file_pw)
         .env("SCOUR_SECRETS_LOG", "error")
         .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
         .output()
         .unwrap();
     assert!(
@@ -838,6 +863,7 @@ fn encrypted_handoff_writes_back_reencrypted() {
         .env("SCOUR_SECRETS_PASSWORD", file_pw)
         .env("SCOUR_SECRETS_LOG", "error")
         .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
         .output()
         .unwrap();
     assert!(
@@ -849,5 +875,379 @@ fn encrypted_handoff_writes_back_reencrypted() {
     assert!(
         !log_out.contains(password),
         "second run must replace the value discovered in run 1; got:\n{log_out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GitLab support-bundle coverage (GitLabSOS / kubeSOS artifact shapes)
+// ---------------------------------------------------------------------------
+
+/// GitLabSOS stores service logs as extensionless runit files
+/// (var/log/gitlab/<service>/current). The gitaly stanza must fire on that
+/// path shape, and non-JSON (timestamp-prefixed) lines must pass through via
+/// skip_invalid instead of failing the file.
+#[test]
+fn gitlabsos_runit_current_log_is_scrubbed() {
+    let dir = tempdir().unwrap();
+    let log_dir = dir.path().join("var/log/gitlab/gitaly");
+    fs::create_dir_all(&log_dir).unwrap();
+    let input = log_dir.join("current");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"grpc.request.glProjectPath":"top-group/secret-project","level":"info"}"#,
+            "\n",
+            "2026-07-08_12:00:00.12345 plain runit prefixed line\n",
+        ),
+    )
+    .unwrap();
+    let output = dir.path().join("out");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scour-secrets"))
+        .args([
+            input.to_str().unwrap(),
+            "--app",
+            "gitlab",
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let result = fs::read_to_string(&output).unwrap();
+    assert!(
+        !result.contains("top-group/secret-project"),
+        "glProjectPath must be scrubbed from a runit current file; got:\n{result}"
+    );
+    assert!(
+        result.contains("2026-07-08_12:00:00.12345"),
+        "non-JSON prefixed line must pass through unchanged; got:\n{result}"
+    );
+}
+
+/// kubeSOS `helm get values --all` dump (all_values.yaml) inlines chart
+/// credentials; the Helm values stanza must match that filename.
+#[test]
+fn kubesos_all_values_dump_is_scrubbed() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("all_values.yaml");
+    fs::write(
+        &input,
+        "global:\n  initialRootPassword: rootPass1234\n  smtp:\n    password: smtpPass5678\n",
+    )
+    .unwrap();
+    let output = dir.path().join("out.yaml");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scour-secrets"))
+        .args([
+            input.to_str().unwrap(),
+            "--app",
+            "gitlab",
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let result = fs::read_to_string(&output).unwrap();
+    assert!(
+        !result.contains("rootPass1234") && !result.contains("smtpPass5678"),
+        "all_values.yaml credentials must be scrubbed; got:\n{result}"
+    );
+}
+
+/// /etc/gitlab/gitlab-secrets.json is the Omnibus master secret store — every
+/// leaf value long enough to be secret material must be scrubbed.
+#[test]
+fn gitlab_secrets_json_is_fully_scrubbed() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("gitlab-secrets.json");
+    fs::write(
+        &input,
+        r#"{"gitlab_rails":{"secret_key_base":"a1b2c3d4e5f60718293a4b5c6d7e8f90"},"gitlab_shell":{"secret_token":"fedcba9876543210fedcba9876543210"}}"#,
+    )
+    .unwrap();
+    let output = dir.path().join("out.json");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scour-secrets"))
+        .args([
+            input.to_str().unwrap(),
+            "--app",
+            "gitlab",
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let result = fs::read_to_string(&output).unwrap();
+    assert!(
+        !result.contains("a1b2c3d4e5f60718293a4b5c6d7e8f90")
+            && !result.contains("fedcba9876543210fedcba9876543210"),
+        "gitlab-secrets.json values must be scrubbed; got:\n{result}"
+    );
+}
+
+/// api_json.log params arrays: the "value" member carries user-submitted data
+/// and must be scrubbed; the "key" member is a metadata label and must be
+/// preserved verbatim (mirrors gitlab-scrubber's params handling).
+#[test]
+fn api_json_params_values_scrubbed_keys_preserved() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("api_json.log");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"params":[{"key":"private_token","value":"s3kr3tvalue123"},{"key":"id","value":"42"}],"username":"alice"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let output = dir.path().join("out.log");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scour-secrets"))
+        .args([
+            input.to_str().unwrap(),
+            "--app",
+            "gitlab",
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let result = fs::read_to_string(&output).unwrap();
+    assert!(
+        !result.contains("s3kr3tvalue123"),
+        "params value must be scrubbed; got:\n{result}"
+    );
+    assert!(
+        result.contains(r#""key":"private_token""#),
+        "params key member is a metadata label and must be preserved; got:\n{result}"
+    );
+    assert!(
+        result.contains(r#""value":"42""#),
+        "short params values below min_length must pass through; got:\n{result}"
+    );
+    assert!(
+        !result.contains("alice"),
+        "username must be scrubbed; got:\n{result}"
+    );
+}
+
+/// helm_manifest.yaml (kubeSOS `helm get manifest` dump) is multi-document
+/// YAML that can embed Secret objects; data/stringData leaves must be
+/// scrubbed across document boundaries.
+#[test]
+fn kubesos_helm_manifest_secret_data_scrubbed() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("helm_manifest.yaml");
+    fs::write(
+        &input,
+        concat!(
+            "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm\n",
+            "---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: creds\n",
+            "data:\n  password: cGFzc3dvcmQtaW4tYjY0LWZvcm0=\n",
+            "stringData:\n  api_token: plaintext-token-value-99\n",
+        ),
+    )
+    .unwrap();
+    let output = dir.path().join("out.yaml");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scour-secrets"))
+        .args([
+            input.to_str().unwrap(),
+            "--app",
+            "gitlab",
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let result = fs::read_to_string(&output).unwrap();
+    assert!(
+        !result.contains("cGFzc3dvcmQtaW4tYjY0LWZvcm0=")
+            && !result.contains("plaintext-token-value-99"),
+        "Secret data in the second YAML document must be scrubbed; got:\n{result}"
+    );
+}
+
+/// kubeSOS kubectl describe dumps print literal env values for plain env vars.
+/// Credential-looking keys must be scrubbed from the extensionless file;
+/// non-credential lines stay intact.
+#[test]
+fn kubesos_describe_pods_env_credentials_scrubbed() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("describe_pods");
+    fs::write(
+        &input,
+        concat!(
+            "Name:         webservice-abc123\n",
+            "    Environment:\n",
+            "      POSTGRES_PASSWORD:  hunter2secret99\n",
+            "      GITLAB_HOST:        gitlab.example.com\n",
+        ),
+    )
+    .unwrap();
+    let output = dir.path().join("out");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scour-secrets"))
+        .args([
+            input.to_str().unwrap(),
+            "--app",
+            "gitlab",
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", isolated_apps_dir())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let result = fs::read_to_string(&output).unwrap();
+    assert!(
+        !result.contains("hunter2secret99"),
+        "literal env credential must be scrubbed from describe output; got:\n{result}"
+    );
+    assert!(
+        result.contains("POSTGRES_PASSWORD"),
+        "env var names must be preserved; got:\n{result}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// App bundle materialization + staleness warning
+// ---------------------------------------------------------------------------
+
+/// The first `--app <name>` run materializes the built-in bundle into the
+/// apps directory; those files are the app from then on.
+#[test]
+fn app_run_materializes_bundle_into_apps_dir() {
+    let dir = tempdir().unwrap();
+    let apps_dir = dir.path().join("apps");
+    let input = dir.path().join("config.txt");
+    fs::write(&input, "token = glpat-xxxxxxxxxxxxxxxxxxxx\n").unwrap();
+    let output = dir.path().join("out.txt");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scour-secrets"))
+        .args([
+            input.to_str().unwrap(),
+            "--app",
+            "gitlab",
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .env("SCOUR_SECRETS_LOG", "error")
+        .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", apps_dir.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        apps_dir.join("gitlab/profile.yaml").is_file(),
+        "profile.yaml should be materialized on first --app use"
+    );
+    assert!(
+        apps_dir.join("gitlab/secrets.yaml").is_file(),
+        "secrets.yaml should be materialized on first --app use"
+    );
+}
+
+/// When the materialized profile.yaml differs from the bundle shipped in the
+/// binary (newer release, or local edit), the run prints a warning pointing
+/// at `apps update`.
+#[test]
+fn stale_local_profile_warns_on_app_run() {
+    let dir = tempdir().unwrap();
+    let apps_dir = dir.path().join("apps");
+    let gitlab_dir = apps_dir.join("gitlab");
+    fs::create_dir_all(&gitlab_dir).unwrap();
+    // Simulate a copy from an older release: valid but different profile.
+    fs::write(
+        gitlab_dir.join("profile.yaml"),
+        "- processor: yaml\n  extensions: [\".yaml\"]\n  fields:\n    - pattern: \"*.password\"\n      category: \"custom:password\"\n",
+    )
+    .unwrap();
+    fs::write(gitlab_dir.join("secrets.yaml"), "[]\n").unwrap();
+
+    let input = dir.path().join("config.txt");
+    fs::write(&input, "hello\n").unwrap();
+    let output = dir.path().join("out.txt");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scour-secrets"))
+        .args([
+            input.to_str().unwrap(),
+            "--app",
+            "gitlab",
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .env("SCOUR_SECRETS_LOG", "warn")
+        .env("SCOUR_SECRETS_NO_SETTINGS", "1")
+        .env("SCOUR_SECRETS_APPS_DIR", apps_dir.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("apps update gitlab"),
+        "expected staleness warning pointing at `apps update`; stderr:\n{stderr}"
     );
 }

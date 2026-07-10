@@ -64,8 +64,7 @@ scour-secrets init-hook [OPTIONS]
 scour-secrets show-config
 scour-secrets install-hook [OPTIONS]
 scour-secrets apps
-scour-secrets apps add <NAME> [OPTIONS]
-scour-secrets apps remove <NAME> [OPTIONS]
+scour-secrets apps update [<NAME>...|--all] [--yes]
 scour-secrets apps dir
 scour-secrets allow-test --allow <PATTERN>... [VALUE]...
 scour-secrets template [PRESET]
@@ -77,15 +76,15 @@ The default mode (no subcommand) sanitizes one or more files and archives. Multi
 
 ### `scour-secrets apps`
 
-Manage app bundles: list available bundles, install custom ones, remove them, or show the storage directory.
+App bundles: list available bundles, refresh local copies from the binary, or show the apps directory.
 
 ```
 scour-secrets apps
-scour-secrets apps add <NAME> [OPTIONS]
-scour-secrets apps remove <NAME> [OPTIONS]
-scour-secrets apps edit <NAME>
+scour-secrets apps update [<NAME>...|--all] [--yes]
 scour-secrets apps dir
 ```
+
+Apps are plain YAML — one directory per app in the apps directory (see `apps dir`), holding `secrets.yaml` (`Vec<SecretEntry>`) and/or `profile.yaml` (`Vec<FileTypeProfile>`). Create, edit, or delete apps by managing those files directly; there is no install ceremony. A directory whose name matches a built-in app takes precedence over the built-in.
 
 #### `scour-secrets apps` (list)
 
@@ -105,7 +104,7 @@ scour-secrets apps
 #   elasticsearch      Elasticsearch — elasticsearch.yml, Kibana/Logstash credentials
 #   fstab              fstab — /etc/fstab CIFS/SMB credentials, NFS and iSCSI server addresses
 #   github-actions     GitHub Actions — workflow env vars, step inputs, container registry credentials
-#   gitlab             GitLab — CI/CD logs, runner output, .gitlab-ci.yml variables
+#   gitlab             GitLab — gitlab.rb, .gitlab-ci.yml, Helm values, GitLabSOS/kubeSOS support bundles
 #   grafana            Grafana — grafana.ini admin credentials, provisioning datasource secrets
 #   har                HAR (HTTP Archive) — browser-captured request/response traffic, auth headers, cookies
 #   heroku             Heroku — app.json env values, add-on credentials (Postgres, Redis, SendGrid…)
@@ -137,98 +136,51 @@ Each app bundle includes:
 - A set of secrets patterns compiled into the scanner alongside any `--secrets-file` patterns.
 - A structured field profile merged with any `--profile` you supply.
 
-#### `scour-secrets apps add`
+#### `scour-secrets apps update`
 
-Install a custom app bundle from local YAML files. At least one of `--profile` or `--secrets` must be supplied. Both files are validated before anything is written to disk.
+Refresh local copies of built-in bundles from the binary.
 
-```
-scour-secrets apps add <NAME> [--profile FILE] [--secrets FILE] [--overwrite]
-```
+The first `--app <name>` run materializes the built-in bundle into the apps directory; from then on those files *are* the app — you edit them in place, and the structured handoff appends discovered literals to the app's `secrets.yaml`. After upgrading scour-secrets, a run whose local `profile.yaml` differs from the shipped bundle prints a one-line warning; this command brings the copy back in sync:
 
-| Flag | Description |
-|------|-------------|
-| `<NAME>` | Bundle name (letters, digits, hyphens, underscores; must start with a letter or digit). |
-| `--profile <FILE>` | Path to a profile YAML file (`Vec<FileTypeProfile>`). |
-| `--secrets <FILE>` | Path to a secrets YAML file (`Vec<SecretEntry>`). |
-| `--overwrite` | Replace an existing custom bundle with the same name. |
-
-```bash
-# Install from a profile and a secrets file:
-scour-secrets apps add elastic \
-  --profile elastic.profile.yaml \
-  --secrets elastic.secrets.yaml
-
-# Profile only (no scanner patterns):
-scour-secrets apps add myapp --profile myapp.profile.yaml
-
-# Secrets only (no structured field rules):
-scour-secrets apps add myapp --secrets myapp.secrets.yaml
-
-# Replace an existing custom bundle:
-scour-secrets apps add elastic --profile elastic.profile.yaml --overwrite
-
-# Use it immediately after installing:
-scour-secrets server.log --app elastic
-```
-
-The bundle is stored under the user apps directory (see `scour-secrets apps dir`). The first `# comment` line of either YAML file becomes the description shown in `scour-secrets apps`.
-
-#### `scour-secrets apps remove`
-
-Remove a custom app bundle. Built-in bundles cannot be removed.
+- `profile.yaml` is **replaced** with the shipped version (local customizations are overwritten).
+- `secrets.yaml` is **union-updated**: shipped entries missing locally are appended; locally added entries — including discovered literals — are preserved. (Entries you deleted from the shipped set reappear.)
 
 ```
-scour-secrets apps remove <NAME> [--yes]
+scour-secrets apps update [<NAME>...|--all] [--yes]
 ```
 
 | Flag | Description |
 |------|-------------|
-| `<NAME>` | Name of the custom bundle to remove. |
-| `--yes` / `-y` | Confirm removal. Required — the command refuses to delete without it. |
+| `<NAME>...` | Built-in bundle names to update. A name with no local copy gets one materialized. |
+| `--all` | Update every built-in bundle that has a local copy (never materializes new ones). |
+| `--yes` / `-y` | Apply the changes. Without it, prints a dry-run summary and exits non-zero. |
 
 ```bash
-# Remove a custom bundle (--yes required):
-scour-secrets apps remove elastic --yes
+# See what would change:
+scour-secrets apps update --all
 
-# Short form:
-scour-secrets apps remove elastic -y
+# Refresh one bundle:
+scour-secrets apps update gitlab --yes
+
+# Refresh every local copy:
+scour-secrets apps update --all --yes
 ```
+
+User-defined apps (no built-in counterpart) are never touched — they are yours to manage in the apps directory. To keep a customized `profile.yaml` and silence the staleness warning, simply don't run `update` for that app; the warning notes it may be a local customization.
 
 #### `scour-secrets apps dir`
 
-Print the path to the user apps directory. Bundles are stored one subdirectory per app name.
+Print the path to the apps directory. Bundles are stored one subdirectory per app name.
 
 ```bash
 scour-secrets apps dir
-# /Users/alice/.config/sanitize/apps
+# /Users/alice/.config/scour-secrets/apps
 
 # Override the location with an environment variable:
 SCOUR_SECRETS_APPS_DIR=/opt/sanitize/apps scour-secrets apps dir
 ```
 
-#### `scour-secrets apps edit`
-
-Copy a built-in app bundle's YAML files into the user apps directory so you can customise them. Opens the copied files in `$EDITOR` (or `$VISUAL`) if one is set.
-
-```
-scour-secrets apps edit <NAME>
-```
-
-| Argument | Description |
-|----------|-------------|
-| `<NAME>` | Name of the built-in bundle to copy (e.g. `rails`, `kubernetes`, `gitlab`). |
-
-```bash
-# Copy the built-in rails bundle into the user apps directory for editing:
-scour-secrets apps edit rails
-
-# After editing, use the customised bundle like any other:
-scour-secrets server.log --app rails
-```
-
-The copied files are placed in the user apps directory (see `scour-secrets apps dir`). To revert to the built-in version, remove the user copy with `scour-secrets apps remove <name> --yes`.
-
-You can also drop bundle directories manually without using `scour-secrets apps add`:
+Creating a custom app is just making a directory:
 
 ```
 ~/.config/scour-secrets/apps/
@@ -239,7 +191,7 @@ You can also drop bundle directories manually without using `scour-secrets apps 
     profile.yaml
 ```
 
-The directory name is the app name. `SCOUR_SECRETS_APPS_DIR` overrides the default location. User-defined bundles take precedence over built-in bundles with the same name.
+The directory name is the app name (letters, digits, hyphens, underscores). The first `# comment` line of either YAML file becomes the description shown in `scour-secrets apps`. Delete the directory to remove the app; for a built-in name, deleting the local copy re-materializes a fresh one on the next `--app` run.
 
 ### `scour-secrets init-hook`
 
