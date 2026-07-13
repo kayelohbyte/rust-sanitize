@@ -3,6 +3,21 @@
 Thank you for your interest in contributing! This document explains how to
 get started.
 
+## Where to Contribute
+
+The canonical repository is
+[github.com/kayelohbyte/scour-secrets](https://github.com/kayelohbyte/scour-secrets);
+the GitLab project is an automated push mirror of it.
+
+- **Bug reports and feature requests:** open an issue on whichever platform
+  you prefer — both are watched.
+- **Code changes:** open a pull request on **GitHub only**. The mirror
+  force-pushes GitHub state to GitLab, so a merge request merged on GitLab
+  would be silently overwritten. Merge requests are disabled on the mirror.
+- **Security vulnerabilities:** never open a public issue on either
+  platform — see [SECURITY.md](SECURITY.md) for the private disclosure
+  process.
+
 Before writing code, read [DESIGN.md](DESIGN.md). It explains the
 non-negotiable constraints (determinism, length preservation, no secret
 logging, memory bounds, atomic writes) and will save you from opening a PR

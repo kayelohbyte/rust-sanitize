@@ -25,5 +25,7 @@ jobs:
           GITLAB_REPO: ${{ secrets.GITLAB_REPO }}
         run: |
           git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@${GITLAB_REPO}"
-          git push gitlab "refs/remotes/origin/*:refs/heads/*" --force
+          # --prune removes GitLab branches that no longer exist on GitHub,
+          # so the mirror never accumulates stale or GitLab-only branches.
+          git push gitlab "refs/remotes/origin/*:refs/heads/*" --force --prune
           git push gitlab --tags --force

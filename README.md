@@ -441,6 +441,24 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ---
 
+## Contributing
+
+The canonical repository is on **GitHub**:
+[github.com/kayelohbyte/scour-secrets](https://github.com/kayelohbyte/scour-secrets).
+The GitLab project is an automated push mirror.
+
+- **Issues** are welcome on **either** platform.
+- **Code changes** (pull requests) are accepted on **GitHub only** — the
+  mirror force-pushes from GitHub, so anything merged on GitLab would be
+  overwritten. Merge requests on GitLab are disabled for this reason.
+- **Releases** (binaries) are published on
+  [GitHub Releases](https://github.com/kayelohbyte/scour-secrets/releases);
+  the mirror carries tags but not release artifacts.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build, test, and PR guidelines.
+
+---
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full text.
