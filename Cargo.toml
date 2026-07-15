@@ -46,6 +46,12 @@ argon2 = { version = "0.5", features = ["zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+# Lenient JSON (comments, unquoted keys, trailing commas, single quotes) —
+# fallback parse for app configs written by relaxed parsers (e.g. Dataiku
+# project variables), used only when strict JSON parsing fails.
+# Pinned to 0.4: every 1.x release uses let-chains (Rust 1.88+), above this
+# crate's MSRV of 1.86.
+json5 = "0.4"
 serde_yaml_ng = "0.10"
 toml = "0.8"
 # Span-preserving structured editing (format-preserving in-place value redaction).

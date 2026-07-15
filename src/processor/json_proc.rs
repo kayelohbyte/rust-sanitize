@@ -5,7 +5,10 @@
 //! value at its exact source span, so whitespace, key order, and the escaping of
 //! unrelated content are preserved byte-for-byte and values escaped in the
 //! source (e.g. `\/`, `\uXXXX`) are redacted without leaking. `process` is the
-//! re-serializing fallback used when span editing is unavailable.
+//! re-serializing fallback used when span editing is unavailable; it also
+//! accepts lenient JSON (JSON5: comments, unquoted keys, trailing commas,
+//! single quotes) when strict parsing fails, so field rules still reach config
+//! files written by relaxed parsers.
 //!
 //! # Key Paths
 //!
@@ -29,6 +32,34 @@ fn json_err(e: impl std::fmt::Display) -> SanitizeError {
     SanitizeError::ParseError {
         format: "JSON".into(),
         message: format!("JSON parse error: {e}"),
+    }
+}
+
+/// Parse a JSON document, falling back to lenient JSON5 parsing when strict
+/// parsing fails.
+///
+/// Config files written by relaxed parsers (Dataiku project `variables.json`,
+/// hand-edited app configs) routinely carry comments, unquoted keys, trailing
+/// commas, or single-quoted strings that `serde_json` rejects. Without the
+/// fallback such files skip the structured pass entirely and their field rules
+/// (`*password*`, `*secret*`, …) are never applied — a redaction coverage gap.
+///
+/// On strict-parse failure the strict error is kept and returned if the
+/// lenient parse also fails: its line/column information is the more precise
+/// diagnostic.
+fn parse_strict_or_lenient(text: &str) -> Result<Value> {
+    match serde_json::from_str(text) {
+        Ok(v) => Ok(v),
+        Err(strict_err) => match json5::from_str(text) {
+            Ok(v) => {
+                tracing::debug!(error = %strict_err, "strict JSON parse failed; parsed leniently as JSON5");
+                Ok(v)
+            }
+            Err(_) => Err(SanitizeError::ParseError {
+                format: "JSON".into(),
+                message: format!("JSON parse error: {strict_err}"),
+            }),
+        },
     }
 }
 
@@ -58,11 +89,7 @@ impl Processor for JsonProcessor {
         // F-04 fix: enforce input size limit.
         let text = crate::processor::check_size_and_decode(content, "JSON", DEFAULT_INPUT_SIZE)?;
 
-        let mut value: Value =
-            serde_json::from_str(text).map_err(|e| SanitizeError::ParseError {
-                format: "JSON".into(),
-                message: format!("JSON parse error: {}", e),
-            })?;
+        let mut value: Value = parse_strict_or_lenient(text)?;
 
         walk_json(&mut value, "", profile, store, 0)?;
 
@@ -342,6 +369,67 @@ mod tests {
         assert_ne!(out["db"]["password"].as_str().unwrap(), "pw1");
         assert_ne!(out["cache"]["password"].as_str().unwrap(), "pw2");
         assert_eq!(out["name"], "app");
+    }
+
+    // ── lenient (JSON5) fallback ─────────────────────────────────────────────
+
+    /// Files written by relaxed parsers (Dataiku project variables) carry
+    /// unquoted keys, trailing commas, comments, and single quotes. The
+    /// literal `process` pass must still parse them and apply field rules.
+    #[test]
+    fn lenient_json_fallback_applies_field_rules() {
+        let store = make_store();
+        let proc = JsonProcessor;
+
+        let content = br#"{
+  // user-edited project variables
+  db_password: 'hunter2secret',
+  api_token: "tok-abcdef123456",
+  keep: "plain",
+}"#;
+        let profile = FileTypeProfile::new(
+            "json",
+            vec![
+                FieldRule::new("*password*").with_category(Category::Custom("pw".into())),
+                FieldRule::new("*token*").with_category(Category::AuthToken),
+            ],
+        )
+        .with_option("compact", "true");
+
+        let result = proc.process(content, &profile, &store).unwrap();
+        let text = String::from_utf8(result).unwrap();
+        assert!(!text.contains("hunter2secret"), "password leaked: {text}");
+        assert!(!text.contains("tok-abcdef123456"), "token leaked: {text}");
+        // Output is re-serialized strict JSON with unmatched fields intact.
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["keep"], "plain");
+    }
+
+    /// Content that is not valid JSON5 either must still fail with the
+    /// original strict parse error (more precise line/column diagnostics).
+    #[test]
+    fn invalid_json_still_errors_after_lenient_fallback() {
+        let store = make_store();
+        let proc = JsonProcessor;
+        let profile = FileTypeProfile::new("json", vec![]);
+        let err = proc
+            .process(b"not json at all {{{", &profile, &store)
+            .expect_err("garbage input must not parse");
+        assert!(err.to_string().contains("JSON parse error"));
+    }
+
+    /// Strict JSON must never take the lenient path (identical behavior to
+    /// before the fallback existed).
+    #[test]
+    fn strict_json_unaffected_by_lenient_fallback() {
+        let store = make_store();
+        let proc = JsonProcessor;
+        let content = br#"{"a": 1, "b": "two"}"#;
+        let profile = FileTypeProfile::new("json", vec![]).with_option("compact", "true");
+        let result = proc.process(content, &profile, &store).unwrap();
+        let out: Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(out["a"], 1);
+        assert_eq!(out["b"], "two");
     }
 
     // ── process_to_edits (span-based, format-preserving) ─────────────────────
