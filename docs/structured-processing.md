@@ -343,6 +343,8 @@ users:
 
 Same dot-separated path convention and array traversal as YAML.
 
+Lenient JSON is accepted as a fallback: when strict parsing fails, the literal pass retries the document as JSON5 (comments, unquoted keys, trailing commas, single-quoted strings), so field rules still reach config files written by relaxed parsers — e.g. hand-edited Dataiku project `variables.json`. The format-preserving span-edit pass requires strict JSON; lenient files keep their original bytes and are redacted via the discovered-literal scan instead.
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `compact` | `"false"` | Set to `"true"` for compact (single-line) output. |

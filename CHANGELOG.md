@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   applies to regex-bound patterns only; literals get their own far looser
   cap (500 000). `StreamScanner::new_with_max_patterns`'s `max_patterns`
   parameter accordingly now bounds regex patterns only.
+- **Lenient JSON configs no longer skip the structured pass.** Config files
+  written by relaxed parsers — Dataiku project `variables.json` /
+  `localvariables.json`, hand-edited app configs — routinely carry comments,
+  unquoted keys, trailing commas, or single-quoted strings that strict JSON
+  parsing rejects, so their profile field rules (`*password*`, `*secret*`, …)
+  were silently never applied and only the baseline scanner ran. The JSON
+  processor's literal pass now falls back to lenient JSON5 parsing when
+  strict parsing fails: field values are discovered, seeded into the store,
+  and scrubbed by the format-preserving scanner as before. The span-edit pass
+  stays strict; input that is not valid JSON5 either still reports the
+  original strict parse error.
 
 ### Added
 
