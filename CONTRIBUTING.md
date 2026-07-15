@@ -64,6 +64,18 @@ cargo fmt -- --check
 cargo fmt
 ```
 
+## Optional: Local Pre-Push Hook
+
+`scripts/setup-hooks.sh` installs a git pre-push hook that mirrors the CI
+checks (fmt, clippy, tests, doc build) so failures surface before you push:
+
+```bash
+./scripts/setup-hooks.sh
+```
+
+Skip it for a single push with `SCOUR_SKIP_PUSH=1 git push`. CI runs the
+same checks either way — the hook just shortens the feedback loop.
+
 ## Fuzz Testing
 
 Four fuzz targets are provided under `fuzz/fuzz_targets/`. Fuzz testing
@@ -101,6 +113,36 @@ property-based tests (via `proptest`). Property tests verify length-preservation
 | `tests/property_tests.rs` | Property-based tests (proptest) |
 | `tests/audit_fix_tests.rs` | Regression tests for audit findings |
 | `src/bin/scour/` (inline) | CLI argument parsing smoke tests |
+
+## Adding Detection-Corpus Fixtures
+
+`tests/detection_corpus/` holds the labeled cases scored by
+`tests/detection_quality_tests.rs` (see
+[docs/detection-quality.md](docs/detection-quality.md)). When adding cases:
+
+- Secrets must be **synthetic**, and must never be committed as a contiguous
+  scannable token — GitHub push protection rejects format-valid token shapes
+  even when fake, and so will any secret scanner pointed at a checkout of
+  this repo.
+- Store the secret with `~|~` split markers roughly every 6 characters, and
+  put `{{SECRET}}` in the context line where the secret belongs. The test
+  loader (`Case::secret()` / `Case::text()`) strips the markers and
+  substitutes the placeholder at runtime.
+- A grep for provider prefixes (`ghp_`, `xoxb-`, `glpat-`, …) over
+  `tests/detection_corpus/` must always return zero hits.
+- Strings that must **not** match go in `negatives.yaml` — hard negatives
+  (commit SHAs, UUIDs, base64 blobs) are just as valuable as positives.
+
+Run `cargo test --test detection_quality_tests` to score your cases.
+
+## Adding an App Bundle
+
+Built-in bundles live under `apps/<name>/` as two files: `secrets.yaml`
+(detection patterns for the app's key/token formats) and `profile.yaml`
+(which files the app writes and how to scan them). Copy the closest
+existing bundle as a starting point and verify against a sample file with
+`scour-secrets <sample> --app <name> --dry-run`. Any fixture secrets follow
+the corpus rules above. Please keep it to one bundle per PR.
 
 ## Minimum Supported Rust Version (MSRV)
 
